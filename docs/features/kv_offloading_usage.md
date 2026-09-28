@@ -97,6 +97,33 @@ vllm serve <model> \
 
 Secondary tiers are not supported yet on engines whose workers span several nodes; such an engine fails at startup.
 
+## Kernel-Managed Offload (`offload_region: "hmm"`)
+
+By default the CPU tier lives in a file-backed mapping in `/dev/shm` that vLLM pins with `cudaHostRegister`. To let the kernel place and migrate those pages itself — Linux HMM, e.g. a driver that migrates pages on device fault — select the `hmm` region instead:
+
+```bash
+vllm serve <model> \
+  --kv-transfer-config '{
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "cpu_bytes_to_use": 1000000000,
+      "offload_region": "hmm"
+    }
+  }'
+```
+
+An `hmm` region is:
+
+- **a plain host allocation** — no `/dev/shm` file and no cross-worker sharing, so each worker allocates its own region. `cpu_bytes_to_use` is still interpreted as the total across all workers.
+- **never pinned** — `cudaHostRegister` would make every page resident and unmovable, which is exactly what HMM migration needs to avoid.
+- **never pre-faulted** — pages stay untouched at allocation so the kernel observes real access patterns.
+
+Each region's address and size are available as `base_tensor.data_ptr()` and `total_size_bytes` on `vllm.v1.kv_offload.cpu.hmm_offload_region.HMMOffloadRegion`, which is what an out-of-tree driver or helper needs in order to register the range with the kernel.
+
+!!! warning
+    `offload_region: "hmm"` is rejected by `TieringOffloadingSpec` (secondary tiers run in the scheduler process and read the primary buffer directly, which requires the shared region) and together with `canonical_layout` (canonical pages are shared by all ranks). Because the memory is unpinned, GPU↔host DMA no longer takes the pinned fast path; throughput depends on how the kernel services the region's page faults.
+
 ## `kv_connector_extra_config` Reference
 
 | Key | Required | Default | Scope | Notes |
@@ -109,6 +136,7 @@ Secondary tiers are not supported yet on engines whose workers span several node
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
+| `offload_region` | no | `shared` | single-tier | Host region backing the CPU tier. `shared`: file-backed mmap in `/dev/shm`, pinned with `cudaHostRegister`. `hmm`: plain unpinned per-worker host allocation left for the kernel to place and migrate (see [Kernel-Managed Offload](#kernel-managed-offload-offload_region-hmm)). |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
 | `tier_poll_interval_s` | no | `0.001` | multi-tier | Pause between tier-poll rounds for tiers that must be serviced between engine steps (currently `p2p`). See [Threading model](#threading-model). Set to `0` to disable the thread and service those tiers once per engine step instead. |
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |

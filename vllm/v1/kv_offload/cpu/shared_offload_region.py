@@ -107,6 +107,9 @@ class SharedOffloadRegion:
 
     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
 
+    # CPUOffloadingWorker registers the region with cudaHostRegister.
+    PIN_HOST_MEMORY: bool = True
+
     def __init__(
         self,
         engine_id: str,
