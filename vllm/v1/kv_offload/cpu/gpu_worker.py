@@ -27,6 +27,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.cpu.hmm_offload_region import HMMOffloadRegion
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
@@ -34,6 +35,9 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 )
 
 logger = init_logger(__name__)
+
+# Host allocation backing a worker's offload side.
+OffloadRegion = SharedOffloadRegion | HMMOffloadRegion
 
 
 def _select_swap_blocks_fn(
@@ -198,8 +202,16 @@ def _canonical_block_sizes(
 MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
 
 
-def pin_mmap_region(region: SharedOffloadRegion) -> None:
+def pin_mmap_region(region: OffloadRegion) -> None:
     """Register row-aligned chunks, rolling back on failure."""
+    if not region.PIN_HOST_MEMORY:
+        logger.info(
+            "Skipping host registration of %s: its pages must stay migratable "
+            "for kernel-managed offload.",
+            type(region).__name__,
+        )
+        return
+
     if not current_platform.is_cuda_alike():
         logger.info(
             "Skipping mmap host registration on %s; cudaHostRegister is only "
@@ -805,7 +817,7 @@ class CPUOffloadingWorker(OffloadingWorker):
         kv_caches: CanonicalKVCaches,
         blocks_per_chunk: int,
         num_cpu_chunks: int,
-        mmap_region: SharedOffloadRegion | None = None,
+        mmap_region: OffloadRegion | None = None,
         canonical_layout: bool = False,
     ):
         assert not canonical_layout or mmap_region is not None

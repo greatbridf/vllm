@@ -501,6 +501,76 @@ def test_cpu_spec_create_worker_rank_assignment(
     assert region_calls[0]["rank"] == expected_rank
 
 
+def test_cpu_spec_rejects_unknown_offload_region():
+    with pytest.raises(ValueError, match="Unsupported offload_region"):
+        _create_spec(extra_config={"offload_region": "nvme"})
+
+
+def test_cpu_spec_create_worker_uses_hmm_region(monkeypatch):
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    page = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    spec = _create_spec(
+        cpu_bytes_to_use=page * 8,
+        worker_kv_bytes_per_block=page,
+        world_size=4,
+        extra_config={"offload_region": "hmm"},
+    )
+    assert isinstance(spec, CPUOffloadingSpec)
+
+    region_calls: list[dict[str, Any]] = []
+
+    def fake_region_ctor(**kwargs):
+        region_calls.append(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(cpu_spec_module, "HMMOffloadRegion", fake_region_ctor)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(
+        cpu_spec_module.torch.accelerator, "current_device_index", lambda: 5
+    )
+
+    spec.create_worker(MagicMock())
+
+    # An HMM region is process-private, so it is sized to this worker's own
+    # slice of the row rather than to the whole shared row.
+    assert region_calls[0]["num_chunks"] == spec.num_chunks == 2
+    assert region_calls[0]["kv_bytes_per_chunk"] == page
+    assert region_calls[0]["cpu_page_size"] == page
+    assert region_calls[0]["rank"] == 1
+
+
+def test_cpu_spec_hmm_region_rejects_canonical_layout(monkeypatch):
+    import dataclasses
+
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    page = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    config = dataclasses.replace(
+        _make_offloading_config(
+            cpu_bytes_to_use=page * 8,
+            worker_kv_bytes_per_block=page,
+            extra_config={"offload_region": "hmm"},
+        ),
+        canonical_layout=True,
+    )
+    spec = CPUOffloadingSpec(config)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
+
+    # Canonical pages are shared across ranks; an HMM region is private.
+    with pytest.raises(ValueError, match="canonical_layout is not supported"):
+        spec.create_worker(MagicMock())
+
+
+def test_tiering_spec_rejects_hmm_region():
+    # Secondary tiers read the primary buffer from the scheduler process.
+    with pytest.raises(ValueError, match="not supported by TieringOffloadingSpec"):
+        _create_spec(
+            spec_name="TieringOffloadingSpec",
+            extra_config={"offload_region": "hmm"},
+        )
+
+
 def test_offloading_spec_has_replicated_layout_default():
     spec = SingleArgExternalOffloadingSpec(_make_offloading_config())
     assert spec.replicated_layout is False

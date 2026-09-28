@@ -95,6 +95,33 @@ vllm serve <model> \
   }'
 ```
 
+## Kernel-Managed Offload (`offload_region: "hmm"`)
+
+By default the CPU tier lives in a file-backed mapping in `/dev/shm` that vLLM pins with `cudaHostRegister`. To let the kernel place and migrate those pages itself — Linux HMM, e.g. a driver that migrates pages on device fault — select the `hmm` region instead:
+
+```bash
+vllm serve <model> \
+  --kv-transfer-config '{
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "cpu_bytes_to_use": 1000000000,
+      "offload_region": "hmm"
+    }
+  }'
+```
+
+An `hmm` region is:
+
+- **a plain host allocation** — no `/dev/shm` file and no cross-worker sharing, so each worker allocates its own region. `cpu_bytes_to_use` is still interpreted as the total across all workers.
+- **never pinned** — `cudaHostRegister` would make every page resident and unmovable, which is exactly what HMM migration needs to avoid.
+- **never pre-faulted** — pages stay untouched at allocation so the kernel observes real access patterns.
+
+Each region's address and size are available as `base_tensor.data_ptr()` and `total_size_bytes` on `vllm.v1.kv_offload.cpu.hmm_offload_region.HMMOffloadRegion`, which is what an out-of-tree driver or helper needs in order to register the range with the kernel.
+
+!!! warning
+    `offload_region: "hmm"` is rejected by `TieringOffloadingSpec` (secondary tiers run in the scheduler process and read the primary buffer directly, which requires the shared region) and together with `canonical_layout` (canonical pages are shared by all ranks). Because the memory is unpinned, GPU↔host DMA no longer takes the pinned fast path; throughput depends on how the kernel services the region's page faults.
+
 ## `kv_connector_extra_config` Reference
 
 | Key | Required | Default | Scope | Notes |
@@ -107,6 +134,7 @@ vllm serve <model> \
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
+| `offload_region` | no | `shared` | single-tier | Host region backing the CPU tier. `shared`: file-backed mmap in `/dev/shm`, pinned with `cudaHostRegister`. `hmm`: plain unpinned per-worker host allocation left for the kernel to place and migrate (see [Kernel-Managed Offload](#kernel-managed-offload-offload_region-hmm)). |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |

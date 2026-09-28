@@ -19,9 +19,16 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker, OffloadRegion
+from vllm.v1.kv_offload.cpu.hmm_offload_region import HMMOffloadRegion
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+# Host region backing the worker's offload side, selected by the
+# `offload_region` key of kv_connector_extra_config.
+OFFLOAD_REGION_SHARED = "shared"
+OFFLOAD_REGION_HMM = "hmm"
+OFFLOAD_REGION_TYPES = (OFFLOAD_REGION_SHARED, OFFLOAD_REGION_HMM)
 
 
 def _all_workers_barrier() -> None:
@@ -94,6 +101,15 @@ class CPUOffloadingSpec(OffloadingSpec):
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
 
+        self.region_type: str = self.extra_config.get(
+            "offload_region", OFFLOAD_REGION_SHARED
+        )
+        if self.region_type not in OFFLOAD_REGION_TYPES:
+            raise ValueError(
+                f"Unsupported offload_region '{self.region_type}'; "
+                f"expected one of {list(OFFLOAD_REGION_TYPES)}"
+            )
+
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if not cpu_bytes_to_use:
             raise Exception(
@@ -164,11 +180,45 @@ class CPUOffloadingSpec(OffloadingSpec):
         per-rank tensor); replicated-layout dedup is gated on this being True."""
         return current_platform.is_cuda_alike() and not current_platform.is_rocm()
 
+    def _create_offload_region(self, rank: int) -> OffloadRegion:
+        """Allocate the host region backing this worker's offload side.
+
+        `shared` is the file-backed mmap shared by all local workers; `hmm` is
+        a plain unpinned per-worker allocation that the kernel places and
+        migrates on its own (Linux HMM).
+        """
+        if self.region_type == OFFLOAD_REGION_HMM:
+            if self.config.canonical_layout:
+                raise ValueError(
+                    "canonical_layout is not supported with "
+                    "offload_region='hmm': canonical pages are shared by all "
+                    "ranks, but an HMM region is process-private."
+                )
+            return HMMOffloadRegion(
+                num_chunks=self.num_chunks,
+                kv_bytes_per_chunk=round_up(
+                    self.cpu_page_size_per_worker,
+                    HMMOffloadRegion.BLOCK_SIZE_ALIGNMENT,
+                ),
+                cpu_page_size=self.cpu_page_size_per_worker,
+                rank=rank,
+            )
+        return SharedOffloadRegion(
+            engine_id=self.config.engine_id,
+            num_chunks=self.num_chunks,
+            rank=rank,
+            kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+            cpu_page_size=self.cpu_page_size_per_worker,
+            barrier=_all_workers_barrier,
+        )
+
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
-        mmap_region: SharedOffloadRegion | None = None
+        region: OffloadRegion | None = None
         # num_chunks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
-        if self._uses_shared_region() and self.num_chunks > 0:
+        if self.num_chunks > 0 and (
+            self.region_type == OFFLOAD_REGION_HMM or self._uses_shared_region()
+        ):
             # Replicated layout puts all ranks on slot 0 (single MLA copy);
             # otherwise each rank takes its own slot by physical device index.
             if self.replicated_layout:
@@ -176,24 +226,17 @@ class CPUOffloadingSpec(OffloadingSpec):
             else:
                 world_size = self.config.parallel.world_size
                 rank = torch.accelerator.current_device_index() % world_size
-            mmap_region = SharedOffloadRegion(
-                engine_id=self.config.engine_id,
-                num_chunks=self.num_chunks,
-                rank=rank,
-                kv_bytes_per_chunk=self.kv_bytes_per_chunk,
-                cpu_page_size=self.cpu_page_size_per_worker,
-                barrier=_all_workers_barrier,
-            )
+            region = self._create_offload_region(rank)
         try:
             return CPUOffloadingWorker(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
-                mmap_region=mmap_region,
+                mmap_region=region,
             )
         except Exception:
-            if mmap_region is not None:
-                mmap_region.cleanup()
+            if region is not None:
+                region.cleanup()
             raise
 
     @override
