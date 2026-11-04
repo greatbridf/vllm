@@ -28,6 +28,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.hmm_offload_region import HMMOffloadRegion
 from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
+from vllm.v1.kv_offload.cpu.mmap_offload_region import MmapOffloadRegion
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
@@ -38,7 +39,7 @@ from vllm.v1.kv_offload.pointer_utils import iter_pointer_groups
 logger = init_logger(__name__)
 
 # Host allocation backing a worker's offload side.
-OffloadRegion = SharedOffloadRegion | HMMOffloadRegion
+OffloadRegion = SharedOffloadRegion | HMMOffloadRegion | MmapOffloadRegion
 
 
 def _clear_pending_device_error() -> None:
@@ -229,7 +230,7 @@ def pin_mmap_region(
         return
 
     rank = region.rank
-    base_ptr = region._base.data_ptr()
+    base_ptr = region.base_tensor.data_ptr()
     total_size = region.total_size_bytes
     # Chunks end on block-row boundaries, which are page aligned, so neither the
     # driver's page rounding nor any single block transfer straddles two
@@ -240,7 +241,9 @@ def pin_mmap_region(
         (offset, min(chunk_size, total_size - offset))
         for offset in range(0, total_size, chunk_size)
     )
-    stride, slot, page = region._row_stride, region.cpu_page_size, region.page_size
+    stride = region._row_stride
+    slot = region.cpu_page_size if isinstance(region, SharedOffloadRegion) else stride
+    page = region.BLOCK_SIZE_ALIGNMENT
     min_savings = max(page, MIN_HOST_REGISTER_SAVED_BYTES)
     if worker_slot_only and region.rank is not None and stride - slot >= min_savings:
         # Round each slot out to pages; the worker's next slot is a page away.
