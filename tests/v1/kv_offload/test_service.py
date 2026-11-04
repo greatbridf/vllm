@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tests.v1.kv_offload.test_factory import _make_offloading_config
+from tests.v1.kv_offload.conftest import make_offloading_config
 from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
 from vllm.v1.kv_offload.service.client import CacheServiceClient
 from vllm.v1.kv_offload.service.region import ServiceOffloadRegion
@@ -57,7 +57,7 @@ def service(tmp_path):
 def _spec(path, rank=0):
     return RustServiceOffloadingSpec(
         replace(
-            _make_offloading_config(
+            make_offloading_config(
                 cpu_bytes_to_use=2 * PAGE,
                 worker_kv_bytes_per_block=64,
                 world_size=2,

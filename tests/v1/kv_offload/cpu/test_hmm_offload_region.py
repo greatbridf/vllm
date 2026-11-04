@@ -44,7 +44,9 @@ def test_region_is_unpinned_host_memory():
 
 
 def test_worker_views_are_strided_over_the_shared_allocation():
-    region = _make_region(num_chunks=3, kv_bytes_per_chunk=4 * PAGE_SIZE)
+    region = _make_region(
+        num_chunks=3, kv_bytes_per_chunk=4 * PAGE_SIZE, cpu_page_size=3 * PAGE_SIZE
+    )
     try:
         first = region.create_next_worker_view(PAGE_SIZE)
         second = region.create_next_worker_view(2 * PAGE_SIZE)
@@ -78,6 +80,7 @@ def test_kv_memoryview_is_zero_copy():
     try:
         view = region.create_kv_memoryview()
         assert view.shape == (2, 2 * PAGE_SIZE)
+        region.base_tensor[2 * 2 * PAGE_SIZE - 1] = 0
         assert view[1, 2 * PAGE_SIZE - 1] == 0
         region.base_tensor[2 * 2 * PAGE_SIZE - 1] = 7
         assert view[1, 2 * PAGE_SIZE - 1] == 7

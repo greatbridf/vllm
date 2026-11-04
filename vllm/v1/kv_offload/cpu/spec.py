@@ -210,12 +210,9 @@ class CPUOffloadingSpec(OffloadingSpec):
 
     def _uses_shared_region(self) -> bool:
         """Whether workers can deduplicate replicated KV in shared storage."""
-        return (
-            self.region_type == OFFLOAD_REGION_SHARED
-            and (
-                (current_platform.is_cuda_alike() and not current_platform.is_rocm())
-                or current_platform.is_xpu()
-            )
+        return self.region_type == OFFLOAD_REGION_SHARED and (
+            (current_platform.is_cuda_alike() and not current_platform.is_rocm())
+            or current_platform.is_xpu()
         )
 
     def _create_offload_region(self, rank: int) -> OffloadRegion:

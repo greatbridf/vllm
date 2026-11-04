@@ -714,7 +714,7 @@ def test_mmap_spec_rejects_canonical_layout_at_configuration():
     from dataclasses import replace
 
     config = replace(
-        _make_offloading_config(extra_config={"offload_region": "mmap"}),
+        make_offloading_config(extra_config={"offload_region": "mmap"}),
         canonical_layout=True,
     )
     with pytest.raises(ValueError, match="canonical_layout is not supported"):
@@ -746,6 +746,7 @@ def test_cpu_spec_create_worker_uses_hmm_region(monkeypatch):
         cpu_bytes_to_use=page * 8,
         worker_kv_bytes_per_block=page,
         world_size=4,
+        rank=1,
         extra_config={"offload_region": "hmm"},
     )
     assert isinstance(spec, CPUOffloadingSpec)
@@ -760,9 +761,6 @@ def test_cpu_spec_create_worker_uses_hmm_region(monkeypatch):
     region_ctor.BLOCK_SIZE_ALIGNMENT = page
     monkeypatch.setattr(cpu_spec_module, "HMMOffloadRegion", region_ctor)
     monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
-    monkeypatch.setattr(
-        cpu_spec_module.torch.accelerator, "current_device_index", lambda: 5
-    )
 
     spec.create_worker(MagicMock())
 
@@ -774,29 +772,22 @@ def test_cpu_spec_create_worker_uses_hmm_region(monkeypatch):
     assert region_calls[0]["rank"] == 1
 
 
-def test_cpu_spec_hmm_region_rejects_canonical_layout(monkeypatch):
+def test_cpu_spec_hmm_region_rejects_canonical_layout():
     import dataclasses
-
-    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
 
     page = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
     config = dataclasses.replace(
-        _make_offloading_config(
+        make_offloading_config(
             cpu_bytes_to_use=page * 8,
             worker_kv_bytes_per_block=page,
             extra_config={"offload_region": "hmm"},
         ),
         canonical_layout=True,
     )
-    spec = CPUOffloadingSpec(config)
-    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
-    monkeypatch.setattr(
-        cpu_spec_module.torch.accelerator, "current_device_index", lambda: 0
-    )
-
     # Canonical pages are shared across ranks; an HMM region is private.
+    spec = CPUOffloadingSpec(config)
     with pytest.raises(ValueError, match="canonical_layout is not supported"):
-        spec.create_worker(MagicMock())
+        spec.create_worker(CanonicalKVCaches(tensors=[], group_data_refs=[]))
 
 
 @pytest.mark.parametrize("region", ["hmm", "mmap"])

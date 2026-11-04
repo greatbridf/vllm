@@ -220,9 +220,7 @@ MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
 MIN_HOST_REGISTER_SAVED_BYTES = 3 * 1024**2
 
 
-def pin_mmap_region(
-    region: OffloadRegion, worker_slot_only: bool = False
-) -> None:
+def pin_mmap_region(region: OffloadRegion, worker_slot_only: bool = False) -> None:
     """Register row-aligned chunks or this worker's slots, rolling back on failure."""
     if not region.PIN_HOST_MEMORY:
         logger.info(
@@ -248,7 +246,12 @@ def pin_mmap_region(
     slot = region.cpu_page_size if isinstance(region, SharedOffloadRegion) else stride
     page = region.BLOCK_SIZE_ALIGNMENT
     min_savings = max(page, MIN_HOST_REGISTER_SAVED_BYTES)
-    if worker_slot_only and region.rank is not None and stride - slot >= min_savings:
+    if (
+        isinstance(region, SharedOffloadRegion)
+        and worker_slot_only
+        and region.rank is not None
+        and stride - slot >= min_savings
+    ):
         # Round each slot out to pages; the worker's next slot is a page away.
         ranges = region.iter_worker_slot_ranges()
     else:
