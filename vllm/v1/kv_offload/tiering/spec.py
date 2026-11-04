@@ -68,7 +68,11 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
-from vllm.v1.kv_offload.cpu.spec import OFFLOAD_REGION_HMM, CPUOffloadingSpec
+from vllm.v1.kv_offload.cpu.spec import (
+    OFFLOAD_REGION_HMM,
+    OFFLOAD_REGION_MMAP,
+    CPUOffloadingSpec,
+)
 from vllm.v1.kv_offload.tiering.base import (
     TIER_LABEL,
     SecondaryTierManager,
@@ -333,9 +337,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
         self._manager: OffloadingManager | None = None
 
-        if self.region_type == OFFLOAD_REGION_HMM:
+        if self.region_type in (OFFLOAD_REGION_HMM, OFFLOAD_REGION_MMAP):
             raise ValueError(
-                "offload_region='hmm' is not supported by "
+                f"offload_region='{self.region_type}' is not supported by "
                 "TieringOffloadingSpec: secondary tiers run in the scheduler "
                 "process and read the primary tier's KV buffer directly, which "
                 "requires the shared mmap region."

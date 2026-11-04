@@ -21,16 +21,21 @@ from vllm.v1.kv_offload.cpu.common import CPUOffloadingInfo, CPUOffloadingMetric
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker, OffloadRegion
 from vllm.v1.kv_offload.cpu.hmm_offload_region import HMMOffloadRegion
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.mmap_offload_region import MmapOffloadRegion
 from vllm.v1.kv_offload.cpu.shared_offload_region import (
     REGION_SEGMENTS,
     SharedOffloadRegion,
 )
 
-# Host region backing the worker's offload side, selected by the
-# `offload_region` key of kv_connector_extra_config.
+# Host region selected by kv_connector_extra_config["offload_region"].
 OFFLOAD_REGION_SHARED = "shared"
 OFFLOAD_REGION_HMM = "hmm"
-OFFLOAD_REGION_TYPES = (OFFLOAD_REGION_SHARED, OFFLOAD_REGION_HMM)
+OFFLOAD_REGION_MMAP = "mmap"
+OFFLOAD_REGION_TYPES = (
+    OFFLOAD_REGION_SHARED,
+    OFFLOAD_REGION_HMM,
+    OFFLOAD_REGION_MMAP,
+)
 
 
 def _all_workers_barrier() -> None:
@@ -111,6 +116,11 @@ class CPUOffloadingSpec(OffloadingSpec):
                 f"Unsupported offload_region '{self.region_type}'; "
                 f"expected one of {list(OFFLOAD_REGION_TYPES)}"
             )
+        if self.region_type == OFFLOAD_REGION_MMAP and config.canonical_layout:
+            raise ValueError(
+                "canonical_layout is not supported with offload_region='mmap': "
+                "canonical pages require a shared region."
+            )
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if not cpu_bytes_to_use:
@@ -135,7 +145,17 @@ class CPUOffloadingSpec(OffloadingSpec):
             aligned_kv_bytes_per_chunk = round_up(
                 kv_bytes_per_chunk, self.BLOCK_SIZE_ALIGNMENT
             )
-            self.num_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
+            if self.region_type == OFFLOAD_REGION_MMAP:
+                # Every private mapping has its own page-alignment padding.
+                # Budget for all workers, not just one aligned aggregate row.
+                aligned_kv_bytes_per_chunk = round_up(
+                    self.cpu_page_size_per_worker, self.BLOCK_SIZE_ALIGNMENT
+                )
+                self.num_chunks = int(cpu_bytes_to_use) // (
+                    aligned_kv_bytes_per_chunk * world_size
+                )
+            else:
+                self.num_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
 
             # Expose aligned_kv_bytes_per_chunk as
             # kv_bytes_per_chunk. Note that this might contain
@@ -189,19 +209,28 @@ class CPUOffloadingSpec(OffloadingSpec):
         return self._manager
 
     def _uses_shared_region(self) -> bool:
-        """Whether the worker CPU buffer is the shared mmap region (vs a private
-        per-rank tensor); replicated-layout dedup is gated on this being True."""
+        """Whether workers can deduplicate replicated KV in shared storage."""
         return (
-            current_platform.is_cuda_alike() and not current_platform.is_rocm()
-        ) or current_platform.is_xpu()
+            self.region_type == OFFLOAD_REGION_SHARED
+            and (
+                (current_platform.is_cuda_alike() and not current_platform.is_rocm())
+                or current_platform.is_xpu()
+            )
+        )
 
     def _create_offload_region(self, rank: int) -> OffloadRegion:
         """Allocate the host region backing this worker's offload side.
 
-        `shared` is the file-backed mmap shared by all local workers; `hmm` is
-        a plain unpinned per-worker allocation that the kernel places and
-        migrates on its own (Linux HMM).
+        `shared` uses /dev/shm; `mmap` uses private anonymous DRAM; `hmm` uses
+        an unpinned allocation left for kernel-managed migration.
         """
+        if self.region_type == OFFLOAD_REGION_MMAP:
+            return MmapOffloadRegion(
+                num_chunks=self.num_chunks,
+                kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+                cpu_page_size=self.cpu_page_size_per_worker,
+                rank=rank,
+            )
         if self.region_type == OFFLOAD_REGION_HMM:
             if self.config.canonical_layout:
                 raise ValueError(
@@ -238,7 +267,8 @@ class CPUOffloadingSpec(OffloadingSpec):
         # num_chunks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
         if self.num_chunks > 0 and (
-            self.region_type == OFFLOAD_REGION_HMM or self._uses_shared_region()
+            self.region_type in (OFFLOAD_REGION_HMM, OFFLOAD_REGION_MMAP)
+            or self._uses_shared_region()
         ):
             rank = 0 if self.replicated_layout else self.config.parallel.rank
             region = self._create_offload_region(rank)

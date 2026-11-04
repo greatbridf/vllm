@@ -664,6 +664,80 @@ def test_cpu_spec_rejects_unknown_offload_region():
         _create_spec(extra_config={"offload_region": "nvme"})
 
 
+@pytest.mark.parametrize("worker_bytes", [17, 4096, 4097])
+def test_mmap_spec_budget_includes_each_workers_alignment(worker_bytes):
+    page = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    spec = _create_spec(
+        cpu_bytes_to_use=16 * page,
+        worker_kv_bytes_per_block=worker_bytes,
+        world_size=4,
+        replicated_layout=True,
+        extra_config={"offload_region": "mmap"},
+    )
+    assert isinstance(spec, CPUOffloadingSpec)
+    assert not spec.replicated_layout
+    expected_row = ((worker_bytes + page - 1) // page) * page
+    assert spec.kv_bytes_per_chunk == expected_row
+    assert spec.num_chunks == 16 * page // (4 * expected_row)
+    assert spec.num_chunks * expected_row * 4 <= 16 * page
+
+
+def test_mmap_spec_creates_private_region_with_logical_worker_rank(monkeypatch):
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+    from vllm.v1.kv_offload.cpu.mmap_offload_region import MmapOffloadRegion
+
+    page = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    spec = _create_spec(
+        cpu_bytes_to_use=8 * page,
+        worker_kv_bytes_per_block=17,
+        world_size=4,
+        rank=3,
+        extra_config={"offload_region": "mmap"},
+    )
+    assert isinstance(spec, CPUOffloadingSpec)
+    worker_ctor = MagicMock()
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", worker_ctor)
+    kv_caches = MagicMock()
+    spec.create_worker(kv_caches)
+    region = worker_ctor.call_args.kwargs["mmap_region"]
+    try:
+        assert isinstance(region, MmapOffloadRegion)
+        assert region.rank == 3
+        assert region.num_chunks == 2
+        assert region.total_size_bytes == 2 * page
+        assert worker_ctor.call_args.kwargs["kv_caches"] is kv_caches
+    finally:
+        region.cleanup()
+
+
+def test_mmap_spec_rejects_canonical_layout_at_configuration():
+    from dataclasses import replace
+
+    config = replace(
+        _make_offloading_config(extra_config={"offload_region": "mmap"}),
+        canonical_layout=True,
+    )
+    with pytest.raises(ValueError, match="canonical_layout is not supported"):
+        CPUOffloadingSpec(config)
+
+
+def test_mmap_spec_cleans_region_when_worker_initialization_fails(monkeypatch):
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    spec = _create_spec(extra_config={"offload_region": "mmap"})
+    assert isinstance(spec, CPUOffloadingSpec)
+    region = MagicMock()
+    monkeypatch.setattr(spec, "_create_offload_region", lambda rank: region)
+    monkeypatch.setattr(
+        cpu_spec_module,
+        "CPUOffloadingWorker",
+        MagicMock(side_effect=RuntimeError("registration failed")),
+    )
+    with pytest.raises(RuntimeError, match="registration failed"):
+        spec.create_worker(MagicMock())
+    region.cleanup.assert_called_once_with()
+
+
 def test_cpu_spec_create_worker_uses_hmm_region(monkeypatch):
     import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
 
@@ -682,7 +756,9 @@ def test_cpu_spec_create_worker_uses_hmm_region(monkeypatch):
         region_calls.append(kwargs)
         return MagicMock()
 
-    monkeypatch.setattr(cpu_spec_module, "HMMOffloadRegion", fake_region_ctor)
+    region_ctor = MagicMock(side_effect=fake_region_ctor)
+    region_ctor.BLOCK_SIZE_ALIGNMENT = page
+    monkeypatch.setattr(cpu_spec_module, "HMMOffloadRegion", region_ctor)
     monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
     monkeypatch.setattr(
         cpu_spec_module.torch.accelerator, "current_device_index", lambda: 5
@@ -714,18 +790,22 @@ def test_cpu_spec_hmm_region_rejects_canonical_layout(monkeypatch):
     )
     spec = CPUOffloadingSpec(config)
     monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(
+        cpu_spec_module.torch.accelerator, "current_device_index", lambda: 0
+    )
 
     # Canonical pages are shared across ranks; an HMM region is private.
     with pytest.raises(ValueError, match="canonical_layout is not supported"):
         spec.create_worker(MagicMock())
 
 
-def test_tiering_spec_rejects_hmm_region():
+@pytest.mark.parametrize("region", ["hmm", "mmap"])
+def test_tiering_spec_rejects_private_region(region):
     # Secondary tiers read the primary buffer from the scheduler process.
     with pytest.raises(ValueError, match="not supported by TieringOffloadingSpec"):
         _create_spec(
             spec_name="TieringOffloadingSpec",
-            extra_config={"offload_region": "hmm"},
+            extra_config={"offload_region": region},
         )
 
 
