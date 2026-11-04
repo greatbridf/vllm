@@ -97,6 +97,68 @@ vllm serve <model> \
 
 Secondary tiers are not supported yet on engines whose workers span several nodes; such an engine fails at startup.
 
+## Anonymous DRAM Offload (`offload_region: "mmap"`)
+
+Select `mmap` for CPU-only storage backed by a process-private anonymous mapping.
+The existing `OffloadingConnector` manages cache keys, eviction, block lifetimes,
+and GPU transfers; no separate connector class is required.
+
+For DeepSeek-V4.1-Flash:
+
+```bash
+vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
+  --tensor-parallel-size 8 \
+  --enable-prefix-caching \
+  --enforce-eager \
+  --kv-transfer-config '{
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "offload_region": "mmap",
+      "cpu_bytes_to_use": 68719476736,
+      "blocks_per_chunk": 1
+    }
+  }'
+```
+
+Choose tensor parallelism and the host-memory budget to fit your hardware.
+The budget above is 64 GiB **across all workers**, including page-alignment
+padding in each private mapping. Each worker retains its own KV copy, even
+when MLA data is replicated across TP ranks.
+
+The mapping has no file descriptor, `/dev/shm` dependency, persistence, or
+cross-engine sharing. On CUDA, the worker attempts to pin it with
+`cudaHostRegister` for DMA. If registration fails, the existing worker falls
+back to pageable-memory DMA and logs a warning; only successfully pinned
+regions are guaranteed to remain resident in DRAM.
+
+DeepSeek's packed layout transfers complete physical rows, preserving the
+compressed MLA cache, indexer data, and padding. Non-prefix-cacheable compressor
+scratch state is not separately offloaded. Bounded-replay SWA state follows the
+model's existing replay path. Start with `blocks_per_chunk: 1` and eager mode;
+GPU/model correctness and graph-mode performance must be validated on the
+deployment hardware.
+
+`canonical_layout` and `TieringOffloadingSpec` are rejected for `mmap`: both
+require shared pages visible to other processes. This backend has no disk,
+remote-memory, or HMM tier.
+
+### DeepSeek Reload Validation
+
+The opt-in model test compares greedy output tokens before and after clearing
+the GPU prefix cache, and verifies that the second request loaded cached KV:
+
+```bash
+VLLM_TEST_DEEPSEEK_V41_MODEL=/path/to/DeepSeek-V4.1-Flash \
+VLLM_TEST_DEEPSEEK_V41_TP=8 \
+.venv/bin/python -m pytest \
+  tests/v1/kv_connector/unit/test_offloading_connector.py \
+  -k deepseek_v41_mmap -v
+```
+
+This requires CUDA and model weights. Packed-byte tests run without either;
+they do not replace a model-output evaluation.
+
 ## Kernel-Managed Offload (`offload_region: "hmm"`)
 
 By default the CPU tier lives in a file-backed mapping in `/dev/shm` that vLLM pins with `cudaHostRegister`. To let the kernel place and migrate those pages itself — Linux HMM, e.g. a driver that migrates pages on device fault — select the `hmm` region instead:
@@ -136,7 +198,7 @@ Each region's address and size are available as `base_tensor.data_ptr()` and `to
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
-| `offload_region` | no | `shared` | single-tier | Host region backing the CPU tier. `shared`: file-backed mmap in `/dev/shm`, pinned with `cudaHostRegister`. `hmm`: plain unpinned per-worker host allocation left for the kernel to place and migrate (see [Kernel-Managed Offload](#kernel-managed-offload-offload_region-hmm)). |
+| `offload_region` | no | `shared` | single-tier | Host region backing the CPU tier. `shared`: file-backed mmap in `/dev/shm`, pinned with `cudaHostRegister`. `mmap`: private anonymous DRAM mapping (see [Anonymous DRAM Offload](#anonymous-dram-offload-offload_region-mmap)). `hmm`: plain unpinned per-worker host allocation left for kernel migration (see [Kernel-Managed Offload](#kernel-managed-offload-offload_region-hmm)). |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
 | `tier_poll_interval_s` | no | `0.001` | multi-tier | Pause between tier-poll rounds for tiers that must be serviced between engine steps (currently `p2p`). See [Threading model](#threading-model). Set to `0` to disable the thread and service those tiers once per engine step instead. |
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |

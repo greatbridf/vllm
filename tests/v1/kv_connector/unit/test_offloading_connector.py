@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import socket
 import threading
 import time
@@ -395,6 +396,48 @@ def test_cpu_offloading_sliding_window_partial_chunk() -> None:
     )
     try:
         _sliding_window_partial_chunk_test(llm)
+    finally:
+        del llm
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or not os.environ.get("VLLM_TEST_DEEPSEEK_V41_MODEL"),
+    reason="Requires CUDA and VLLM_TEST_DEEPSEEK_V41_MODEL weights",
+)
+def test_deepseek_v41_mmap_offload_reload_matches_cold_output():
+    """Force a CPU reload and compare greedy tokens against cold prefill."""
+    llm = LLM(
+        model=os.environ["VLLM_TEST_DEEPSEEK_V41_MODEL"],
+        tensor_parallel_size=int(os.environ.get("VLLM_TEST_DEEPSEEK_V41_TP", "1")),
+        max_model_len=4096,
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        enforce_eager=True,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="OffloadingConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "offload_region": "mmap",
+                "cpu_bytes_to_use": 4 << 30,
+                "blocks_per_chunk": 1,
+            },
+        ),
+    )
+    params = SamplingParams(temperature=0, max_tokens=8)
+    prompt = TokensPrompt(
+        prompt_token_ids=llm.get_tokenizer().encode(
+            "Explain why a prefix cache must preserve the full attention state. " * 128
+        )[:3073]
+    )
+    try:
+        cold = llm.generate(prompt, params, use_tqdm=False)[0]
+        _wait_for_prefix_cache_reset(llm)
+        warm = llm.generate(prompt, params, use_tqdm=False)[0]
+        assert (warm.num_cached_tokens or 0) > 0, (
+            "The request did not reload offloaded KV"
+        )
+        assert warm.outputs[0].token_ids == cold.outputs[0].token_ids
     finally:
         del llm
 

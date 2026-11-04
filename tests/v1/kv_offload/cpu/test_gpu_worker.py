@@ -26,6 +26,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu import gpu_worker
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.mmap_offload_region import MmapOffloadRegion
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
 
@@ -459,8 +460,8 @@ def test_worker_syncs_before_cleanup_after_handler_failure(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize(
-    ("use_shared_memory", "replicated_layout"),
-    [(False, False), (True, False), (True, True)],
+    ("region_type", "replicated_layout"),
+    [("tensor", False), ("shared", False), ("shared", True), ("mmap", False)],
 )
 @torch.inference_mode()
 def test_transfer(
@@ -474,7 +475,7 @@ def test_transfer(
     num_tensors: int,
     seed: int,
     device: str,
-    use_shared_memory: bool,
+    region_type: str,
     replicated_layout: bool,
 ) -> None:
     set_random_seed(seed)
@@ -510,8 +511,8 @@ def test_transfer(
         group_data_refs=kv_cache_groups_data_refs,
     )
 
-    mmap_region: SharedOffloadRegion | None = None
-    if use_shared_memory:
+    mmap_region: SharedOffloadRegion | MmapOffloadRegion | None = None
+    if region_type != "tensor":
         cpu_page_size = round_up(
             gpu_page_size_bytes * num_tensors * blocks_per_chunk,
             SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT,
@@ -520,13 +521,21 @@ def test_transfer(
         kv_bytes_per_chunk = (
             cpu_page_size if replicated_layout else cpu_page_size * simulated_world_size
         )
-        mmap_region = SharedOffloadRegion(
-            engine_id=str(uuid.uuid4()),
-            num_chunks=num_cpu_chunks,
-            rank=0,
-            kv_bytes_per_chunk=kv_bytes_per_chunk,
-            cpu_page_size=cpu_page_size,
-        )
+        if region_type == "mmap":
+            mmap_region = MmapOffloadRegion(
+                num_chunks=num_cpu_chunks,
+                rank=0,
+                kv_bytes_per_chunk=cpu_page_size,
+                cpu_page_size=cpu_page_size,
+            )
+        else:
+            mmap_region = SharedOffloadRegion(
+                engine_id=str(uuid.uuid4()),
+                num_chunks=num_cpu_chunks,
+                rank=0,
+                kv_bytes_per_chunk=kv_bytes_per_chunk,
+                cpu_page_size=cpu_page_size,
+            )
 
     worker = CPUOffloadingWorker(
         kv_caches=kv_caches,

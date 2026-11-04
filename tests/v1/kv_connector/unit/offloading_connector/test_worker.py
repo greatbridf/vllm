@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     TransferJob,
 )
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
@@ -670,6 +671,95 @@ def test_register_packed_kv_caches_skips_scratch_group():
     assert len(canonical.tensors) == 1
     assert canonical.tensors[0].tensor.shape == (NUM_BLOCKS, 2 * page)
     assert canonical.group_data_refs == [[CanonicalKVCacheRef(0, 2 * page)]]
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+def test_deepseek_v41_packed_rows_roundtrip_through_mmap(compress_ratio):
+    """Preserve compressed KV, indexer bytes and padding as one physical row."""
+    from dataclasses import replace
+
+    from vllm.v1.kv_offload.cpu.mmap_offload_region import MmapOffloadRegion
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    main = MLAAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        tokens_per_state=compress_ratio,
+        model_version="deepseek_v4",
+        alignment=512,
+    )
+    indexer = MLAAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=compress_ratio,
+        alignment=512,
+    )
+    row_bytes = main.page_size_bytes + indexer.page_size_bytes
+    raw = torch.randint(0, 256, (NUM_BLOCKS, row_bytes), dtype=torch.uint8)
+    expected = raw.clone()
+    config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["main", "indexer"],
+                UniformTypeKVCacheSpecs(
+                    block_size=BLOCK_SIZE,
+                    kv_cache_specs={"main": main, "indexer": indexer},
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["compressor.state"],
+                CircularBufferSpec(
+                    block_size=8, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+        ],
+    )
+    worker, spec = _make_worker(config)
+    worker.register_kv_caches(
+        {
+            "main": raw[:, : main.page_size_bytes],
+            "indexer": raw[:, main.page_size_bytes :],
+        }
+    )
+    caches = spec.get_worker.call_args.args[0]
+    assert len(caches.tensors) == 1
+    assert caches.group_data_refs == [[CanonicalKVCacheRef(0, row_bytes)]]
+    packed = caches.tensors[0].tensor
+    assert packed.data_ptr() == raw.data_ptr()
+    assert packed.shape == (NUM_BLOCKS, row_bytes)
+    assert torch.equal(packed.view(torch.uint8), expected)
+
+    # Exercise the real backend allocator without requiring a GPU DMA engine.
+    backend = CPUOffloadingSpec(
+        replace(
+            _offloading_config(),
+            worker_kv_bytes_per_block=row_bytes,
+            extra_config={
+                "offload_region": "mmap",
+                "cpu_bytes_to_use": (
+                    round_up(row_bytes, MmapOffloadRegion.BLOCK_SIZE_ALIGNMENT)
+                    * NUM_BLOCKS
+                    * 2
+                ),
+            },
+        )
+    )
+    region = backend._create_offload_region(rank=0)
+    try:
+        assert isinstance(region, MmapOffloadRegion)
+        cpu = region.create_next_worker_view(row_bytes)
+        cpu[:NUM_BLOCKS].copy_(packed)
+        raw.zero_()
+        packed.copy_(cpu[:NUM_BLOCKS])
+        assert torch.equal(raw, expected)
+    finally:
+        region.cleanup()
 
 
 @pytest.mark.parametrize("backend", ATTN_BACKENDS)
