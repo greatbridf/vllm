@@ -405,8 +405,24 @@ def test_cpu_offloading_sliding_window_partial_chunk() -> None:
     or not os.environ.get("VLLM_TEST_DEEPSEEK_V41_MODEL"),
     reason="Requires CUDA and VLLM_TEST_DEEPSEEK_V41_MODEL weights",
 )
-def test_deepseek_v41_mmap_offload_reload_matches_cold_output():
+@pytest.mark.parametrize("backend", ["mmap", "rust"])
+def test_deepseek_v41_mmap_offload_reload_matches_cold_output(backend):
     """Force a CPU reload and compare greedy tokens against cold prefill."""
+    extra_config = {
+        "offload_region": "mmap",
+        "cpu_bytes_to_use": 4 << 30,
+        "blocks_per_chunk": 1,
+    }
+    if backend == "rust":
+        path = os.environ.get("VLLM_TEST_KV_CACHE_SERVICE_SOCKET")
+        if not path:
+            pytest.skip("Requires VLLM_TEST_KV_CACHE_SERVICE_SOCKET")
+        extra_config = {
+            "spec_name": "RustServiceOffloadingSpec",
+            "service_socket": path,
+            "cpu_bytes_to_use": 4 << 30,
+            "blocks_per_chunk": 1,
+        }
     llm = LLM(
         model=os.environ["VLLM_TEST_DEEPSEEK_V41_MODEL"],
         tensor_parallel_size=int(os.environ.get("VLLM_TEST_DEEPSEEK_V41_TP", "1")),
@@ -417,11 +433,7 @@ def test_deepseek_v41_mmap_offload_reload_matches_cold_output():
         kv_transfer_config=KVTransferConfig(
             kv_connector="OffloadingConnector",
             kv_role="kv_both",
-            kv_connector_extra_config={
-                "offload_region": "mmap",
-                "cpu_bytes_to_use": 4 << 30,
-                "blocks_per_chunk": 1,
-            },
+            kv_connector_extra_config=extra_config,
         ),
     )
     params = SamplingParams(temperature=0, max_tokens=8)

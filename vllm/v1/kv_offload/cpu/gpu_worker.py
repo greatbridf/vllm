@@ -35,11 +35,14 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     swap_blocks_batch,
 )
 from vllm.v1.kv_offload.pointer_utils import iter_pointer_groups
+from vllm.v1.kv_offload.service.region import ServiceOffloadRegion
 
 logger = init_logger(__name__)
 
 # Host allocation backing a worker's offload side.
-OffloadRegion = SharedOffloadRegion | HMMOffloadRegion | MmapOffloadRegion
+OffloadRegion = (
+    SharedOffloadRegion | HMMOffloadRegion | MmapOffloadRegion | ServiceOffloadRegion
+)
 
 
 def _clear_pending_device_error() -> None:

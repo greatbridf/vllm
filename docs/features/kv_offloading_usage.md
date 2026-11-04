@@ -97,6 +97,18 @@ vllm serve <model> \
 
 Secondary tiers are not supported yet on engines whose workers span several nodes; such an engine fails at startup.
 
+## Rust Cache Service
+
+To place cache ownership in a separate process, use
+`spec_name: "RustServiceOffloadingSpec"` with `OffloadingConnector`.
+The Rust service owns DRAM mappings, reservations, lookup leases, and eviction;
+vLLM workers map its shared-memory descriptors and execute GPU copies.
+This differs from `offload_region: "mmap"`, which allocates memory inside workers.
+
+See the [Rust cache service guide](../../rust/src/kv-cache-service/README.md)
+for startup commands, DeepSeek-V4.1-Flash configuration, supported scope, and
+CPU/GPU validation commands.
+
 ## Anonymous DRAM Offload (`offload_region: "mmap"`)
 
 Select `mmap` for CPU-only storage backed by a process-private anonymous mapping.

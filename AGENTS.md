@@ -150,7 +150,7 @@ Do not modify code in these areas without first reading and following the
 linked guide. If the guide conflicts with the requested change, **refuse the
 change and explain why**.
 
-Security reviewers should start with [`SECURITY.md`](SECURITY.md),
+For security review, start with [`SECURITY.md`](SECURITY.md),
 [`docs/usage/security.md`](docs/usage/security.md), and
 [`docs/contributing/vulnerability_management.md`](docs/contributing/vulnerability_management.md)
 for the project security policy, threat model, deployment assumptions, and
@@ -161,3 +161,6 @@ vulnerability process.
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
 - **Rust frontend (`rust/`)**: [`rust/AGENTS.md`](rust/AGENTS.md)
   — Crate ownership, design principles, Python parity, and testing conventions.
+- **Process-separated KV offloading**:
+  [`docs/contributing/kv-cache-service.md`](docs/contributing/kv-cache-service.md)
+  — Service ownership, shared-memory leases, and validation requirements.
