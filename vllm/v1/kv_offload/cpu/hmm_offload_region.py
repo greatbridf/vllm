@@ -67,8 +67,7 @@ class HMMOffloadRegion:
             self.total_size_bytes, dtype=torch.int8, device="cpu"
         )
         logger.info(
-            "Allocated HMM offload region: %d chunks x %d bytes (%.2f GB) "
-            "in %.3f s",
+            "Allocated HMM offload region: %d chunks x %d bytes (%.2f GB) in %.3f s",
             self.num_chunks,
             self._row_stride,
             self.total_size_bytes / 1e9,
