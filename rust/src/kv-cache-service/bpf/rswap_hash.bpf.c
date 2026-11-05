@@ -12,7 +12,6 @@
 #include "rswap_hash.h"
 
 typedef unsigned long long u64;
-typedef unsigned char u8;
 
 #define SEC(name) __attribute__((section(name), used))
 
@@ -22,15 +21,18 @@ typedef unsigned char u8;
 _Static_assert(sizeof(struct rswap_hash_ctx) == 56, "rswap context ABI");
 _Static_assert(sizeof(struct rswap_arena_hdr) == 128, "arena header ABI");
 _Static_assert(sizeof(struct rswap_page_meta) == 64, "arena entry ABI");
+_Static_assert(__builtin_offsetof(struct rswap_page_meta, hash) == 8, "hash ABI");
+_Static_assert(__builtin_offsetof(struct rswap_page_meta, page_index) == 56,
+	       "page index ABI");
 
 SEC("syscall")
 int rswap_hash_prog(struct rswap_hash_ctx *ctx)
 {
 	u64 base = RSWAP_ARENA_MARKER;
 	struct rswap_arena_hdr *hdr;
+	volatile struct rswap_page_meta *meta;
 	u64 vaddr = ctx->vaddr;
-	u64 shift, data_base, num, index, meta, entry_size;
-	volatile u64 *src;
+	u64 shift, data_base, num, index, entry_size;
 	u64 *dst;
 	int i;
 
@@ -56,16 +58,16 @@ int rswap_hash_prog(struct rswap_hash_ctx *ctx)
 	if (index >= num)
 		return 0;
 
-	meta = base + *(volatile u64 *)&hdr->entries_off +
-	       index * RSWAP_ARENA_ENTRY_SIZE;
-	if (*(volatile u8 *)meta == 0)
+	meta = (volatile struct rswap_page_meta *)(base +
+		*(volatile u64 *)&hdr->entries_off +
+		index * RSWAP_ARENA_ENTRY_SIZE);
+	if (meta->ready == 0)
 		return 0;
 
-	src = (volatile u64 *)(meta + sizeof(u64));
 	dst = (u64 *)ctx->hash;
 #pragma clang loop unroll(full)
 	for (i = 0; i < 6; i++)
-		dst[i] = src[i];
+		dst[i] = meta->hash_words[i];
 
 	return 1;
 }
