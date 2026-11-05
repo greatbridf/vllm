@@ -13,7 +13,12 @@ serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "cache"
+harness = false
 
 [lints]
 workspace = true

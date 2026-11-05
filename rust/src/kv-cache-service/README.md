@@ -245,6 +245,67 @@ when enabled, and model output is unaffected.
   `lookup_many` reply carries statuses only, so a batch bounded by `MAX_KEYS`
   always fits.
 
+## Performance
+
+Both layers below are CPU-only: no GPU, no root, no rswap. The numbers are one
+idle run on an aarch64 Linux VM (Apple silicon host, 11 vCPU, 16 GiB DRAM,
+16 KiB pages), so re-measure on the machine you deploy instead of comparing
+across machines. Repeated runs spread by about 10 %, except for the groups that
+rebuild their fixture at 2^15 entries, where ten samples put the spread at 30 %.
+
+Cache metadata (`cargo bench`):
+
+| bench | shape | cost |
+| --- | --- | --- |
+| `lookup_hit` | 2^11 / 2^13 / 2^15 entries | 38 / 39 / 46 ns |
+| `touch_least_recent` | same, promoted entry at the LRU tail | 83 / 81 / 126 ns |
+| `store_evict` | 2^13 entries, 1 / 16 / 64 victims | 360 ns / 3.9 µs / 13.3 µs |
+| `store_evict` | 2^15 entries, 1 / 16 / 64 victims | 460 ns / 4.0 µs / 14.4 µs |
+| `release_request` | 2^13 entries, 1 / 64 leases | 80 ns / 163 ns |
+| `release_request` | 2^15 entries, 1 / 64 leases | 83 ns / 318 ns |
+| `check_keys` | 1 / 256 / 4096 keys | 20 ns / 10.3 µs / 179 µs |
+
+Promotion, victim selection, and lease release are flat in the entry count: a
+2^15-entry cache evicts 64 keys in 14.4 µs. Only `check_keys` grows with its
+batch, at 44 ns per key of duplicate detection. The groups that rebuild their
+fixture per iteration (`touch_least_recent`, `store_evict`, `release_request`)
+promote or evict the true LRU tail; at 2^15 entries that setup dominates each
+iteration, so criterion reports the fewer samples it warns about.
+
+Control plane (`bench` subcommand, 4096 keys, 1 connection):
+
+| case | p50 | p99 | per op |
+| --- | --- | --- | --- |
+| `rpc_serial_lookup` | 26.9 µs | 31.5 µs | 27.1 µs |
+| `rpc_pipelined_lookup` | 0.63 µs | 0.79 µs | 0.67 µs |
+| `rpc_lookup_many` | 888 µs | 962 µs | 891 µs (0.22 µs per key) |
+| `mixed_schedule_step` | 75 µs | 926 µs | 349 µs |
+| `stats` | 34 µs | 44 µs | 34 µs |
+
+One lookup round trip costs 27 µs, so a per-chunk lookup costs the scheduler
+27 µs per chunk of the prefix. Pipelining the same lookups costs 0.67 µs per op,
+and one 4096-key `lookup_many` covers a 64 k-token prefix in 0.9 ms. Pipelined
+ops are charged the time since the previous reply, so the first op of a window
+also pays for the window to drain. `mixed_schedule_step` is a synthetic schedule
+step: the prefix scan, the load of its hits, a 64-chunk store and commit, and the
+release of the step's leases, so its mean is dominated by the scan.
+
+```bash
+cargo bench --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
+  --bench cache -- --warm-up-time 0.2 --measurement-time 0.5
+cargo run --release --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
+  -- bench --json --keys 4096 --conns 1 --iterations 500 \
+  --assert-max rpc_serial_lookup=200
+```
+
+`bench --keys`, `--conns`, `--iterations`, and `--cache-bytes` shape the run.
+It serves real protocol frames from the real dispatch loop on a private socket in
+the same process, one namespace per connection, and prints one JSON object per
+case (an aligned table without `--json`). Every `--assert-max <case>=<us>` bound
+that fails makes the process exit non-zero, so an accidental O(n) path (a 400 µs
+eviction instead of 14 µs) or a lost lookup batch fails CI instead of passing as
+noise.
+
 ## Tests
 
 ```bash

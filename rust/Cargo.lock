@@ -5754,6 +5754,7 @@ name = "vllm-kv-cache-service"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "criterion",
  "libc",
  "memmap2",
  "serde",

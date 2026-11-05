@@ -22,6 +22,7 @@ use vllm_kv_cache_service::protocol::{self, Request};
 
 #[macro_use]
 mod log;
+mod bench;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound on how long a shutdown signal waits for the accept loop, which
@@ -33,14 +34,18 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// Set by the SIGTERM and SIGINT handler, read by the accept loop.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// The command line. Serving requires a socket and a capacity, while the `bench`
+/// subcommand measures without either, so those two are optional here and still
+/// required by the parser whenever no subcommand is given.
 #[derive(Parser)]
+#[command(subcommand_negates_reqs = true)]
 struct Args {
     /// Socket in a directory accessible only to the service owner.
-    #[arg(long)]
-    socket: PathBuf,
+    #[arg(long, required = true)]
+    socket: Option<PathBuf>,
     /// Aggregate upper bound on bytes allocated across cache namespaces.
-    #[arg(long)]
-    capacity_bytes: usize,
+    #[arg(long, required = true)]
+    capacity_bytes: Option<usize>,
     /// Simultaneous client connections served at once.
     #[arg(long, default_value_t = 128)]
     max_connections: usize,
@@ -61,6 +66,14 @@ struct Args {
         default_missing_value = "/sys/kernel/mm/xswap/rswap_attach"
     )]
     rswap_attach: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Measure the control plane in-process and report the cost of each case.
+    Bench(bench::BenchArgs),
 }
 
 /// Per-connection bounds taken from the command line.
@@ -748,23 +761,35 @@ fn accept_connections(
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
-    let parent = args.socket.parent().ok_or_else(|| invalid("socket directory required"))?;
+    let Some(command) = args.command else {
+        return run_service(args);
+    };
+    match command {
+        Command::Bench(bench) => bench::run(bench),
+    }
+}
+
+fn run_service(args: Args) -> io::Result<()> {
+    let socket = args.socket.ok_or_else(|| invalid("--socket is required"))?;
+    let capacity_bytes =
+        args.capacity_bytes.ok_or_else(|| invalid("--capacity-bytes is required"))?;
+    let parent = socket.parent().ok_or_else(|| invalid("socket directory required"))?;
     let metadata = fs::metadata(parent)?;
     // SAFETY: geteuid takes no arguments and returns the calling process UID.
     let uid = unsafe { libc::geteuid() };
     if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != uid {
         return Err(invalid("socket directory must be private (mode 0700)"));
     }
-    if args.capacity_bytes == 0 {
+    if capacity_bytes == 0 {
         return Err(invalid("capacity must be positive"));
     }
     if args.max_connections == 0 {
         return Err(invalid("connection limit must be positive"));
     }
     install_shutdown_signal_handlers()?;
-    let listener = bind_listener(&args.socket)?;
-    let _socket_path = SocketPath(&args.socket);
-    fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o600))?;
+    let listener = bind_listener(&socket)?;
+    let _socket_path = SocketPath(&socket);
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let limits = Limits {
         max_connections: args.max_connections,
         idle_timeout: (args.idle_timeout_secs > 0)
@@ -772,8 +797,8 @@ fn main() -> io::Result<()> {
     };
     log_event!(
         "start",
-        "socket" = args.socket.display(),
-        "capacity_bytes" = args.capacity_bytes,
+        "socket" = socket.display(),
+        "capacity_bytes" = capacity_bytes,
         "pid" = std::process::id(),
         "max_connections" = limits.max_connections,
         "idle_timeout_secs" = args.idle_timeout_secs,
@@ -782,7 +807,7 @@ fn main() -> io::Result<()> {
     let registry = Arc::new(Mutex::new(Registry {
         namespaces: HashMap::new(),
         retired: Vec::new(),
-        budget: args.capacity_bytes,
+        budget: capacity_bytes,
         rswap_attach: args.rswap_attach,
         pending_timeout: (args.pending_timeout_secs > 0)
             .then(|| Duration::from_secs(args.pending_timeout_secs)),

@@ -52,3 +52,25 @@ Read this before changing the Rust CPU cache service or its native offloading sp
 - Follow the Rust subtree instructions for Cargo dependencies and testing. Use
   the repository virtual environment for Python tests. Report unrun GPU checks
   separately from passing CPU tests.
+
+## Benchmarks
+
+Measure a change on CPU before arguing it is cheap. Two layers, neither needing a
+GPU, root, or rswap:
+
+```bash
+cargo bench --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
+  --bench cache -- --warm-up-time 0.2 --measurement-time 0.5
+cargo run --release --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
+  -- bench --json --assert-max rpc_serial_lookup=200
+```
+
+`cargo bench` covers the cache metadata alone: promotion from the LRU tail, victim
+selection, lease release, and key validation. The `bench` subcommand runs the real
+dispatch loop in-process and reports one JSON object per case, so it also covers
+frame encoding, decoding, and the per-step RPC mix. A change that affects a lookup,
+eviction, lease, or validation path must state the measured delta in its PR, and
+the numbers in
+[`rust/src/kv-cache-service/README.md`](../../rust/src/kv-cache-service/README.md)
+must be re-measured when they move. Set `--assert-max` bounds 2-3x above the local
+number: they exist to catch an O(n) path or a dropped batch, not jitter.
