@@ -463,6 +463,7 @@ def test_worker_syncs_before_cleanup_after_handler_failure(
     ("region_type", "replicated_layout"),
     [("tensor", False), ("shared", False), ("shared", True), ("mmap", False)],
 )
+@pytest.mark.skipif(current_platform.is_cpu(), reason="needs a GPU")
 @torch.inference_mode()
 def test_transfer(
     default_vllm_config,
@@ -660,6 +661,7 @@ def test_transfer(
 @pytest.mark.parametrize("num_cpu_chunks", NUM_CPU_CHUNKS)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.skipif(current_platform.is_cpu(), reason="needs a GPU")
 @torch.inference_mode()
 def test_transfer_multi_group(
     default_vllm_config,
