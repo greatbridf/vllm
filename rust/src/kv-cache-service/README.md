@@ -52,7 +52,173 @@ allocated.
 Workers attempt host pinning through the existing DMA worker and register only
 their own slice of every chunk, so pinned memory stays one slice per worker
 instead of the whole multi-rank region; pageable fallback does not guarantee
-that Linux keeps all pages resident in DRAM.
+that Linux keeps all pages resident in DRAM. Sizing has the arithmetic behind
+`cpu_bytes_to_use`.
+
+## Deployment
+
+Run the service under a supervisor. A `systemd` unit:
+
+```ini
+# /etc/systemd/system/vllm-kv-cache.service
+[Unit]
+Description=vLLM Rust KV cache service
+After=local-fs.target
+
+[Service]
+Type=simple
+User=vllm
+RuntimeDirectory=vllm-kv-service
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/vllm-kv-cache-service \
+    --socket /run/vllm-kv-service/cache.sock \
+    --capacity-bytes 68719476736
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`RuntimeDirectory` creates `/run/vllm-kv-service` owned by `User` with mode
+`0700` and removes it when the unit stops, which is the layout the service
+requires: it refuses to start unless the socket's parent is a directory owned by
+its own UID with no group or other access, and it creates the socket with mode
+`0600`. The start fails with `socket directory must be private (mode 0700)` when
+the directory grants group or other access. Peers are authenticated by UID, so
+the engine must run as `User`.
+
+The unit needs no cleanup step. `SIGTERM` from `systemctl stop` unlinks the
+socket and exits 0, so `Restart=on-failure` restarts the service only after a
+failure; a process that was killed leaves its socket behind and the next start
+reclaims it (see Lifecycle). Changing `--capacity-bytes` needs a restart of the
+service, which drops every namespace. Every event of the service is one line in
+the journal (`journalctl -u vllm-kv-cache.service`).
+
+`--rswap-attach` needs BPF privileges, which the unit grants explicitly; leave
+both lines out when hash reporting is off, because the service needs no
+capability otherwise.
+
+```ini
+CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN
+AmbientCapabilities=CAP_BPF CAP_SYS_ADMIN
+```
+
+Build the binary with
+
+```bash
+cargo build --release --manifest-path rust/Cargo.toml -p vllm-kv-cache-service
+```
+
+which writes `rust/target/release/vllm-kv-cache-service`; install it where
+`ExecStart` points. One service can serve every engine on the node: each engine
+opens its own namespace, so an engine needs a distinct `engine_id` and its share
+of `--capacity-bytes`.
+
+## Sizing
+
+One engine reserves one row per chunk:
+
+```text
+worker_bytes    = blocks_per_chunk x worker_kv_bytes_per_block
+row_bytes       = round_up(worker_bytes x world_size, page_size)
+num_chunks      = cpu_bytes_to_use // row_bytes
+namespace_bytes = row_bytes x num_chunks
+```
+
+`worker_bytes` is one rank's slice of a chunk and every rank stores its own copy,
+so a row holds `world_size` slices rounded up to the host page size (`4096` bytes
+on most hosts, `16384` on a 16 KiB-page aarch64 kernel). The padding is bounded
+by one page per row, so a chunk whose row is smaller than a page wastes most of
+its reservation: a 100-byte per-rank chunk over 8 ranks is one 800-byte row,
+charged as a whole page.
+
+The reservation is charged for as long as the namespace exists, filled or not,
+and `cpu_bytes_to_use` must hold at least one row. For example 64 GiB over 8
+ranks with 2 MiB of KV per rank and chunk gives `row_bytes = 16 MiB` and
+`num_chunks = 4096`.
+
+`--capacity-bytes` must cover every engine's reservation plus one more:
+
+```text
+sum over engines of row_bytes x num_chunks, plus one engine's full reservation
+```
+
+The extra reservation covers an engine that starts while its predecessor still
+holds sessions: a namespace whose scheduler disconnected but whose workers are
+still attached is retired and stays charged until its last session leaves (see
+Failure modes).
+
+A size that does not fit shows up in one of three ways:
+
+- `cpu_bytes_to_use` below one row fails the engine at startup with the minimum
+  to reserve, and an aggregate budget below one row fails it with the
+  `--capacity-bytes` to raise.
+- A `cpu_bytes_to_use` above what `--capacity-bytes` holds is trimmed with a
+  warning to the chunks the budget holds. That cap compares against the whole
+  budget rather than against what other namespaces already reserved, so a second
+  engine can still be rejected by `open` with `cache exceeds service capacity`,
+  which fails its startup.
+- Inside a namespace a full cache evicts. Only when no chunk can be freed,
+  because every one is leased, reserved, or part of the store batch itself, does
+  `store` answer `{"ok": true, "full": true}` and the engine keeps those chunks
+  in GPU memory only.
+
+## Protocol
+
+Every message is one frame: a 4-byte big-endian length and that many bytes of
+JSON. Both directions are bounded by 1 MiB. A request is an object whose `op`
+field names one of the operations below; an unknown operation, an unknown field,
+a non-JSON payload, a length of 0, and a length above the limit are frame-level
+failures. Requests carry no ids, so a reply belongs to the request in flight,
+and the service answers one connection's requests in arrival order, one at a
+time. A client that writes several frames before reading their replies pipelines
+them; the connector does not.
+
+| `op` | Fields | Sent by | Reply |
+| --- | --- | --- | --- |
+| `open` | `version`, `namespace`, `fingerprint`, `worker_bytes`, `world_size`, `num_chunks` | scheduler | the namespace geometry |
+| `attach` | `version`, `namespace`, `fingerprint`, `rank` | worker | the namespace geometry, then one shared-memory descriptor |
+| `lookup` | `key`, `request` | scheduler | `status` |
+| `lookup_many` | `keys`, `request` | scheduler | `statuses`, one per key in order |
+| `load` | `keys`, `request` | scheduler | `slots`, one per key |
+| `release` | `keys`, `request` | scheduler | `released`, `unknown` |
+| `release_request` | `request` | scheduler | `released`, `unknown` |
+| `store` | `keys`, `request` | scheduler | `keys`, `slots`, `evicted`, or `full` |
+| `commit` | `keys`, `request`, `success` | scheduler | `ok` only |
+| `touch` | `keys` | scheduler | `ok` only |
+| `reset` | `force`, default `false` | scheduler | `ok` only |
+| `stats` | none | scheduler or worker | `stats` |
+| `info` | none | anyone, before any handshake | service state |
+
+`open` and `attach` are the only handshake operations, and a session holds at
+most one namespace. `open` creates a namespace under a caller-chosen name, with
+the caller's 64-hex layout fingerprint and the geometry it will reserve;
+`attach` joins that namespace at one rank and receives the descriptor of its
+mapping. After the handshake the session that opened the namespace owns every
+mutating operation, while an attached worker may send `stats` and nothing else.
+An `attach` reply is the frame followed by one 1-byte message that carries one
+`SCM_RIGHTS` descriptor, so a client must receive it before it sends another
+request. `info` needs no handshake and is the only operation that reports the
+service rather than one namespace.
+
+A `stats` reply, one counter set per namespace:
+
+```json
+{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "free_chunks": 2, "requests": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}}
+```
+
+An `info` reply, which an operator or a probe can read before any engine opened a
+namespace:
+
+```json
+{"ok": true, "version": "0.1.0", "pid": 81470, "uptime_ms": 2710, "capacity_bytes": 68719476736, "used_bytes": 0, "retired_bytes": 0, "namespaces": 0, "sessions": 0, "max_connections": 128}
+```
+
+A frame-level failure closes the connection without a reply, and the namespace
+that session owned is invalidated. A request-level failure answers
+`{"ok": false, "error": "..."}` and leaves the session and its namespace alive;
+Ownership lists what a rejection covers and what it leaves to the caller.
 
 ## Ownership
 
@@ -88,7 +254,10 @@ store a worker performs.
 
 `release` and `release_request` still succeed on unknown input, but report what
 they ended: `{"ok": true, "released": N, "unknown": M}` counts the leases
-dropped and the keys or request ids that held none.
+dropped and the keys or request ids that held none. A lease has no timeout of
+its own: it ends with `release`, `release_request`, a forced `reset`, or with the
+namespace, so a request the connector never finishes keeps its chunks out of the
+eviction order until the engine stops.
 
 `stats` reports the namespace state (`entries`, `pending`, `leased`,
 `free_chunks`, `bytes`, `num_chunks`, `requests` for requests currently holding
@@ -121,12 +290,13 @@ has looked up since they were stored. A `store` batch never evicts a key it
 contains, and a reservation is not a victim until it is committed.
 
 A rejection (`{"ok": false, "error": ...}`) keeps the session and its namespace
-alive: an invalid key or request id, an unknown namespace, a commit without a
-matching reservation, a `store` batch too large for one control frame, and an
-unknown handshake field all leave the caller free to retry or give up without
-losing the cache. Only frame-level failures (bad length, non-JSON, unknown op)
-and I/O errors close a connection. Attached workers may read `stats`; every
-other command mutates scheduler-owned metadata and is rejected for them.
+alive: an invalid key or request id, an unknown namespace, incompatible handshake
+fields, a commit without a matching reservation, and a `store` batch too large
+for one control frame all leave the caller free to retry or give up without
+losing the cache. Only frame-level failures (bad length, non-JSON, unknown op or
+field, a short frame) and I/O errors close a connection. Attached workers may
+read `stats`; every other command mutates scheduler-owned metadata and is
+rejected for them.
 `store` and `commit` both carry the request that owns the reservation, so a
 request id must be the same one across the whole lifetime of that request.
 No reply is written while the namespace registry is locked, so a client that
@@ -139,9 +309,9 @@ on the wire, so any user-supplied id fits the 256-byte limit; the service sees
 one stable 32-character id per request.
 
 A control RPC that fails at the transport level closes the client. A read-only
-`lookup` reconnects and repeats itself once, and every other operation stops
-offloading for that engine instead of failing the scheduler step: a lookup
-becomes a miss and reservations, completions, touches, and resets become
+`lookup` or `lookup_many` reconnects and repeats itself once, and every other
+operation stops offloading for that engine instead of failing the scheduler step:
+a lookup becomes a miss and reservations, completions, touches, and resets become
 no-ops. A rejection after such a reconnect disables offloading the same way,
 because a namespace the service dropped cannot serve the request again. A reply
 that breaks the slot contract raises instead, since it means a service bug and
@@ -183,14 +353,90 @@ namespace. This workspace builds its binaries with `panic = "abort"`, where a
 panic ends the process instead; the socket path it leaves behind is reclaimed by
 the next start.
 
+## Monitoring
+
+The service has no metrics endpoint. It writes one line per event to stderr (see
+Lifecycle) and answers two read-only operations, `info` for the service and
+`stats` for one namespace. `info` needs no handshake, so any same-UID process can
+probe it, while `stats` needs a session in the namespace.
+
+```bash
+.venv/bin/python - <<'PY'
+from vllm.v1.kv_offload.service.client import CacheServiceClient
+
+client = CacheServiceClient("/run/vllm-kv-service/cache.sock")
+print(client.call("info"))
+client.close()
+PY
+```
+
+`info` reports `capacity_bytes`, `used_bytes` (live plus retired namespaces),
+`retired_bytes`, `namespaces`, and `sessions`. A `used_bytes` that stays at its
+value after every engine of a restart is gone, with `retired_bytes` equal to it,
+means a worker of the old engine still holds its session. The service has no
+aggregate `stats`: one namespace is one `stats` call.
+
+`stats` reports one namespace, and its counters show a leak before the cache
+stalls:
+
+| Reading | Meaning |
+| --- | --- |
+| `leased`, `requests` | Chunks with a live request lease, and the requests holding them. A leased chunk cannot be evicted, and no lease has a timeout, so a value that does not fall to 0 once the engine is idle is a lease the engine never released. |
+| `pending` | Chunks reserved by a `store` and not committed. Sustained non-zero means a worker reserved slots and never committed them; `--pending-timeout-secs` reclaims them and logs `reservations_reclaimed`. |
+| `free_chunks` | Chunks no key holds. At 0 with `pending` at 0, a `store` can only evict. |
+| `hits`, `misses`, `pending_hits` | Lookup outcomes since `open`, unchanged across `reset`. |
+| `evictions`, `stores`, `commits`, `aborted` | Chunks evicted, reserved, published, and released without publishing. |
+| `failed_commits`, `reclaimed` | Commits rejected (ownership, missing reservation, failed publish) and keys reclaimed by the pending timeout. |
+
+Engine side, the connector samples one `stats` RPC per collection and reports
+`vllm:kv_offload_cpu_cache_usage_perc` (`entries / num_chunks`),
+`vllm:kv_offload_cpu_cache_write_usage_perc` (`pending / num_chunks`),
+`vllm:kv_offload_cpu_cache_read_usage_perc` (the difference of the two), and one
+`vllm:kv_offload_cpu_allocation_size` observation per store batch.
+`vllm:kv_offload_config_info` carries the negotiated geometry in
+`cpu_num_chunks`, `cpu_blocks_per_chunk`, `cpu_kv_cache_size_bytes`, and
+`cpu_kv_cache_size_tokens`, with no `tier` label because this backend reports one
+configuration. `vllm:kv_offload_stores_skipped` never appears here, since it is
+declared only for a `store_threshold` of 2 or more, which the spec rejects. The
+counters that no declared metric carries, such as `evictions` and `reclaimed`,
+are logged at debug level.
+
+## Failure modes and recovery
+
+| Symptom | Cause | Recovery |
+| --- | --- | --- |
+| `socket directory must be private (mode 0700)` at start | the socket's parent grants group or other access, or belongs to another user | use a `RuntimeDirectory` as Deployment shows |
+| `another service is listening on <path>` at start | a live service owns the path | stop it, or point `service_socket` at this one; the path was not unlinked |
+| `capacity must be positive`, `connection limit must be positive` at start | `--capacity-bytes 0` or `--max-connections 0` | pass a positive bound |
+| `service was built without the rswap BPF object` on `open` | `--rswap-attach` on a build without clang | rebuild with clang or drop the flag; the service itself starts |
+| `namespace already owned by another scheduler` | another live engine uses the same `engine_id` | give each engine a distinct `engine_id`, or stop the old engine |
+| `cache exceeds service capacity` at engine start | `--capacity-bytes` is smaller than the reservations, or a restarting engine's predecessor still holds sessions | raise it and restart the service, or stop the stale engine; see Sizing |
+| `cache namespace invalidated` | a session of that namespace disconnected, was idle-timed out, or sent a malformed frame | restart the engine; its cache is cold |
+| `scheduler namespace not available` on `attach` | the worker attached after the namespace was invalidated | restart the whole engine, not only the worker |
+| `incompatible or duplicate worker` on `attach` | a second attach of the same rank, or a rank that does not match the namespace fingerprint | restart the engine; every rank must attach once, with one layout |
+| `workers cannot mutate cache metadata` | an attached worker sent an operation other than `stats` | a client bug; the worker's session and the namespace still live |
+| `cannot reset a cache with active transfers or leases` | a `reset` without `force` while a lease or reservation is open | release the leases, or send `{"force": true}` once every transfer whose slot it abandons is flushed |
+| `cannot connect to the KV cache service at ...` | the socket is missing, the service is down, or the path or UID is wrong | check the unit, `ls -l` the socket, and `info` |
+| `invalid_frame` in the journal, then a closed connection | a bad frame length, a non-JSON payload, or an unknown `op` or field | a client bug or a version mismatch; the namespace that session owned is gone, so restart the engine |
+| one error line, then every lookup misses | a transport failure, or a rejection after the reconnect | offloading is off for that engine until it restarts |
+| `internal error` | a panic under `catch_unwind` | that connection closed; restart the engine if it recurs |
+
+Nothing reconnects a mutating operation: a read-only `lookup` repeats itself
+once on a new connection, every other operation degrades as Ownership
+describes, and the cache of a restarted engine is always cold. Old mappings are
+never reused, and a namespace stays charged until the last of its sessions
+leaves, so a restart of one engine can fail on capacity while the previous
+process is still exiting.
+
 ## Hash reporting
 
 Hash reporting is optional and off by default. Pass `--rswap-attach` (or
 `--hash-attach`), optionally with a sysfs path that defaults to
 `/sys/kernel/mm/xswap/rswap_attach`, to enable it. It requires an
 rswap-capable kernel (`CONFIG_RSWAP`) with `BPF_PROG_TYPE_SYSCALL` support.
-Cargo builds `bpf/rswap_hash.bpf.c` with clang when available; without clang,
-`--rswap-attach` is unavailable at runtime.
+Cargo builds `bpf/rswap_hash.bpf.c` with clang when available; without clang the
+build still succeeds, the flag is still accepted, and every namespace `open`
+fails with `service was built without the rswap BPF object`.
 
 At namespace open, the service loads the embedded BPF object with CAP_BPF and
 attaches it to the memfd VMA with CAP_SYS_ADMIN by writing
@@ -238,12 +484,30 @@ when enabled, and model output is unaffected.
 - No secondary tiers, persistent cache, cross-engine cache reuse, context
   parallelism, pipeline parallelism, or shared-copy TP deduplication.
 - Bounded synchronous control RPCs are a correctness-first MVP. Lookups are
-  batched through `lookup_many`; pipelined RPCs, background liveness checks and
-  CUDA-IPC service-side DMA are future work.
+  batched through `lookup_many`; the connector does not pipeline its requests,
+  and background liveness checks and CUDA-IPC service-side DMA are future work.
 - A `store` batch whose reply cannot fit in one 1 MiB frame is rejected with
   `batch too large for one control frame` before any slot is reserved. A
   `lookup_many` reply carries statuses only, so a batch bounded by `MAX_KEYS`
   always fits.
+
+Numbers the service enforces:
+
+- `world_size` from 1 to 64 per namespace; `worker_bytes` and `num_chunks` of at
+  least 1, with `row_bytes x num_chunks` fitting the remaining capacity.
+- `num_chunks` at most 2^31 - 1 in the connector, and at most 2^32 - 2 on the
+  wire, because `u32::MAX` is the absent-slot marker.
+- At most 4096 keys per request. A key is 1 to 512 hexadecimal characters of even
+  length and unique within its batch.
+- A request id is 1 to 256 bytes on the wire; the connector sends a 32-character
+  SHA-256 prefix of the vLLM request id, so any user id fits.
+- A namespace name is 1 to 256 bytes, and a layout fingerprint is exactly 64
+  hexadecimal characters.
+- One frame is at most 1 MiB in either direction.
+- One namespace per session, because a session `open`s or `attach`es once, and
+  one in-flight request per client: the connector never pipelines.
+- `--max-connections` 128, `--idle-timeout-secs` 900, and
+  `--pending-timeout-secs` 60 by default.
 
 ## Performance
 
@@ -310,9 +574,24 @@ noise.
 
 ```bash
 cargo test --manifest-path rust/Cargo.toml -p vllm-kv-cache-service
+cargo clippy --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
+  --all-targets -- -D warnings
+cargo fmt --manifest-path rust/Cargo.toml -p vllm-kv-cache-service -- --check
 .venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
-  tests/v1/kv_offload/test_service.py -v
+  tests/v1/kv_offload/test_service.py tests/v1/kv_offload/test_service_manager.py \
+  tests/v1/kv_offload/test_service_region.py -q
+.venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
+  tests/v1/kv_offload/test_factory.py -k rust -q
 ```
+
+`tests/server.rs` starts the built binary on a private socket, so those runs need
+no Python environment, GPU, or root. The arena and program tests in
+`tests/hash.rs` print `SKIP: ...` and return without asserting when the kernel
+lacks BPF privileges or `BPF_MAP_TYPE_ARENA`, so a green `cargo test` does not by
+itself prove the BPF path ran. The Python suites need
+`rust/target/debug/vllm-kv-cache-service` (or `VLLM_KV_CACHE_SERVICE_BINARY`) and
+skip when it is missing; `test_service_manager.py` and `test_service_region.py`
+need neither the binary nor a GPU.
 
 On a machine booted into an rswap-capable kernel (`CONFIG_RSWAP`) with an rswap
 backend configured, `test_service_rswap.py` also covers the kernel side: it
@@ -330,6 +609,11 @@ sudo VLLM_TEST_KV_SERVICE_RSWAP=1 VLLM_TEST_KV_SERVICE_RSWAP_CHUNKS=256 \
   tests/v1/kv_offload/test_service_rswap.py -v
 ```
 
+The digest audit compares what the service published with what the rswap backend
+stored, so it needs a readable rswap backend; without one the test prints `no
+readable rswap backend: N pages stored unaudited` and asserts only the kernel's
+page counters and the round trip.
+
 With the service running and CUDA model weights available:
 
 ```bash
@@ -343,3 +627,11 @@ VLLM_TEST_KV_CACHE_SERVICE_SOCKET=/tmp/vllm-kv-service/cache.sock \
 
 CPU subprocess tests verify the actual protocol and shared memory, not GPU DMA
 or model-output correctness.
+
+## Further reading
+
+- [KV Offloading Usage Guide](../../../docs/features/kv_offloading_usage.md) has the
+  `kv_connector_extra_config` reference and what the engine does with this
+  backend: metrics, cache-hit source, KV events, and the rejected combinations.
+- [Process-Separated KV Offloading](../../../docs/contributing/kv-cache-service.md)
+  has the invariants a change must keep and how to validate one.

@@ -1,6 +1,9 @@
 # Process-Separated KV Offloading
 
 Read this before changing the Rust CPU cache service or its native offloading spec.
+The operator-facing side of this backend, including its
+`kv_connector_extra_config` keys and the metrics it reports, lives in
+[KV Offloading Usage Guide](../features/kv_offloading_usage.md).
 
 - Keep cache keys, reservations, and eviction in the service. Worker-side memory
   allocators are not a substitute for an out-of-process backend.
@@ -52,6 +55,100 @@ Read this before changing the Rust CPU cache service or its native offloading sp
 - Follow the Rust subtree instructions for Cargo dependencies and testing. Use
   the repository virtual environment for Python tests. Report unrun GPU checks
   separately from passing CPU tests.
+
+## Review checklist
+
+Each invariant below is what a change to this backend must keep, and the test
+that pins it:
+
+- **Reservation ownership.** A `store` reservation belongs to the request that
+  made it, and a `commit` from another request is rejected with the reservation
+  still pending (`cache.rs::commit`,
+  `commit_by_another_request_leaves_the_reservation_pending`).
+- **Publish only after every worker reported.** `store` reserves, `commit` with
+  `success` publishes, `complete_store` is the only caller, and a failed commit
+  releases the slots and clears their hashes
+  (`failed_publish_keeps_entry_pending_and_returns_error`).
+- **Lease before hit.** `lookup` and `lookup_many` take the lease before
+  reporting a hit, and `load` refuses a key this request does not lease
+  (`lookup_lease_prevents_eviction_before_load`). A lease is released only when
+  the request finished and every job it issued completed
+  (`test_lookup_lease_released_only_after_finish_and_all_jobs`).
+- **Namespace retirement.** A disconnected session never hands its mapping to a
+  new namespace: the namespace is retired and stays charged to capacity until
+  its last session leaves (`main.rs::release_session`).
+- **Reset ordering.** `reset` refuses leases and pending reservations; the forced
+  reset follows `on_reset_flushed()`, and only after every worker reported the
+  transfers it flushed (`forced_reset_discards_leases_and_pending_reservations`,
+  `test_reset_is_two_phase_and_aborts_pending_reservations`).
+- **Bounded frames.** 1 MiB in either direction, 4096 keys per request, and a
+  `store` reply that cannot fit is rejected before any slot is reserved
+  (`protocol.rs::store_reply_fits`, `check_keys_is_bounded`).
+- **No lock across socket I/O.** The reply is built before the wire is touched,
+  the registry lock is released before the cache is used, and the frame and the
+  descriptor are written after `handle` returns, so a client that stops reading
+  blocks only its own connection
+  (`slow_reader_does_not_block_another_namespace`).
+
+## Validating a change
+
+```bash
+# Unit and integration tests: cache, protocol, and the service binary.
+cargo test --manifest-path rust/Cargo.toml -p vllm-kv-cache-service
+
+# Lints and formatting.
+cargo clippy --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
+  --all-targets -- -D warnings
+cargo fmt --manifest-path rust/Cargo.toml -p vllm-kv-cache-service -- --check
+
+# The connector, spec, manager, and region tests against the real binary.
+cargo build --manifest-path rust/Cargo.toml -p vllm-kv-cache-service
+.venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
+  tests/v1/kv_offload/test_service.py tests/v1/kv_offload/test_service_manager.py \
+  tests/v1/kv_offload/test_service_region.py -q
+.venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
+  tests/v1/kv_offload/test_factory.py -k rust -q
+```
+
+None of these needs root, an rswap kernel, or a GPU. Two of the suites can pass
+while skipping what they cover, so a report says which happened:
+
+- `tests/hash.rs` prints `SKIP: ...` and returns without asserting when the
+  kernel has no BPF privileges or `BPF_MAP_TYPE_ARENA`, so a green `cargo test`
+  on such a host has not exercised the arena or the program.
+- `test_service.py` skips when the binary is missing (`Build
+  vllm-kv-cache-service or set VLLM_KV_CACHE_SERVICE_BINARY`).
+  `test_service_manager.py` and `test_service_region.py` need neither the binary
+  nor a GPU; `test_service.py` needs only the binary.
+
+The opt-in suites need hardware or privileges and stay out of CI:
+
+```bash
+# Kernel digest path: root, CONFIG_RSWAP, an idle swap setup, and a readable
+# rswap backend for the digest audit.
+sudo VLLM_TEST_KV_SERVICE_RSWAP=1 .venv/bin/python -m pytest \
+  --confcutdir=tests/v1/kv_offload tests/v1/kv_offload/test_service_rswap.py -v
+
+# GPU DMA and model output, against a service you started yourself.
+VLLM_TEST_DEEPSEEK_V41_MODEL=/path/to/DeepSeek-V4.1-Flash \
+VLLM_TEST_DEEPSEEK_V41_TP=8 \
+VLLM_TEST_KV_CACHE_SERVICE_SOCKET=/run/vllm-kv-service/cache.sock \
+.venv/bin/python -m pytest \
+  tests/v1/kv_connector/unit/test_offloading_connector.py \
+  -k 'deepseek_v41_mmap and rust' -v
+```
+
+A PR touching this backend reports:
+
+- the commands above it ran, each with its result, and every `SKIP` with the
+  reason the host gave;
+- the GPU or model-output evidence separately from the CPU results, or a
+  statement that it was not run;
+- the measured delta from the two benchmark commands below when the change
+  touches a lookup, eviction, lease, reservation, or frame path, and the
+  re-measured numbers when the README tables move;
+- any behavior change in the same commit's `rust/src/kv-cache-service/README.md`
+  and, if an operator sees it, `docs/features/kv_offloading_usage.md`.
 
 ## Benchmarks
 

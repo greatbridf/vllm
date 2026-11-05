@@ -105,6 +105,15 @@ The Rust service owns DRAM mappings, reservations, lookup leases, and eviction;
 vLLM workers map its shared-memory descriptors and execute GPU copies.
 This differs from `offload_region: "mmap"`, which allocates memory inside workers.
 
+Choose this backend when one DRAM cache on the node should outlive a worker
+restart within one engine lifetime, with eviction and lease bookkeeping outside
+the engine process. It replaces the in-process CPU tier of `OffloadingConnector`
+(`offload_region: "shared"`, `"mmap"`, or `"hmm"`), not LMCache: it has no
+multi-node or disaggregated role, serves no remote peer, keeps no secondary tier,
+does not persist across engine sessions, and is single-node tensor-parallel only,
+so it is not a drop-in for `LMCacheConnectorV1`/`LMCacheMPConnector` in a
+disaggregated prefill/decode or multi-tier deployment.
+
 See the [Rust cache service guide](../../rust/src/kv-cache-service/README.md)
 for startup commands, DeepSeek-V4.1-Flash configuration, supported scope,
 CPU/GPU validation commands, and hash reporting details. The service stops on
@@ -124,6 +133,21 @@ as unsupported. It honours `service_socket`, `service_timeout`,
 control RPC, and `service_connect_timeout` (default 5 s) bounds connecting,
 including the bounded retry that lets an engine start race the service.
 
+In plain terms, the unsupported combinations are:
+
+- pipeline parallelism, prefill context parallelism, and decode context
+  parallelism (tensor parallelism only, and the offload workers are exactly the TP
+  group);
+- `canonical_layout`, because each rank stores its own copy;
+- `TieringOffloadingSpec` and `secondary_tiers`, which stay in-process;
+- `eviction_policy` other than `lru`, so no `arc` policy and no
+  `cache_policy_module_path`;
+- `store_threshold` of 2 or more, and `max_tracker_size`, because the service
+  stores every offered chunk instead of counting reuse;
+- `offload_region` other than `shared`, because the service owns the mapping;
+- a second engine sharing one `engine_id`, since the namespace belongs to that
+  engine's scheduler.
+
 At startup the spec asks the service's `info` op for its `--capacity-bytes` and
 caps `num_chunks` to what that budget holds: a `cpu_bytes_to_use` larger than the
 service can serve is trimmed with a warning instead of failing `open` later, and
@@ -132,6 +156,16 @@ the minimum to reserve. The realized geometry (`namespace`, `worker_bytes`,
 `row_bytes`, `num_chunks`, `bytes`, `world_size`) is logged once at INFO, so the
 engine log and `vllm:kv_offload_config_info` agree with what the service
 allocated.
+
+The arithmetic behind `cpu_bytes_to_use` is in
+[Sizing](../../rust/src/kv-cache-service/README.md#sizing): one chunk holds
+`blocks_per_chunk x worker_kv_bytes_per_block` bytes per rank, a row holds every
+rank's slice of one chunk rounded up to the host page size, and
+`num_chunks = cpu_bytes_to_use // row_bytes`. The service's `--capacity-bytes`
+must cover every engine's reservation plus one restarting engine's. Because the
+cap compares against the whole budget and not against what other namespaces
+already hold, a second engine can still be refused by `open` with `cache exceeds
+service capacity`, which fails that engine's startup.
 
 Each rank pins its own slice of every chunk rather than the whole multi-rank
 region, so host-pinned memory stays `num_chunks x worker_bytes` per worker
@@ -165,12 +199,16 @@ The connector reports the CPU tier's metrics from that namespace state, with one
 `stats` RPC per collection and none per lookup:
 `vllm:kv_offload_cpu_cache_usage_perc` from the chunks in use,
 `vllm:kv_offload_cpu_cache_write_usage_perc` from the chunks pending a store,
-`vllm:kv_offload_cpu_cache_read_usage_perc` from the rest, and one
-`vllm:kv_offload_cpu_allocation_size` observation per store batch. The service's
-own counters, which no declared metric carries, are logged at debug level, and
-`vllm:kv_offload_config_info` holds the chunk geometry the engine negotiated, so
-it matches the bytes the service allocated. A hit in this tier is attributed to
-`CacheHitSource.HOST`, like the in-process CPU tier.
+`vllm:kv_offload_cpu_cache_read_usage_perc` from the difference of the two, and
+one `vllm:kv_offload_cpu_allocation_size` observation per store batch. The
+service's own counters, which no declared metric carries, are logged at debug
+level, and `vllm:kv_offload_config_info` carries the chunk geometry the engine
+negotiated, so it matches the bytes the service allocated (see
+[Info Metric Labels](#info-metric-labels)).
+`vllm:kv_offload_stores_skipped` is never published for this backend, because it
+is declared only for a `store_threshold` of 2 or more, which the spec rejects. A
+hit in this tier is attributed to `CacheHitSource.HOST`, like the in-process CPU
+tier.
 
 KV cache events are supported: with `enable_kv_cache_events` (from
 `--kv-events-config`), the connector publishes a `BlockStored` event for each
@@ -200,6 +238,10 @@ service detaches on namespace disconnect. Attachment is per-VMA in the writing
 task's mm: each process that maps the memfd needs its own attachment, and
 workers are a TODO. This changes no wire responses, geometry fields, worker
 mappings, or model output.
+
+See [Process-Separated KV Offloading](../contributing/kv-cache-service.md) for
+the invariants a change to this backend must keep and the commands that validate
+one.
 
 ## Anonymous DRAM Offload (`offload_region: "mmap"`)
 
@@ -298,7 +340,7 @@ Each region's address and size are available as `base_tensor.data_ptr()` and `to
 | `service_socket` | no | — | `RustServiceOffloadingSpec` | Path of the Rust cache service's Unix socket. Required by that spec; the directory must be `0700` and owned by the calling UID. |
 | `service_timeout` | no | `5.0` | `RustServiceOffloadingSpec` | Seconds allowed for each control RPC. A timeout stops offloading for the engine instead of failing the scheduler step. |
 | `service_connect_timeout` | no | `5.0` | `RustServiceOffloadingSpec` | Seconds allowed for one connect attempt, including the bounded retry that covers a service still starting. |
-| `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). |
+| `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). `RustServiceOffloadingSpec` reserves it inside the service's aggregate `--capacity-bytes`, rounded down to whole chunks, and caps it to what that budget holds; see [Sizing](../../rust/src/kv-cache-service/README.md#sizing). |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |
 | `blocks_per_chunk` | no | `1` | both | Offloaded chunk size in GPU blocks; must be > 0. Alternative to `block_size` for models whose KV cache groups have different block sizes. |
 | `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). `RustServiceOffloadingSpec` accepts only `lru`. |
@@ -360,12 +402,17 @@ The gauge holds one series for each configuration that the manager reports. A ma
 | Label | Declared by | Meaning | Notes |
 | --- | --- | --- | --- |
 | `tier` | `TieringOffloadingSpec` | The tier that this series reports. | `<index>:<type>`. Index `0` is the CPU primary tier, and a secondary tier index starts at 1. `<type>` is the `type` key of the tier config, such as `1:fs`. |
-| `cpu_num_chunks` | `CPUOffloadingSpec` or `TieringOffloadingSpec` | Chunk slots in the CPU tier. | Chunks, not GPU blocks. |
-| `cpu_blocks_per_chunk` | `CPUOffloadingSpec` or `TieringOffloadingSpec` | GPU blocks in one chunk. | The chunk-to-block conversion factor. Set by `blocks_per_chunk`, or derived from `block_size`. |
-| `cpu_kv_cache_size_bytes` | `CPUOffloadingSpec` or `TieringOffloadingSpec` | Size of the CPU tier in bytes. | `cpu_num_chunks` times the bytes of one chunk slot. Each slot is rounded up to the host page size, so this can include padding. |
-| `cpu_kv_cache_size_tokens` | `CPUOffloadingSpec` or `TieringOffloadingSpec` | KV tokens the tier holds for requests of `max_model_len` tokens. | Computed like the GPU `kv_cache_size_tokens`. A group with a sliding window keeps a fixed chunk count, so this value can be larger than the byte capacity suggests. Reads `None` when `max_model_len` is 0 or the model has no KV cache group. |
+| `cpu_num_chunks` | `CPUOffloadingSpec`, `TieringOffloadingSpec`, or `RustServiceOffloadingSpec` | Chunk slots in the CPU tier. | Chunks, not GPU blocks. |
+| `cpu_blocks_per_chunk` | `CPUOffloadingSpec`, `TieringOffloadingSpec`, or `RustServiceOffloadingSpec` | GPU blocks in one chunk. | The chunk-to-block conversion factor. Set by `blocks_per_chunk`, or derived from `block_size`. |
+| `cpu_kv_cache_size_bytes` | `CPUOffloadingSpec`, `TieringOffloadingSpec`, or `RustServiceOffloadingSpec` | Size of the CPU tier in bytes. | `cpu_num_chunks` times the bytes of one chunk slot. Each slot is rounded up to the host page size, so this can include padding. |
+| `cpu_kv_cache_size_tokens` | `CPUOffloadingSpec`, `TieringOffloadingSpec`, or `RustServiceOffloadingSpec` | KV tokens the tier holds for requests of `max_model_len` tokens. | Computed like the GPU `kv_cache_size_tokens`. A group with a sliding window keeps a fixed chunk count, so this value can be larger than the byte capacity suggests. Reads `None` when `max_model_len` is 0 or the model has no KV cache group. |
 
 `CPUOffloadingSpec` publishes the four `cpu_` labels on its one series. `TieringOffloadingSpec` publishes them on the `0:primary` series.
+
+`RustServiceOffloadingSpec` publishes the four `cpu_` labels on its one series,
+with the values of the geometry it negotiated with the service, so
+`cpu_kv_cache_size_bytes` is the bytes the service reserved for that engine's
+namespace. It has no `tier` label, because it reports one configuration.
 
 The spec declares the label names in the API server process, and the manager fills the values in the engine process. The names of every series bind once, at the declaration. A label that one series owns reads empty on every other series. For a worked example, the `example` secondary tier publishes one label, `example_info`.
 
