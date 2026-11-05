@@ -189,7 +189,14 @@ requests holding leases) that make such a leak visible.
 
 A service that stops answering, or that dropped the engine's namespace, does not
 abort the scheduler step: the connector logs one error, reports every later lookup
-as a miss, and stops reserving, until the engine is restarted.
+as a miss, and stops reserving, until the engine is restarted. A lost connection is
+the exception it can absorb: a read-only `lookup`, `lookup_many`, or `stats`
+reconnects and reopens the namespace, which the service adopts with every entry and
+lease it still holds, so a scheduler hiccup costs one retried RPC instead of the
+node's cache. Only a failure the service cannot absorb ends offloading: a worker
+disconnect, an explicit `close`, or an owner that stayed away longer than
+`--namespace-grace-secs`. Stopping the engine sends `close`, so a restarted engine
+starts cold instead of adopting a cache its workers no longer map.
 
 A lookup scan costs one RPC per batch instead of one per chunk: `lookup_many`
 answers up to 4096 keys at once, so a 4096-chunk full-attention prefix costs one

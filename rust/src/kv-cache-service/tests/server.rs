@@ -177,6 +177,24 @@ fn encode(request: &Value) -> Vec<u8> {
 }
 
 fn open(client: &mut Client, namespace: &str) -> Value {
+    open_with(client, namespace, &"a".repeat(64), 2)
+}
+
+fn open_with(client: &mut Client, namespace: &str, fingerprint: &str, num_chunks: usize) -> Value {
+    client.call(json!({
+        "op": "open",
+        "version": 1,
+        "namespace": namespace,
+        "fingerprint": fingerprint,
+        "worker_bytes": 64,
+        "world_size": 2,
+        "num_chunks": num_chunks,
+    }))
+}
+
+/// The replay a reconnecting client sends: adopt what a departed owner left, or
+/// nothing.
+fn adopt(client: &mut Client, namespace: &str) -> Value {
     client.call(json!({
         "op": "open",
         "version": 1,
@@ -185,6 +203,7 @@ fn open(client: &mut Client, namespace: &str) -> Value {
         "worker_bytes": 64,
         "world_size": 2,
         "num_chunks": 2,
+        "adopt": true,
     }))
 }
 
@@ -196,6 +215,31 @@ fn attach(client: &mut Client, namespace: &str, rank: usize) -> Value {
         "fingerprint": "a".repeat(64),
         "rank": rank,
     }))
+}
+
+/// Attaches one rank and discards the descriptor, which these tests do not read.
+fn attach_worker(service: &Service, namespace: &str, rank: usize) -> Client {
+    let mut worker = service.connect();
+    assert_eq!(attach(&mut worker, namespace, rank)["ok"], true);
+    for descriptor in receive_descriptor(&worker.stream) {
+        // SAFETY: the descriptor is owned by this test and never used again.
+        assert_eq!(unsafe { libc::close(descriptor) }, 0);
+    }
+    worker
+}
+
+fn info(probe: &mut Client) -> Value {
+    probe.call(json!({"op": "info"}))
+}
+
+/// Retries `attempt` until it holds, which is how a test observes the release a
+/// disconnect or a grace period triggers asynchronously.
+fn wait_until(what: &str, mut attempt: impl FnMut() -> bool) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !attempt() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Receives the descriptor frame the service sends after the attach geometry.
@@ -534,6 +578,7 @@ fn info_reports_service_capacity_without_a_handshake() {
     assert_eq!(info["used_bytes"].as_u64(), Some(0));
     assert_eq!(info["retired_bytes"].as_u64(), Some(0));
     assert_eq!(info["namespaces"].as_u64(), Some(0));
+    assert_eq!(info["detached"].as_u64(), Some(0));
     assert_eq!(info["sessions"].as_u64(), Some(0));
     assert_eq!(info["max_connections"].as_u64(), Some(128));
     assert!(info["pid"].as_u64().is_some_and(|pid| pid > 0));
@@ -643,5 +688,291 @@ fn idle_connection_is_closed_after_the_timeout() {
     assert!(
         elapsed >= Duration::from_millis(500),
         "closed before the idle timeout: {elapsed:?}"
+    );
+}
+
+#[test]
+fn owner_reconnect_adopts_the_namespace_and_keeps_entries() {
+    let service = Service::start();
+    let mut owner = service.connect();
+    let opened = open(&mut owner, "engine-adopt");
+    assert_eq!(opened["ok"], true);
+    assert_eq!(
+        owner.call(json!({"op": "store", "keys": ["aa"], "request": "a"}))["ok"],
+        true
+    );
+    assert_eq!(
+        owner.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
+        true
+    );
+
+    // A transport hiccup on the scheduler's side leaves the mapping behind.
+    drop(owner);
+    let mut probe = service.connect();
+    wait_until("the namespace to detach", || {
+        info(&mut probe)["detached"].as_u64() == Some(1)
+    });
+
+    let mut adopted = service.connect();
+    let reopened = open(&mut adopted, "engine-adopt");
+    assert_eq!(reopened["ok"], true);
+    assert_eq!(reopened["total_bytes"], opened["total_bytes"]);
+    // Adopted, not recreated: the published entry and its counters survive.
+    assert_eq!(
+        adopted.call(json!({"op": "lookup", "key": "aa", "request": "b"}))["status"],
+        "hit"
+    );
+    let stats = adopted.call(json!({"op": "stats"}));
+    assert_eq!(stats["stats"]["entries"], 1);
+    assert_eq!(stats["sessions"].as_u64(), Some(1));
+    assert_eq!(stats["detached"], false);
+    // The adopting session owns the mapping, so it can still mutate it.
+    assert_eq!(
+        adopted.call(json!({"op": "store", "keys": ["bb"], "request": "c"}))["ok"],
+        true
+    );
+    assert_eq!(
+        adopted.call(json!({"op": "commit", "keys": ["bb"], "request": "c", "success": true}))["ok"],
+        true
+    );
+    let reported = info(&mut probe);
+    assert_eq!(reported["namespaces"].as_u64(), Some(1));
+    assert_eq!(reported["detached"].as_u64(), Some(0));
+    assert_eq!(reported["used_bytes"], opened["total_bytes"]);
+}
+
+#[test]
+fn reopen_with_a_different_fingerprint_is_rejected() {
+    let service = Service::start();
+    let mut owner = service.connect();
+    assert_eq!(open(&mut owner, "engine-mismatch")["ok"], true);
+    drop(owner);
+    let mut probe = service.connect();
+    wait_until("the namespace to detach", || {
+        info(&mut probe)["detached"].as_u64() == Some(1)
+    });
+
+    // Another layout, and another geometry under the same fingerprint, are both
+    // refused instead of reusing a mapping they do not describe.
+    let mut client = service.connect();
+    for rejected in [
+        open_with(&mut client, "engine-mismatch", &"b".repeat(64), 2),
+        open_with(&mut client, "engine-mismatch", &"a".repeat(64), 1),
+    ] {
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"], "namespace geometry mismatch");
+    }
+
+    // The mapping is still there for the layout that created it.
+    let adopted = open(&mut client, "engine-mismatch");
+    assert_eq!(adopted["ok"], true);
+    assert_eq!(
+        client.call(json!({"op": "stats"}))["stats"]["num_chunks"],
+        2
+    );
+}
+
+#[test]
+fn adoption_is_refused_while_the_previous_owner_is_connected() {
+    let service = Service::start();
+    let mut owner = service.connect();
+    assert_eq!(open(&mut owner, "engine-live-owner")["ok"], true);
+
+    let mut second = service.connect();
+    let refused = open(&mut second, "engine-live-owner");
+    assert_eq!(refused["ok"], false);
+    assert_eq!(
+        refused["error"],
+        "namespace already owned by another scheduler"
+    );
+
+    // The owner keeps its namespace, and a worker attach still finds it.
+    assert_eq!(owner.call(json!({"op": "stats"}))["ok"], true);
+    let mut worker = attach_worker(&service, "engine-live-owner", 0);
+    assert_eq!(worker.call(json!({"op": "stats"}))["ok"], true);
+}
+
+#[test]
+fn worker_disconnect_still_invalidates_the_namespace() {
+    let service = Service::start();
+    let mut owner = service.connect();
+    assert_eq!(open(&mut owner, "engine-worker-loss")["ok"], true);
+    let worker = attach_worker(&service, "engine-worker-loss", 0);
+    drop(worker);
+
+    // That rank may still have DMA in flight, so the owner's calls stop working.
+    wait_until("the namespace to be invalidated", || {
+        owner.call(json!({"op": "stats"}))["error"] == "cache namespace invalidated"
+    });
+    let mut probe = service.connect();
+    let reported = info(&mut probe);
+    assert_eq!(reported["namespaces"].as_u64(), Some(0));
+    assert_eq!(reported["detached"].as_u64(), Some(0));
+
+    // The mapping stays charged while the owner's session keeps it, and a new
+    // namespace of the same name is a fresh mapping rather than the old one.
+    assert_eq!(reported["sessions"].as_u64(), Some(1));
+    let mut replacement = service.connect();
+    assert_eq!(open(&mut replacement, "engine-worker-loss")["ok"], true);
+    assert_eq!(
+        replacement.call(json!({"op": "lookup", "key": "aa", "request": "r"}))["status"],
+        "miss"
+    );
+}
+
+#[test]
+fn close_retires_the_namespace_immediately() {
+    let service = Service::start();
+    let mut owner = service.connect();
+    let opened = open(&mut owner, "engine-close");
+    assert_eq!(opened["ok"], true);
+    let mut worker = attach_worker(&service, "engine-close", 0);
+
+    assert_eq!(owner.call(json!({"op": "close"}))["ok"], true);
+    // Closed, not detached: neither session has a namespace any more.
+    assert_eq!(
+        worker.call(json!({"op": "stats"}))["error"],
+        "cache namespace invalidated"
+    );
+    assert_eq!(
+        owner.call(json!({"op": "stats"}))["error"],
+        "handshake required"
+    );
+
+    let mut probe = service.connect();
+    let retired = info(&mut probe);
+    assert_eq!(retired["namespaces"].as_u64(), Some(0));
+    assert_eq!(retired["detached"].as_u64(), Some(0));
+    // The worker's session keeps the retired mapping charged, never adoptable.
+    assert_eq!(retired["retired_bytes"], opened["total_bytes"]);
+    let mut replaced = service.connect();
+    assert_eq!(open(&mut replaced, "engine-close")["ok"], true);
+
+    // The last session leaving frees the closed mapping.
+    drop(worker);
+    wait_until("the closed mapping to be freed", || {
+        info(&mut probe)["retired_bytes"].as_u64() == Some(0)
+    });
+}
+
+#[test]
+fn namespace_without_sessions_is_reclaimed() {
+    let service = Service::start();
+    let mut owner = service.connect();
+    let opened = open(&mut owner, "engine-orphan");
+    assert_eq!(opened["ok"], true);
+    let worker = attach_worker(&service, "engine-orphan", 0);
+
+    // A detached namespace with a worker still keeps its mapping charged...
+    drop(owner);
+    let mut probe = service.connect();
+    wait_until("the namespace to detach", || {
+        info(&mut probe)["detached"].as_u64() == Some(1)
+    });
+    assert_eq!(info(&mut probe)["used_bytes"], opened["total_bytes"]);
+
+    // ...and the last session leaving reclaims it at once, not after the grace
+    // period the default configuration sets to 300 seconds.
+    drop(worker);
+    wait_until("the namespace to be reclaimed", || {
+        info(&mut probe)["used_bytes"].as_u64() == Some(0)
+    });
+    let reported = info(&mut probe);
+    assert_eq!(reported["namespaces"].as_u64(), Some(0));
+    assert_eq!(reported["sessions"].as_u64(), Some(0));
+}
+
+#[test]
+fn detached_namespace_expires_after_the_grace_period() {
+    let mut service = Service::start_with(&["--namespace-grace-secs", "1"]);
+    let mut owner = service.connect();
+    let opened = open(&mut owner, "engine-grace");
+    assert_eq!(opened["ok"], true);
+    let mut worker = attach_worker(&service, "engine-grace", 0);
+    drop(owner);
+
+    // A restart inside the grace period still finds the mapping adoptable.
+    let mut probe = service.connect();
+    wait_until("the namespace to detach", || {
+        info(&mut probe)["detached"].as_u64() == Some(1)
+    });
+    assert_eq!(info(&mut probe)["used_bytes"], opened["total_bytes"]);
+
+    // Nobody adopted it, so the mapping a crashed scheduler left behind is
+    // reclaimed even though its worker is still attached.
+    wait_until("the grace period to reclaim the namespace", || {
+        info(&mut probe)["used_bytes"].as_u64() == Some(0)
+    });
+    assert_eq!(info(&mut probe)["namespaces"].as_u64(), Some(0));
+    assert_eq!(
+        worker.call(json!({"op": "stats"}))["error"],
+        "cache namespace invalidated"
+    );
+
+    let (status, stderr) = service.signal_and_wait(libc::SIGTERM);
+    assert!(status.success(), "exit status {status}: {stderr}");
+    assert!(
+        stderr.contains("reason=grace_expired"),
+        "missing reclaim event: {stderr}"
+    );
+}
+
+#[test]
+fn adopt_never_creates_a_namespace() {
+    let service = Service::start();
+    let mut client = service.connect();
+    let refused = adopt(&mut client, "engine-absent");
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"], "no detached namespace to adopt");
+
+    // Nothing was allocated behind the client's back, and the session is usable
+    // for the namespace it creates explicitly.
+    let mut probe = service.connect();
+    let reported = info(&mut probe);
+    assert_eq!(reported["namespaces"].as_u64(), Some(0));
+    assert_eq!(reported["used_bytes"].as_u64(), Some(0));
+    assert_eq!(open(&mut client, "engine-absent")["ok"], true);
+
+    // A detached namespace is what the replay is for.
+    drop(client);
+    wait_until("the namespace to detach", || {
+        info(&mut probe)["detached"].as_u64() == Some(1)
+    });
+    let mut reconnected = service.connect();
+    assert_eq!(adopt(&mut reconnected, "engine-absent")["ok"], true);
+}
+
+#[test]
+fn adoption_keeps_the_mapping_an_attached_worker_holds() {
+    let service = Service::start();
+    let mut owner = service.connect();
+    assert_eq!(open(&mut owner, "engine-adopt-worker")["ok"], true);
+    let mut worker = attach_worker(&service, "engine-adopt-worker", 0);
+    assert_eq!(
+        owner.call(json!({"op": "store", "keys": ["aa"], "request": "a"}))["ok"],
+        true
+    );
+    assert_eq!(
+        owner.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
+        true
+    );
+    drop(owner);
+
+    let mut probe = service.connect();
+    wait_until("the namespace to detach", || {
+        info(&mut probe)["detached"].as_u64() == Some(1)
+    });
+    let mut adopted = service.connect();
+    assert_eq!(adopt(&mut adopted, "engine-adopt-worker")["ok"], true);
+
+    // The worker keeps the session and the mapping it already had, and the
+    // adopted owner serves the entry the previous owner published.
+    let stats = worker.call(json!({"op": "stats"}));
+    assert_eq!(stats["ok"], true);
+    assert_eq!(stats["sessions"].as_u64(), Some(2));
+    assert_eq!(stats["detached"], false);
+    assert_eq!(
+        adopted.call(json!({"op": "lookup", "key": "aa", "request": "b"}))["status"],
+        "hit"
     );
 }

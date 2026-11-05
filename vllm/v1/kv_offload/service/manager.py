@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler adapter for Rust-owned cache keys and reservations."""
 
+import contextlib
 import hashlib
 from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -108,7 +109,8 @@ class ServiceOffloadingManager(OffloadingManager):
     service, and `take_events()` the store and eviction events its own store
     calls produced once KV cache events are enabled. `lookup_many()` answers a
     whole batch of a scan with one RPC per `MAX_KEYS` keys instead of one per
-    key.
+    key. `shutdown()` closes the namespace before the connection, so the service
+    retires it instead of keeping it adoptable.
     """
 
     def __init__(
@@ -441,7 +443,7 @@ class ServiceOffloadingManager(OffloadingManager):
         """Reports the CPU-tier metrics from one `stats` RPC per collection."""
         allocation_sizes, self._allocation_sizes = self._allocation_sizes, []
         try:
-            response = self._call_or_degrade("stats")
+            response = self._call_or_degrade("stats", retry=True)
         except CacheServiceError as error:
             # Metrics never fail a scheduler step, and a namespace the service
             # dropped cannot report them.
@@ -478,4 +480,11 @@ class ServiceOffloadingManager(OffloadingManager):
         yield from events
 
     def shutdown(self) -> None:
+        """Retires the namespace, then closes the connection.
+
+        A service that is already gone, or one that dropped this namespace,
+        needs no close, and shutdown must not raise either way.
+        """
+        with contextlib.suppress(CacheServiceError):
+            self.client.call("close")
         self.client.close()

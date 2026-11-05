@@ -34,7 +34,10 @@ class CacheServiceClient:
     A request is one frame: a big-endian length prefix and its JSON payload,
     written in a single call. Any transport failure closes the socket, so a
     read-only call may reopen it once while a mutating one may not, because the
-    outcome of a lost reply is unknown.
+    outcome of a lost reply is unknown. The `open` handshake is remembered and
+    replayed on that reconnect, because the service keeps the namespace of an
+    owner that disconnected: the new session adopts the same mapping, entries,
+    and leases, so the retried call reads the cache it wrote.
     """
 
     def __init__(
@@ -46,6 +49,8 @@ class CacheServiceClient:
         self.path = path
         self.op_timeout = op_timeout
         self.connect_timeout = connect_timeout
+        # The fields of the namespace this client opened, if it opened one.
+        self._open: dict[str, Any] | None = None
         self.socket = self._connect()
 
     def _connect(self) -> socket.socket:
@@ -71,8 +76,16 @@ class CacheServiceClient:
         )
 
     def reconnect(self) -> None:
-        """Replaces the closed socket with a new connection."""
+        """Replaces the closed socket with a new connection.
+
+        The namespace this client opened is reopened on it, which the service
+        answers by adopting the mapping its previous owner left behind. The
+        replay may only adopt: a namespace the service dropped is not quietly
+        recreated while the workers still map it.
+        """
         self.socket = self._connect()
+        if self._open is not None:
+            self._send("open", {**self._open, "adopt": True})
 
     def _read_exact(self, length: int) -> bytes:
         payload = bytearray()
@@ -144,6 +157,8 @@ class CacheServiceClient:
             raise CacheServiceError(
                 f"KV cache service rejected {op}: {response.get('error', response)}"
             )
+        if op == "open":
+            self._open = dict(fields)
         return response
 
     def receive_fd(self) -> int:

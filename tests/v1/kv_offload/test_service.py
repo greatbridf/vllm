@@ -367,3 +367,82 @@ def test_client_connect_error_names_the_socket_path(tmp_path, monkeypatch):
     monkeypatch.setattr(client_module, "_CONNECT_BACKOFF_S", 0.0)
     with pytest.raises(CacheServiceUnavailable, match="missing.sock"):
         CacheServiceClient(str(tmp_path / "missing.sock"))
+
+
+def test_manager_reconnects_and_adopts_the_namespace_it_opened(service):
+    """A lost scheduler socket costs a reconnect, not the engine's cache."""
+    manager = _spec(service).get_manager()
+    request = ReqContext("first")
+    key = OffloadKey(b"adopted")
+    probe = CacheServiceClient(service)
+    try:
+        assert manager.prepare_store([key], request) is not None
+        manager.complete_store([key], request)
+        assert manager.lookup(key, request) is LookupResult.HIT
+
+        # The scheduler's connection dies; the service keeps the namespace.
+        manager.client.close()
+        deadline = time.monotonic() + 5
+        while probe.call("info")["detached"] != 1:
+            if time.monotonic() > deadline:
+                pytest.fail("The service did not detach the namespace")
+            time.sleep(0.01)
+
+        # The retried read-only call reconnects, reopens, and reads the cache.
+        assert manager.lookup(key, ReqContext("second")) is LookupResult.HIT
+        assert probe.call("info")["detached"] == 0
+        assert manager.client.call("stats")["stats"]["entries"] == 1
+    finally:
+        probe.close()
+        manager.shutdown()
+
+
+def test_shutdown_closes_the_namespace_so_the_service_frees_it(service):
+    manager = _spec(service).get_manager()
+    manager.prepare_store([OffloadKey(b"closed")], ReqContext("first"))
+
+    manager.shutdown()
+
+    probe = CacheServiceClient(service)
+    try:
+        info = probe.call("info")
+    finally:
+        probe.close()
+    assert info["namespaces"] == 0
+    assert info["used_bytes"] == 0
+    # Nothing is left adoptable either.
+    assert info["detached"] == 0
+
+
+def test_reconnect_never_recreates_a_namespace_the_service_dropped(service):
+    """A lost worker retires the mapping; a reconnect may not allocate another."""
+    spec = _spec(service)
+    manager = spec.get_manager()
+    region = _attach(spec)
+    key = OffloadKey(b"retired")
+    request = ReqContext("first")
+    probe = CacheServiceClient(service)
+    try:
+        assert manager.prepare_store([key], request) is not None
+        manager.complete_store([key], request)
+        # The scheduler's connection dies, and the worker restart retires the
+        # namespace the workers still map.
+        manager.client.close()
+        region.client.socket.shutdown(socket.SHUT_RDWR)
+        region.client.close()
+        deadline = time.monotonic() + 5
+        while probe.call("info")["namespaces"] != 0:
+            if time.monotonic() > deadline:
+                pytest.fail("The worker disconnect did not retire the namespace")
+            time.sleep(0.01)
+
+        # The retried lookup reconnects, finds nothing to adopt, and degrades
+        # instead of pointing the engine at a mapping its workers do not hold.
+        assert manager.lookup(key, ReqContext("second")) is LookupResult.MISS
+        info = probe.call("info")
+        assert info["namespaces"] == 0
+        assert info["used_bytes"] == info["retired_bytes"]
+    finally:
+        probe.close()
+        region.cleanup()
+        manager.shutdown()

@@ -57,6 +57,11 @@ struct Args {
     /// reservations until their request commits or releases them.
     #[arg(long, default_value_t = 60)]
     pending_timeout_secs: u64,
+    /// Reclaim a namespace whose owner disconnected this many seconds after it
+    /// detached, unless an owner adopted it again; 0 keeps it until it has no
+    /// sessions left.
+    #[arg(long, default_value_t = 300)]
+    namespace_grace_secs: u64,
     /// Attach the rswap digest BPF program through sysfs; disabled by default.
     /// Defaults to /sys/kernel/mm/xswap/rswap_attach when no path is given.
     #[arg(
@@ -83,12 +88,40 @@ struct Limits {
     idle_timeout: Option<Duration>,
 }
 
+/// What a connected session is to its namespace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    /// The session that sent `open`.
+    Owner,
+    /// A session that sent `attach` for one rank.
+    Worker,
+}
+
 /// One engine namespace: the shared cache mapping plus the sessions using it.
 struct Namespace {
     cache: Arc<Mutex<Cache>>,
     fingerprint: String,
     attached_ranks: HashSet<usize>,
-    sessions: HashSet<u64>,
+    sessions: HashMap<u64, SessionKind>,
+    /// Set while no owner is bound. The namespace keeps its mapping, entries, and
+    /// leases so the same engine can adopt it, until the grace period ends or an
+    /// attached worker disconnects.
+    detached_since: Option<Instant>,
+}
+
+impl Namespace {
+    fn detached(&self) -> bool {
+        self.detached_since.is_some()
+    }
+}
+
+/// The geometry an `open` reserves, checked against a detached namespace before
+/// it is adopted.
+#[derive(Clone, Copy)]
+struct Geometry {
+    worker_bytes: usize,
+    world_size: usize,
+    num_chunks: usize,
 }
 
 /// Namespaces reachable by name. Its lock is only held to clone a cache handle or
@@ -181,7 +214,7 @@ fn lock_or_recover<'a, T>(lock: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
     }
 }
 
-fn geometry(cache: &Cache) -> Value {
+fn geometry_reply(cache: &Cache) -> Value {
     json!({
         "ok": true,
         "version": 1,
@@ -205,6 +238,7 @@ fn info(registry: &Registry, limits: &Limits) -> Value {
         "used_bytes": registry.used_bytes(),
         "retired_bytes": registry.retired_bytes(),
         "namespaces": registry.namespaces.len(),
+        "detached": registry.detached(),
         "sessions": registry.sessions(),
         "max_connections": limits.max_connections,
     })
@@ -225,6 +259,7 @@ fn handle(
             worker_bytes,
             world_size,
             num_chunks,
+            adopt,
         } => {
             if version != 1
                 || namespace.is_some()
@@ -236,44 +271,15 @@ fn handle(
                 return Err(reject("invalid open handshake"));
             }
             let size = namespace_bytes(worker_bytes, world_size, num_chunks).map_err(reject)?;
-            let mut registry = lock_or_recover(registry, "registry");
-            if registry.namespaces.contains_key(&name) {
-                return Err(reject("namespace already owned by another scheduler"));
-            }
-            let remaining = registry.budget.saturating_sub(registry.used_bytes());
-            if size > remaining {
-                return Err(reject("cache exceeds service capacity"));
-            }
-            let factory = registry.rswap_attach.as_ref().map(|path| RswapConfig {
-                attach_path: path.clone(),
-            });
-            let cache = Cache::with_hashes(
-                session,
+            let geometry = Geometry {
                 worker_bytes,
                 world_size,
                 num_chunks,
-                remaining,
-                factory.as_ref().map(|factory| factory as &dyn HashFactory),
-            )?;
-            let frame = protocol::encode_response(&geometry(&cache))?;
-            log_event!(
-                "namespace_opened",
-                "session" = session,
-                "namespace" = name,
-                "num_chunks" = cache.num_chunks,
-                "row_bytes" = cache.row_bytes,
-                "bytes" = cache.mapping.len(),
-                "budget_left_bytes" = remaining - size,
-            );
-            registry.namespaces.insert(
-                name.clone(),
-                Namespace {
-                    cache: Arc::new(Mutex::new(cache)),
-                    fingerprint,
-                    attached_ranks: HashSet::new(),
-                    sessions: HashSet::from([session]),
-                },
-            );
+            };
+            let frame = {
+                let mut registry = lock_or_recover(registry, "registry");
+                registry.open(session, &name, &fingerprint, geometry, size, adopt)?
+            };
             *namespace = Some(name);
             Ok(Reply::Frame(frame))
         }
@@ -286,32 +292,25 @@ fn handle(
             if version != 1 || namespace.is_some() {
                 return Err(reject("invalid attach handshake"));
             }
-            let mut registry = lock_or_recover(registry, "registry");
-            let entry = registry
-                .namespaces
-                .get_mut(&name)
-                .ok_or_else(|| reject("scheduler namespace not available"))?;
-            let (frame, fd) = {
-                let cache = lock_or_recover(&entry.cache, "cache");
-                if fingerprint != entry.fingerprint
-                    || rank >= cache.world_size
-                    || entry.attached_ranks.contains(&rank)
-                {
-                    return Err(reject("incompatible or duplicate worker"));
-                }
-                let frame = protocol::encode_response(&geometry(&cache))?;
-                (frame, protocol::duplicate_fd(cache.file.as_fd())?)
+            let reply = {
+                let mut registry = lock_or_recover(registry, "registry");
+                registry.attach(session, &name, &fingerprint, rank)?
             };
-            entry.attached_ranks.insert(rank);
-            entry.sessions.insert(session);
-            log_event!(
-                "worker_attached",
-                "session" = session,
-                "namespace" = name,
-                "rank" = rank
-            );
             *namespace = Some(name);
-            Ok(Reply::Attach { frame, fd })
+            Ok(reply)
+        }
+        Request::Close => {
+            let Some(name) = namespace.clone() else {
+                return Err(reject("handshake required"));
+            };
+            {
+                let mut registry = lock_or_recover(registry, "registry");
+                registry.close(session, &name)?;
+            }
+            *namespace = None;
+            Ok(Reply::Frame(protocol::encode_response(
+                &json!({"ok": true}),
+            )?))
         }
         Request::Info => {
             let registry = lock_or_recover(registry, "registry");
@@ -320,13 +319,18 @@ fn handle(
         }
         command => {
             let name = namespace.as_deref().ok_or_else(|| reject("handshake required"))?;
-            let (cache, pending_timeout) = {
+            let (cache, pending_timeout, sessions, detached) = {
                 let registry = lock_or_recover(registry, "registry");
                 let entry = registry
                     .namespaces
                     .get(name)
                     .ok_or_else(|| reject("cache namespace invalidated"))?;
-                (Arc::clone(&entry.cache), registry.pending_timeout)
+                (
+                    Arc::clone(&entry.cache),
+                    registry.pending_timeout,
+                    entry.sessions.len(),
+                    entry.detached(),
+                )
             };
             let mut cache = lock_or_recover(&cache, "cache");
             // Read-only stats stay available to attached workers; every other
@@ -401,9 +405,16 @@ fn handle(
                 }
                 Request::Stats => {
                     reclaim_expired(&mut cache, name, pending_timeout);
-                    json!({"ok": true, "stats": cache.stats()})
+                    json!({
+                        "ok": true,
+                        "stats": cache.stats(),
+                        "sessions": sessions,
+                        "detached": detached,
+                    })
                 }
-                Request::Open { .. } | Request::Attach { .. } | Request::Info => unreachable!(),
+                Request::Open { .. } | Request::Attach { .. } | Request::Close | Request::Info => {
+                    unreachable!()
+                }
             };
             Ok(Reply::Frame(protocol::encode_response(&response)?))
         }
@@ -535,42 +546,15 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .unwrap_or("unknown panic")
 }
 
-/// Invalidates the departed session's namespace and frees retired memory once no
-/// session holds it. An abandoned in-flight DMA destination is never recycled, so
-/// the namespace is retired rather than handed to a new client.
+/// Ends one departed session; `Registry::release_session` decides what that costs
+/// its namespace.
 fn release_session(registry: &Mutex<Registry>, name: Option<&str>, session: u64) {
-    let mut registry = lock_or_recover(registry, "registry");
-    if let Some(name) = name
-        && registry
-            .namespaces
-            .get(name)
-            .is_some_and(|entry| entry.sessions.contains(&session))
-        && let Some(mut entry) = registry.namespaces.remove(name)
-    {
-        entry.sessions.remove(&session);
-        invalidate_hashes(&entry);
-        if entry.sessions.is_empty() {
-            log_event!(
-                "namespace_invalidated",
-                "session" = session,
-                "namespace" = name
-            );
-        } else {
-            log_event!(
-                "namespace_retired",
-                "session" = session,
-                "namespace" = name,
-                "reason" = "session_disconnect",
-                "sessions_left" = entry.sessions.len(),
-            );
-            registry.retired.push(entry);
-        }
-    }
-    for entry in &mut registry.retired {
-        entry.sessions.remove(&session);
-        invalidate_hashes(entry);
-    }
-    registry.retired.retain(|entry| !entry.sessions.is_empty());
+    lock_or_recover(registry, "registry").release_session(session, name);
+}
+
+/// Reclaims namespaces their owner left behind longer than `grace` ago.
+fn sweep_namespaces(registry: &Mutex<Registry>, grace: Duration) {
+    lock_or_recover(registry, "registry").sweep(Instant::now(), grace);
 }
 
 fn invalidate_hashes(namespace: &Namespace) {
@@ -578,6 +562,230 @@ fn invalidate_hashes(namespace: &Namespace) {
 }
 
 impl Registry {
+    /// Opens `name` for `session`, or adopts the namespace its previous owner left
+    /// behind. Adoption keeps the mapping, every entry, and every lease, and only
+    /// succeeds for the fingerprint and geometry the mapping was created with, so
+    /// a reconnecting scheduler never reuses a cache it would not have opened.
+    /// `adopt` forbids creating a namespace, because a client that reconnects must
+    /// not allocate a second mapping while the workers still hold the first.
+    fn open(
+        &mut self,
+        session: u64,
+        name: &str,
+        fingerprint: &str,
+        geometry: Geometry,
+        size: usize,
+        adopt: bool,
+    ) -> Result<Vec<u8>, Failure> {
+        if let Some(entry) = self.namespaces.get_mut(name) {
+            if !entry.detached() {
+                return Err(reject("namespace already owned by another scheduler"));
+            }
+            let (frame, bytes) = {
+                let mut cache = lock_or_recover(&entry.cache, "cache");
+                if fingerprint != entry.fingerprint
+                    || geometry.worker_bytes != cache.worker_bytes
+                    || geometry.world_size != cache.world_size
+                    || geometry.num_chunks != cache.num_chunks
+                {
+                    return Err(reject("namespace geometry mismatch"));
+                }
+                // The cache reports the adopter as its owner, so its sessions may
+                // mutate what the previous owner reserved and published.
+                cache.owner = session;
+                (
+                    protocol::encode_response(&geometry_reply(&cache))?,
+                    cache.mapping.len(),
+                )
+            };
+            entry.sessions.insert(session, SessionKind::Owner);
+            entry.detached_since = None;
+            log_event!(
+                "namespace_adopted",
+                "session" = session,
+                "namespace" = name,
+                "sessions" = entry.sessions.len(),
+                "bytes" = bytes,
+            );
+            return Ok(frame);
+        }
+        if adopt {
+            return Err(reject("no detached namespace to adopt"));
+        }
+        // The budget is charged for the whole namespace lifetime, whatever the
+        // sessions do with it, and a retired mapping is never a candidate.
+        let remaining = self.budget.saturating_sub(self.used_bytes());
+        if size > remaining {
+            return Err(reject("cache exceeds service capacity"));
+        }
+        let factory = self.rswap_attach.as_ref().map(|path| RswapConfig {
+            attach_path: path.clone(),
+        });
+        let cache = Cache::with_hashes(
+            session,
+            geometry.worker_bytes,
+            geometry.world_size,
+            geometry.num_chunks,
+            remaining,
+            factory.as_ref().map(|factory| factory as &dyn HashFactory),
+        )?;
+        let frame = protocol::encode_response(&geometry_reply(&cache))?;
+        log_event!(
+            "namespace_opened",
+            "session" = session,
+            "namespace" = name,
+            "num_chunks" = cache.num_chunks,
+            "row_bytes" = cache.row_bytes,
+            "bytes" = cache.mapping.len(),
+            "budget_left_bytes" = remaining - size,
+        );
+        self.namespaces.insert(
+            name.to_owned(),
+            Namespace {
+                cache: Arc::new(Mutex::new(cache)),
+                fingerprint: fingerprint.to_owned(),
+                attached_ranks: HashSet::new(),
+                sessions: HashMap::from([(session, SessionKind::Owner)]),
+                detached_since: None,
+            },
+        );
+        Ok(frame)
+    }
+
+    /// Binds `session` to rank `rank` of a namespace and hands back its geometry
+    /// and a duplicate of its mapping.
+    fn attach(
+        &mut self,
+        session: u64,
+        name: &str,
+        fingerprint: &str,
+        rank: usize,
+    ) -> Result<Reply, Failure> {
+        let entry = self
+            .namespaces
+            .get_mut(name)
+            .ok_or_else(|| reject("scheduler namespace not available"))?;
+        let (frame, fd) = {
+            let cache = lock_or_recover(&entry.cache, "cache");
+            if fingerprint != entry.fingerprint
+                || rank >= cache.world_size
+                || entry.attached_ranks.contains(&rank)
+            {
+                return Err(reject("incompatible or duplicate worker"));
+            }
+            let frame = protocol::encode_response(&geometry_reply(&cache))?;
+            (frame, protocol::duplicate_fd(cache.file.as_fd())?)
+        };
+        entry.attached_ranks.insert(rank);
+        entry.sessions.insert(session, SessionKind::Worker);
+        log_event!(
+            "worker_attached",
+            "session" = session,
+            "namespace" = name,
+            "rank" = rank
+        );
+        Ok(Reply::Attach { frame, fd })
+    }
+
+    /// Retires a namespace its owner closed: a shutdown never leaves a mapping a
+    /// later engine could adopt.
+    fn close(&mut self, session: u64, name: &str) -> Result<(), Failure> {
+        let entry =
+            self.namespaces.get(name).ok_or_else(|| reject("cache namespace invalidated"))?;
+        if entry.sessions.get(&session) != Some(&SessionKind::Owner) {
+            return Err(reject("workers cannot mutate cache metadata"));
+        }
+        if let Some(mut entry) = self.namespaces.remove(name) {
+            // The closing session leaves with its namespace, so only the sessions
+            // that stay behind keep the retired mapping charged.
+            entry.sessions.remove(&session);
+            self.retire(name, entry, "close", session);
+        }
+        Ok(())
+    }
+
+    /// Ends one session. A worker's departure retires its namespace, because that
+    /// rank may still have DMA in flight into slots nobody may recycle; an owner's
+    /// departure only detaches it, so the same engine can adopt its entries.
+    fn release_session(&mut self, session: u64, name: Option<&str>) {
+        if let Some(name) = name
+            && let Some(kind) = self
+                .namespaces
+                .get(name)
+                .and_then(|entry| entry.sessions.get(&session).copied())
+            && let Some(mut entry) = self.namespaces.remove(name)
+        {
+            entry.sessions.remove(&session);
+            match kind {
+                SessionKind::Worker => self.retire(name, entry, "worker_disconnect", session),
+                SessionKind::Owner => {
+                    log_event!(
+                        "namespace_detached",
+                        "session" = session,
+                        "namespace" = name,
+                        "sessions_left" = entry.sessions.len(),
+                    );
+                    entry.detached_since = Some(Instant::now());
+                    self.namespaces.insert(name.to_owned(), entry);
+                }
+            }
+        }
+        for entry in &mut self.retired {
+            entry.sessions.remove(&session);
+            invalidate_hashes(entry);
+        }
+        self.retired.retain(|entry| !entry.sessions.is_empty());
+    }
+
+    /// Frees a namespace's mapping, or holds it charged while its remaining
+    /// sessions keep it, and logs the transition.
+    fn retire(&mut self, name: &str, entry: Namespace, reason: &'static str, session: u64) {
+        invalidate_hashes(&entry);
+        if entry.sessions.is_empty() {
+            log_event!(
+                "namespace_invalidated",
+                "session" = session,
+                "namespace" = name,
+                "reason" = reason,
+            );
+            return;
+        }
+        log_event!(
+            "namespace_retired",
+            "session" = session,
+            "namespace" = name,
+            "reason" = reason,
+            "sessions_left" = entry.sessions.len(),
+        );
+        self.retired.push(entry);
+    }
+
+    /// Reclaims namespaces no owner adopted for `grace`, so a crashed scheduler
+    /// cannot pin memory behind the workers it left attached.
+    fn sweep(&mut self, now: Instant, grace: Duration) {
+        let expired: Vec<String> = self
+            .namespaces
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .detached_since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= grace)
+            })
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        for name in expired {
+            if let Some(entry) = self.namespaces.remove(&name) {
+                invalidate_hashes(&entry);
+                log_event!(
+                    "namespace_reclaimed",
+                    "namespace" = name,
+                    "reason" = "grace_expired",
+                    "sessions_lost" = entry.sessions.len(),
+                );
+            }
+        }
+    }
+
     fn used_bytes(&self) -> usize {
         self.namespaces.values().chain(&self.retired).fold(0, |used, entry| {
             used.saturating_add(lock_or_recover(&entry.cache, "cache").mapping.len())
@@ -601,6 +809,12 @@ impl Registry {
             .chain(&self.retired)
             .map(|entry| entry.sessions.len())
             .sum()
+    }
+
+    /// Live namespaces no owner holds, which stay adoptable until their grace
+    /// period ends.
+    fn detached(&self) -> usize {
+        self.namespaces.values().filter(|entry| entry.detached()).count()
     }
 }
 
@@ -676,10 +890,16 @@ fn accept_connections(
     listener: &UnixListener,
     registry: &Arc<Mutex<Registry>>,
     limits: &Limits,
+    grace: Option<Duration>,
 ) -> io::Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     let mut session = 0u64;
     while !SHUTDOWN.load(Ordering::SeqCst) {
+        // The poll below is the only timer this process has, so a namespace whose
+        // owner left is reclaimed from here instead of from a thread of its own.
+        if let Some(grace) = grace {
+            sweep_namespaces(registry, grace);
+        }
         let mut pollfd = libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,
@@ -803,6 +1023,7 @@ fn run_service(args: Args) -> io::Result<()> {
         "max_connections" = limits.max_connections,
         "idle_timeout_secs" = args.idle_timeout_secs,
         "pending_timeout_secs" = args.pending_timeout_secs,
+        "namespace_grace_secs" = args.namespace_grace_secs,
     );
     let registry = Arc::new(Mutex::new(Registry {
         namespaces: HashMap::new(),
@@ -813,7 +1034,9 @@ fn run_service(args: Args) -> io::Result<()> {
             .then(|| Duration::from_secs(args.pending_timeout_secs)),
         started: Instant::now(),
     }));
-    let result = accept_connections(&listener, &registry, &limits);
+    let grace =
+        (args.namespace_grace_secs > 0).then(|| Duration::from_secs(args.namespace_grace_secs));
+    let result = accept_connections(&listener, &registry, &limits, grace);
     let reason = if SHUTDOWN.load(Ordering::SeqCst) {
         "signal"
     } else {
@@ -861,5 +1084,6 @@ mod tests {
         assert_eq!(args.max_connections, 128);
         assert_eq!(args.idle_timeout_secs, 900);
         assert_eq!(args.pending_timeout_secs, 60);
+        assert_eq!(args.namespace_grace_secs, 300);
     }
 }

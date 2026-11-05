@@ -145,9 +145,10 @@ sum over engines of row_bytes x num_chunks, plus one engine's full reservation
 ```
 
 The extra reservation covers an engine that starts while its predecessor still
-holds sessions: a namespace whose scheduler disconnected but whose workers are
-still attached is retired and stays charged until its last session leaves (see
-Failure modes).
+holds sessions: a namespace whose worker disconnected is retired and stays
+charged until its last session leaves, and a namespace whose scheduler
+disconnected stays detached and adoptable until `--namespace-grace-secs` runs
+out (see Ownership and Failure modes).
 
 A size that does not fit shows up in one of three ways:
 
@@ -177,7 +178,7 @@ them; the connector does not.
 
 | `op` | Fields | Sent by | Reply |
 | --- | --- | --- | --- |
-| `open` | `version`, `namespace`, `fingerprint`, `worker_bytes`, `world_size`, `num_chunks` | scheduler | the namespace geometry |
+| `open` | `version`, `namespace`, `fingerprint`, `worker_bytes`, `world_size`, `num_chunks`, `adopt` (default `false`) | scheduler | the namespace geometry |
 | `attach` | `version`, `namespace`, `fingerprint`, `rank` | worker | the namespace geometry, then one shared-memory descriptor |
 | `lookup` | `key`, `request` | scheduler | `status` |
 | `lookup_many` | `keys`, `request` | scheduler | `statuses`, one per key in order |
@@ -188,7 +189,8 @@ them; the connector does not.
 | `commit` | `keys`, `request`, `success` | scheduler | `ok` only |
 | `touch` | `keys` | scheduler | `ok` only |
 | `reset` | `force`, default `false` | scheduler | `ok` only |
-| `stats` | none | scheduler or worker | `stats` |
+| `stats` | none | scheduler or worker | `stats`, `sessions`, `detached` |
+| `close` | none | scheduler | `ok` only |
 | `info` | none | anyone, before any handshake | service state |
 
 `open` and `attach` are the only handshake operations, and a session holds at
@@ -202,17 +204,26 @@ An `attach` reply is the frame followed by one 1-byte message that carries one
 request. `info` needs no handshake and is the only operation that reports the
 service rather than one namespace.
 
-A `stats` reply, one counter set per namespace:
+`close` retires the namespace the caller owns, which is how the connector stops
+the engine without depending on what its last disconnect happened to leave
+behind (see Ownership). `open` with `"adopt": true` may only adopt a detached
+namespace and never creates one: a client that reconnects replays its handshake
+that way, so a namespace the service already dropped degrades the connector
+instead of pointing it at a second mapping while the workers still hold the
+first.
+
+A `stats` reply, one counter set per namespace, plus the sessions using it and
+whether its owner left it adoptable:
 
 ```json
-{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "free_chunks": 2, "requests": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}}
+{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "free_chunks": 2, "requests": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}, "sessions": 2, "detached": false}
 ```
 
 An `info` reply, which an operator or a probe can read before any engine opened a
-namespace:
+namespace, where `detached` counts the namespaces no owner holds:
 
 ```json
-{"ok": true, "version": "0.1.0", "pid": 81470, "uptime_ms": 2710, "capacity_bytes": 68719476736, "used_bytes": 0, "retired_bytes": 0, "namespaces": 0, "sessions": 0, "max_connections": 128}
+{"ok": true, "version": "0.1.0", "pid": 81470, "uptime_ms": 2710, "capacity_bytes": 68719476736, "used_bytes": 0, "retired_bytes": 0, "namespaces": 0, "detached": 0, "sessions": 0, "max_connections": 128}
 ```
 
 A frame-level failure closes the connection without a reply, and the namespace
@@ -265,16 +276,17 @@ eviction order until the engine stops.
 a lease) plus counters that are monotonic since the namespace opened and survive
 `reset`: `hits`, `misses`, `pending_hits`, `evictions`, `stores`, `commits`,
 `aborted`, `reclaimed` in keys, and the rejected or failed `commit` calls in
-`failed_commits`. A leaked lease or reservation shows up there instead of only as
-a stalled cache. `stats` reads no slot beyond the reservation and lease flags it
-counts.
+`failed_commits`. Beside that object it reports the `sessions` using the
+namespace and whether its owner left it `detached`. A leaked lease or reservation
+shows up there instead of only as a stalled cache. `stats` reads no slot beyond
+the reservation and lease flags it counts.
 
 `info` needs no handshake and reports the service rather than one namespace:
 `version`, `pid`, `uptime_ms`, `capacity_bytes`, `used_bytes` (live plus retired
-mappings), `retired_bytes`, `namespaces` (live ones), `sessions` (live and
-retired), and `max_connections`. A probe or an operator can call it before any
-engine opened a namespace; like every other command it still requires a same-UID
-peer.
+mappings), `retired_bytes`, `namespaces` (live ones), `detached` (live ones no
+owner holds), `sessions` (live and retired), and `max_connections`. A probe or an
+operator can call it before any engine opened a namespace; like every other
+command it still requires a same-UID peer.
 
 A `reset` refuses a cache with a pending reservation or a lease. `reset` with
 `"force": true` instead drops every lease and reservation, clears the slots, and
@@ -299,25 +311,65 @@ field, a short frame) and I/O errors close a connection. Attached workers may
 read `stats`; every other command mutates scheduler-owned metadata and is
 rejected for them.
 `store` and `commit` both carry the request that owns the reservation, so a
-request id must be the same one across the whole lifetime of that request.
+request id must be the same one across the whole lifetime of that request. The
+connector digests an id before it goes on the wire, so any user-supplied id fits
+the 256-byte limit and the service sees one stable 32-character id per request.
 No reply is written while the namespace registry is locked, so a client that
 stops reading blocks only its own connection, for at most the 5 s write timeout.
 
-Disconnecting an attached client still invalidates its namespace. Old mappings
-are never reused by a new namespace, and remain charged to capacity while
-attached clients retain their sessions. A request id is digested before it goes
-on the wire, so any user-supplied id fits the 256-byte limit; the service sees
-one stable 32-character id per request.
+A session is one of three kinds, and its kind decides what its departure costs
+the namespace:
+
+- an **owner**, the session that sent `open`,
+- a **worker**, a session that sent `attach` for one rank,
+- a **probe**, a session that has done neither and may only send `info`.
+
+A worker's departure retires its namespace: that rank may still have DMA in
+flight into slots nobody may recycle, so every owner call answers
+`cache namespace invalidated` from then on, and the connector degrades. A
+retired mapping is never adopted, never handed to a new namespace, and stays
+charged to capacity until its last remaining session leaves.
+
+An owner's departure alone only detaches the namespace. The mapping, every
+published entry, and every lease stay, and a later `open` with the same name,
+the same fingerprint, and the same geometry adopts them: it binds the new session
+as owner, answers with the geometry of the mapping it adopted, and leaves the
+entries and leases intact, so a worker keeps `attach`ing to the mapping it already
+has. A re-`open` with another fingerprint or another geometry is rejected with
+`namespace geometry mismatch` instead of reusing a mapping it does not describe,
+and adoption is refused with `namespace already owned by another scheduler`
+while the previous owner session is still connected.
+
+A detached namespace keeps its workers and its memory, so it cannot stay forever:
+`--namespace-grace-secs` (default 300; 0 disables) reclaims it that long after it
+detached, which frees the mapping of a scheduler that crashed and never came back
+even while its workers are still attached. Every transition is one log line:
+`namespace_detached` when the owner leaves, `namespace_adopted` when another
+session takes the namespace over, `namespace_retired` when a worker's departure
+keeps the mapping for its remaining sessions, `namespace_invalidated` when the
+mapping is freed instead because no session is left to hold it, and
+`namespace_reclaimed` when the grace period ends. `stats` reports the `sessions` of a namespace and whether it is
+`detached`, and `info` counts the `detached` namespaces of the service.
+
+`close` retires the namespace at once, which is what a scheduler shutting down
+sends: `ServiceOffloadingManager.shutdown()` sends `close` before it closes the
+socket, so a stopped engine leaves nothing for a later engine to adopt, and a
+worker keeps its own disconnect, which retires the namespace once its DMA is
+drained.
 
 A control RPC that fails at the transport level closes the client. A read-only
-`lookup` or `lookup_many` reconnects and repeats itself once, and every other
-operation stops offloading for that engine instead of failing the scheduler step:
-a lookup becomes a miss and reservations, completions, touches, and resets become
-no-ops. A rejection after such a reconnect disables offloading the same way,
-because a namespace the service dropped cannot serve the request again. A reply
-that breaks the slot contract raises instead, since it means a service bug and
-not a lost connection. No lookup ever reports a hit the service did not take a
-lease for.
+`lookup`, `lookup_many`, or `stats` reconnects and repeats itself once: the new
+connection replays the `open` handshake as an adoption, so the retried call reads
+the cache the engine already stored instead of failing on a namespace only its
+old session knew. A replay that has nothing to adopt, because the namespace was
+retired or its grace period ended, is rejected and disables offloading, since a
+second mapping the workers do not hold would be worse than no offloading at all.
+Every other operation stops offloading for that engine instead of failing the
+scheduler step: a lookup becomes a miss and reservations, completions, touches,
+and resets become no-ops. A rejection after such a reconnect disables offloading
+the same way. A reply that breaks the slot contract raises instead, since it means
+a service bug and not a lost connection. No lookup ever reports a hit the service
+did not take a lease for.
 
 ## Lifecycle
 
@@ -340,11 +392,13 @@ disable it with 0. One connection is one thread and one descriptor, so both
 limits bound the process. Transient accept failures (`EMFILE`, `ENFILE`,
 `ENOMEM`) are logged and retried after a short backoff rather than ending the
 service. `--pending-timeout-secs` (default 60; 0 disables) bounds how long a
-reservation may stay pending; see Ownership.
+reservation may stay pending; see Ownership. `--namespace-grace-secs` (default
+300; 0 disables) bounds how long a namespace whose owner left stays adoptable;
+the accept loop's own poll sweeps it, so no thread or timer exists for that.
 Every event writes one line to stderr, starting with `kv-cache-service: start`
-(socket, capacity, pid, and both limits) and ending with `shutdown`: namespace
-open and attach, retirement with the sessions left, the reclaimed socket, and
-rejected or failed requests with the operation name. Per-lookup paths log
+(socket, capacity, pid, and every limit) and ending with `shutdown`: namespace
+open, attach, detach, adoption, retirement, and reclaim, the reclaimed socket,
+and rejected or failed requests with the operation name. Per-lookup paths log
 nothing.
 
 A request loop runs under `catch_unwind`, so a build with unwinding answers
@@ -372,10 +426,12 @@ PY
 ```
 
 `info` reports `capacity_bytes`, `used_bytes` (live plus retired namespaces),
-`retired_bytes`, `namespaces`, and `sessions`. A `used_bytes` that stays at its
-value after every engine of a restart is gone, with `retired_bytes` equal to it,
-means a worker of the old engine still holds its session. The service has no
-aggregate `stats`: one namespace is one `stats` call.
+`retired_bytes`, `namespaces`, `detached`, and `sessions`. A `used_bytes` that
+stays at its value after every engine of a restart is gone, with `retired_bytes`
+equal to it, means a worker of the old engine still holds its session. A
+`detached` above 0 means a scheduler left a namespace adoptable, and the grace
+period is what eventually frees it. The service has no aggregate `stats`: one
+namespace is one `stats` call.
 
 `stats` reports one namespace, and its counters show a leak before the cache
 stalls:
@@ -388,6 +444,7 @@ stalls:
 | `hits`, `misses`, `pending_hits` | Lookup outcomes since `open`, unchanged across `reset`. |
 | `evictions`, `stores`, `commits`, `aborted` | Chunks evicted, reserved, published, and released without publishing. |
 | `failed_commits`, `reclaimed` | Commits rejected (ownership, missing reservation, failed publish) and keys reclaimed by the pending timeout. |
+| `sessions`, `detached` | Sessions using the namespace, and whether an owner left it adoptable. `detached` with `sessions` above 0 is a scheduler that is gone while its workers still hold the mapping; `--namespace-grace-secs` is what frees it. |
 
 Engine side, the connector samples one `stats` RPC per collection and reports
 `vllm:kv_offload_cpu_cache_usage_perc` (`entries / num_chunks`),
@@ -411,8 +468,10 @@ are logged at debug level.
 | `capacity must be positive`, `connection limit must be positive` at start | `--capacity-bytes 0` or `--max-connections 0` | pass a positive bound |
 | `service was built without the rswap BPF object` on `open` | `--rswap-attach` on a build without clang | rebuild with clang or drop the flag; the service itself starts |
 | `namespace already owned by another scheduler` | another live engine uses the same `engine_id` | give each engine a distinct `engine_id`, or stop the old engine |
+| `namespace geometry mismatch` | a re-`open` of an adoptable namespace with another fingerprint or another geometry | use the `engine_id`, layout, and sizing the running namespace was opened with, or wait for its grace period to end |
+| `no detached namespace to adopt` | a reconnect replayed its `open` after the namespace was retired or its grace period expired | the engine degraded on purpose; restart it, and size `--namespace-grace-secs` above the longest connection outage it should survive |
 | `cache exceeds service capacity` at engine start | `--capacity-bytes` is smaller than the reservations, or a restarting engine's predecessor still holds sessions | raise it and restart the service, or stop the stale engine; see Sizing |
-| `cache namespace invalidated` | a session of that namespace disconnected, was idle-timed out, or sent a malformed frame | restart the engine; its cache is cold |
+| `cache namespace invalidated` | a worker of that namespace disconnected, the owner sent `close`, or the grace period expired | restart the engine; its cache is cold |
 | `scheduler namespace not available` on `attach` | the worker attached after the namespace was invalidated | restart the whole engine, not only the worker |
 | `incompatible or duplicate worker` on `attach` | a second attach of the same rank, or a rank that does not match the namespace fingerprint | restart the engine; every rank must attach once, with one layout |
 | `workers cannot mutate cache metadata` | an attached worker sent an operation other than `stats` | a client bug; the worker's session and the namespace still live |
@@ -422,12 +481,14 @@ are logged at debug level.
 | one error line, then every lookup misses | a transport failure, or a rejection after the reconnect | offloading is off for that engine until it restarts |
 | `internal error` | a panic under `catch_unwind` | that connection closed; restart the engine if it recurs |
 
-Nothing reconnects a mutating operation: a read-only `lookup` repeats itself
-once on a new connection, every other operation degrades as Ownership
-describes, and the cache of a restarted engine is always cold. Old mappings are
-never reused, and a namespace stays charged until the last of its sessions
-leaves, so a restart of one engine can fail on capacity while the previous
-process is still exiting.
+Nothing reconnects a mutating operation: a read-only `lookup`, `lookup_many`, or
+`stats` repeats itself once on a new connection, which adopts the namespace its
+previous session opened, and every other operation degrades as Ownership
+describes. A namespace whose ownership was lost for longer than
+`--namespace-grace-secs` cannot be adopted again, so its restarted engine starts
+cold. Retired mappings are never reused, and a namespace stays charged until the
+last of its sessions leaves, so a restart of one engine can fail on capacity
+while the previous process is still exiting.
 
 ## Hash reporting
 
@@ -507,8 +568,8 @@ Numbers the service enforces:
 - One frame is at most 1 MiB in either direction.
 - One namespace per session, because a session `open`s or `attach`es once, and
   one in-flight request per client: the connector never pipelines.
-- `--max-connections` 128, `--idle-timeout-secs` 900, and
-  `--pending-timeout-secs` 60 by default.
+- `--max-connections` 128, `--idle-timeout-secs` 900,
+  `--pending-timeout-secs` 60, and `--namespace-grace-secs` 300 by default.
 
 ## Performance
 

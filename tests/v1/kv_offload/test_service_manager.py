@@ -54,6 +54,7 @@ class FakeClient:
         self.evicted: list[str] = []
         # Namespace counters the service reports from `stats`.
         self.counters: dict[str, int] = {"entries": 0, "pending": 0, "leased": 0}
+        self.closed = False
         self._store_calls = 0
 
     def call(self, op: str, retry: bool = False, **fields: Any) -> dict[str, Any]:
@@ -65,7 +66,7 @@ class FakeClient:
         return getattr(self, f"_{op}")(**fields)
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
     def ops(self, op: str) -> list[dict[str, Any]]:
         return [fields for name, fields in self.calls if name == op]
@@ -108,6 +109,9 @@ class FakeClient:
 
     def _stats(self) -> dict[str, Any]:
         return {"ok": True, "stats": dict(self.counters)}
+
+    def _close(self) -> dict[str, Any]:
+        return {"ok": True}
 
 
 def make_manager(
@@ -570,3 +574,26 @@ def test_partially_consumed_drain_does_not_replay_events():
     events = iter(manager.take_events())
     assert next(events).keys == [make_key(0)]
     assert list(manager.take_events()) == []
+
+
+def test_shutdown_closes_the_namespace_then_the_socket():
+    """A shutdown retires the namespace instead of leaving it adoptable."""
+    client = FakeClient()
+    manager = make_manager(client)
+
+    manager.shutdown()
+
+    assert [op for op, _ in client.calls] == ["close"]
+    assert client.closed
+
+
+def test_shutdown_swallows_a_failed_close():
+    """A service that already dropped the namespace must not fail shutdown."""
+    client = FakeClient()
+    client.reject = True
+    manager = make_manager(client)
+
+    manager.shutdown()
+
+    assert len(client.ops("close")) == 1
+    assert client.closed

@@ -29,6 +29,13 @@ The operator-facing side of this backend, including its
 - A lost worker may still have DMA in flight. Invalidate its namespace rather
   than reclaiming slots into the same mapping. Do not reconnect old workers to a
   newly created namespace.
+- An owner's departure is not a lost worker: detach the namespace, keep its
+  mapping, entries, and leases, and let the same engine adopt it with a matching
+  fingerprint and geometry, because one reconnect must not cost the engine its
+  whole cache. Refuse adoption while the previous owner is still connected, and
+  bound how long a detached namespace may stay adoptable so a crashed scheduler
+  cannot pin memory behind its workers. A reconnect may adopt only, never create a
+  second mapping while the workers still hold the first.
 - A rejected request is not a lost worker. Answer it with `{"ok": false, ...}` and
   keep the session and namespace alive; only frame-level failures and I/O errors
   end a connection. Never hold a lock across a socket write or a descriptor send.
@@ -74,9 +81,24 @@ that pins it:
   (`lookup_lease_prevents_eviction_before_load`). A lease is released only when
   the request finished and every job it issued completed
   (`test_lookup_lease_released_only_after_finish_and_all_jobs`).
-- **Namespace retirement.** A disconnected session never hands its mapping to a
-  new namespace: the namespace is retired and stays charged to capacity until
-  its last session leaves (`main.rs::release_session`).
+- **Namespace retirement.** A disconnected worker never hands its mapping to a
+  new namespace: the namespace is retired and stays charged to capacity until its
+  last session leaves (`main.rs::Registry::retire`,
+  `worker_disconnect_still_invalidates_the_namespace`).
+- **Namespace adoption.** A disconnected owner only detaches: the same fingerprint
+  and geometry adopt the mapping with its entries and leases, a different one is
+  rejected, and a live owner refuses it
+  (`main.rs::Registry::open`,
+  `owner_reconnect_adopts_the_namespace_and_keeps_entries`,
+  `reopen_with_a_different_fingerprint_is_rejected`). A namespace nobody adopts is
+  reclaimed when its grace period ends, and a reconnect can never create one
+  (`detached_namespace_expires_after_the_grace_period`, `adopt_never_creates_a_namespace`,
+  `test_reconnect_never_recreates_a_namespace_the_service_dropped`). A namespace
+  with no sessions left is reclaimed at once
+  (`namespace_without_sessions_is_reclaimed`).
+- **Explicit shutdown.** `close` retires the namespace before the socket goes, and
+  is the only teardown that leaves nothing adoptable (`close_retires_the_namespace_immediately`,
+  `test_shutdown_closes_the_namespace_so_the_service_frees_it`).
 - **Reset ordering.** `reset` refuses leases and pending reservations; the forced
   reset follows `on_reset_flushed()`, and only after every worker reported the
   transfers it flushed (`forced_reset_discards_leases_and_pending_reservations`,

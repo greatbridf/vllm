@@ -273,7 +273,7 @@ impl Service {
         let thread = thread::spawn(move || {
             // Only a listener failure ends the loop early, and the next client
             // call then reports it.
-            let _ = accept_connections(&listener, &registry, &limits);
+            let _ = accept_connections(&listener, &registry, &limits, None);
         });
         Ok(Service {
             _dir: dir,
@@ -470,9 +470,13 @@ impl Bench {
         Ok(sessions)
     }
 
-    /// Drops a finished case's connections and waits until the service released
-    /// their namespaces, so the next case opens against the whole budget.
-    fn finish(&self, sessions: Vec<Session>) -> io::Result<()> {
+    /// Drops a finished case's connections, closing their namespaces so the
+    /// service frees them, so the next case opens against the whole budget.
+    fn finish(&self, mut sessions: Vec<Session>) -> io::Result<()> {
+        for session in &mut sessions {
+            let closed = session.client.call(&json!({"op": "close"}))?;
+            accepted(&closed)?;
+        }
         drop(sessions);
         let mut probe = Client::connect(&self.socket)?;
         let deadline = Instant::now() + RELEASE_TIMEOUT;

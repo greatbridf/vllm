@@ -25,6 +25,10 @@ pub enum Request {
         worker_bytes: usize,
         world_size: usize,
         num_chunks: usize,
+        /// Adopt a namespace a departed owner left behind instead of creating
+        /// one, which is what a reconnect may do and a first start may not.
+        #[serde(default)]
+        adopt: bool,
     },
     Attach {
         version: u32,
@@ -73,6 +77,8 @@ pub enum Request {
         force: bool,
     },
     Stats,
+    /// Owner-only: retires the namespace now instead of leaving it adoptable.
+    Close,
     /// Service-wide state, available before any handshake.
     Info,
 }
@@ -93,6 +99,7 @@ impl Request {
             Request::Touch { .. } => "touch",
             Request::Reset { .. } => "reset",
             Request::Stats => "stats",
+            Request::Close => "close",
             Request::Info => "info",
         }
     }
