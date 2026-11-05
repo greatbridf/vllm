@@ -226,8 +226,10 @@ namespace, where `detached` counts the namespaces no owner holds:
 {"ok": true, "version": "0.1.0", "pid": 81470, "uptime_ms": 2710, "capacity_bytes": 68719476736, "used_bytes": 0, "retired_bytes": 0, "namespaces": 0, "detached": 0, "sessions": 0, "max_connections": 128}
 ```
 
-A frame-level failure closes the connection without a reply, and the namespace
-that session owned is invalidated. A request-level failure answers
+A frame-level failure closes the connection without a reply, which ends that
+session as any disconnect does (see Ownership): an owner's namespace stays
+adoptable until its grace period ends, and a worker's is retired. A request-level
+failure answers
 `{"ok": false, "error": "..."}` and leaves the session and its namespace alive;
 Ownership lists what a rejection covers and what it leaves to the caller.
 
@@ -480,7 +482,7 @@ are logged at debug level.
 | `workers cannot mutate cache metadata` | an attached worker sent an operation other than `stats` | a client bug; the worker's session and the namespace still live |
 | `cannot reset a cache with active transfers or leases` | a `reset` without `force` while a lease or reservation is open | release the leases, or send `{"force": true}` once every transfer whose slot it abandons is flushed |
 | `cannot connect to the KV cache service at ...` | the socket is missing, the service is down, or the path or UID is wrong | check the unit, `ls -l` the socket, and `info` |
-| `invalid_frame` in the journal, then a closed connection | a bad frame length, a non-JSON payload, or an unknown `op` or field | a client bug or a version mismatch; the namespace that session owned is gone, so restart the engine |
+| `invalid_frame` in the journal, then a closed connection | a bad frame length, a non-JSON payload, or an unknown `op` or field | a client bug or a version mismatch; the session is gone, and an owner's namespace is adoptable only until its grace period ends, so restart the engine |
 | one error line, then every lookup misses | a transport failure, or a rejection after the reconnect | offloading is off for that engine until it restarts |
 | `internal error` | a panic under `catch_unwind` | that connection closed; restart the engine if it recurs |
 
