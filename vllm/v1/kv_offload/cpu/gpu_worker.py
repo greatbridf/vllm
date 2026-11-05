@@ -243,17 +243,20 @@ def pin_mmap_region(region: OffloadRegion, worker_slot_only: bool = False) -> No
         for offset in range(0, total_size, chunk_size)
     )
     stride = region._row_stride
-    slot = region.cpu_page_size if isinstance(region, SharedOffloadRegion) else stride
+    # A region that reports cpu_page_size owns only that slice of every row, so
+    # it can register its own slices instead of the whole multi-rank region.
+    slot = getattr(region, "cpu_page_size", stride)
+    iter_slots = getattr(region, "iter_worker_slot_ranges", None)
     page = region.BLOCK_SIZE_ALIGNMENT
     min_savings = max(page, MIN_HOST_REGISTER_SAVED_BYTES)
     if (
-        isinstance(region, SharedOffloadRegion)
+        iter_slots is not None
         and worker_slot_only
         and region.rank is not None
         and stride - slot >= min_savings
     ):
         # Round each slot out to pages; the worker's next slot is a page away.
-        ranges = region.iter_worker_slot_ranges()
+        ranges = iter_slots()
     else:
         reason = (
             "whole-region layout requested"

@@ -4,11 +4,13 @@
 
 import mmap
 import os
+from collections.abc import Iterator
 
 import numpy as np
 import torch
 
-from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+from vllm.utils.math_utils import round_up
+from vllm.v1.kv_offload.cpu.host_register import host_unregister
 from vllm.v1.kv_offload.cpu.mmap_offload_region import MmapOffloadRegion
 from vllm.v1.kv_offload.service.client import CacheServiceClient
 
@@ -45,6 +47,9 @@ class ServiceOffloadRegion(MmapOffloadRegion):
             self.num_chunks = num_chunks
             self.rank = rank
             self._row_stride = row_bytes
+            # This rank's slice of every row. `pin_mmap_region` reads it to
+            # register those slices instead of the whole multi-rank region.
+            self.cpu_page_size = worker_bytes
             self._worker_offset = rank * worker_bytes
             self._worker_area_end = (rank + 1) * worker_bytes
             self.total_size_bytes = num_chunks * row_bytes
@@ -56,19 +61,42 @@ class ServiceOffloadRegion(MmapOffloadRegion):
         finally:
             os.close(fd)
 
+    def iter_worker_slot_ranges(self) -> Iterator[tuple[int, int]]:
+        """Yields this rank's page-aligned slice of every chunk.
+
+        Consecutive slices are merged into one range, so a layout whose rows
+        hold nothing but this rank's bytes registers once, not once per chunk.
+        """
+        page = mmap.PAGESIZE
+        rank = self.rank
+        assert rank is not None
+        pending: tuple[int, int] | None = None
+        for chunk in range(self.num_chunks):
+            row = chunk * self._row_stride
+            start = row + rank * self.cpu_page_size
+            start -= start % page
+            end = min(
+                round_up(row + self._worker_area_end, page), self.total_size_bytes
+            )
+            if pending is not None and start <= pending[1]:
+                pending = (pending[0], max(pending[1], end))
+                continue
+            if pending is not None:
+                yield pending[0], pending[1] - pending[0]
+            pending = (start, end)
+        if pending is not None:
+            yield pending[0], pending[1] - pending[0]
+
     def cleanup(self) -> None:
-        try:
-            if self.is_pinned:
-                runtime = CudaRTLibrary()
-                while self.pinned_addresses:
-                    address = self.pinned_addresses[-1]
-                    code = runtime.cudaHostUnregister(address)
-                    if code != 0:
-                        raise RuntimeError(f"Host unregistration failed: {code}")
-                    self.pinned_addresses.pop()
-                self.is_pinned = False
-            super().cleanup()
-        finally:
-            # Worker shutdown drains DMA before disconnecting. The service
-            # invalidates this namespace before it can reuse abandoned slots.
-            self.client.close()
+        """Releases the mapping and this rank's registration; safe to repeat."""
+        if self.is_pinned:
+            # Pinning is a bandwidth optimization the region has already given
+            # up if unregistering fails, so a failure warns instead of raising.
+            for address in reversed(self.pinned_addresses):
+                host_unregister(address)
+            self.pinned_addresses.clear()
+            self.is_pinned = False
+        super().cleanup()
+        # Worker shutdown drains DMA before disconnecting. The service
+        # invalidates this namespace before it can reuse abandoned slots.
+        self.client.close()

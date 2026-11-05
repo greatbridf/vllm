@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+import vllm.v1.kv_offload.service.spec as service_spec_module
 from tests.v1.kv_offload.conftest import make_offloading_config
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -973,7 +974,176 @@ def test_tiering_spec_rejects_secondary_tiers_across_nodes(
     assert sorted(queried) == (["pcp", "pp", "tp"] if secondary_tiers else [])
 
 
-def test_rust_spec_accepts_kv_cache_events_and_publishes_the_geometry(monkeypatch):
+@pytest.fixture
+def service_budget(monkeypatch):
+    """Answers the startup budget probe of the Rust service; no process needed."""
+    budget = {"capacity_bytes": 1 << 40}
+
+    def capacity_bytes(self) -> int:
+        return budget["capacity_bytes"]
+
+    monkeypatch.setattr(
+        RustServiceOffloadingSpec, "_service_capacity_bytes", capacity_bytes
+    )
+    return budget
+
+
+def _rust_spec(**kwargs: Any) -> RustServiceOffloadingSpec:
+    extra_config = {
+        "service_socket": "/tmp/cache.sock",
+        **kwargs.pop("extra_config", {}),
+    }
+    return RustServiceOffloadingSpec(
+        make_offloading_config(
+            spec_name="RustServiceOffloadingSpec",
+            extra_config=extra_config,
+            **kwargs,
+        )
+    )
+
+
+def test_rust_spec_rejects_an_unknown_extra_config_key(service_budget):
+    """A mistyped setting fails at startup instead of being ignored."""
+    with pytest.raises(ValueError, match="key 'service_sockets'"):
+        _rust_spec(extra_config={"service_sockets": "/tmp/cache.sock"})
+
+
+@pytest.mark.parametrize(
+    "extra_config, key",
+    [
+        ({"cache_policy_module_path": "mod.Policy"}, "cache_policy_module_path"),
+        ({"max_tracker_size": 64000}, "max_tracker_size"),
+        ({"secondary_tiers": [{"type": "fs"}]}, "secondary_tiers"),
+    ],
+)
+def test_rust_spec_rejects_another_tier_setting(service_budget, extra_config, key):
+    """Settings another CPU backend reads are rejected, naming the key."""
+    with pytest.raises(ValueError, match=key):
+        _rust_spec(extra_config=extra_config)
+
+
+def test_rust_spec_rejects_a_non_shared_offload_region(service_budget):
+    """The service owns one copy per worker, so no region type is selectable."""
+    with pytest.raises(ValueError, match="offload_region='shared'"):
+        _rust_spec(extra_config={"offload_region": "mmap"})
+    assert _rust_spec(extra_config={"offload_region": "shared"}).region_type == "shared"
+
+
+def test_rust_spec_rejects_a_non_lru_eviction_policy(service_budget):
+    with pytest.raises(ValueError, match="least recently used"):
+        _rust_spec(extra_config={"eviction_policy": "arc"})
+
+
+@pytest.mark.parametrize("store_threshold", [2, 3, -1])
+def test_rust_spec_rejects_store_threshold(service_budget, store_threshold):
+    """The service stores every offered chunk instead of counting reuse."""
+    with pytest.raises(ValueError, match="remove store_threshold"):
+        _rust_spec(extra_config={"store_threshold": store_threshold})
+    # 0 and 1 both mean "no filter" in the CPU settings this backend inherits.
+    assert _rust_spec(extra_config={"store_threshold": 1}).num_chunks > 0
+
+
+@pytest.mark.parametrize("key", ["service_timeout", "service_connect_timeout"])
+@pytest.mark.parametrize("timeout", [0.0, -1.0])
+def test_rust_spec_rejects_a_non_positive_timeout(service_budget, key, timeout):
+    with pytest.raises(ValueError, match=f"{key} must be positive"):
+        _rust_spec(extra_config={key: timeout})
+
+
+def test_rust_spec_uses_separate_connect_and_rpc_timeouts(monkeypatch, service_budget):
+    """Connecting gets its own bound, and every RPC reuses the operation one."""
+    spec = _rust_spec(
+        extra_config={"service_timeout": 2.5, "service_connect_timeout": 7.5}
+    )
+    assert spec.timeout == 2.5
+    client_ctor = MagicMock()
+    monkeypatch.setattr(service_spec_module, "CacheServiceClient", client_ctor)
+    spec._client()
+    client_ctor.assert_called_once_with("/tmp/cache.sock", 2.5, 7.5)
+    # Documented defaults: both are 5 s.
+    default_spec = _rust_spec()
+    assert default_spec.timeout == default_spec.connect_timeout == 5.0
+
+
+def test_rust_spec_rejects_canonical_layout(service_budget):
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="canonical pages are not supported"):
+        RustServiceOffloadingSpec(
+            replace(
+                make_offloading_config(
+                    spec_name="RustServiceOffloadingSpec",
+                    extra_config={"service_socket": "/tmp/cache.sock"},
+                ),
+                canonical_layout=True,
+            )
+        )
+
+
+def test_rust_spec_rejects_a_budget_below_one_chunk(service_budget):
+    """A budget that truncates to zero chunks names the minimum reservation."""
+    page = mmap.PAGESIZE
+    with pytest.raises(ValueError, match=f"reserve at least {page} bytes"):
+        _rust_spec(cpu_bytes_to_use=page - 1)
+
+
+def test_rust_spec_caps_the_chunk_count_to_the_service_budget(service_budget):
+    """A budget over the service's capacity is trimmed instead of failing `open`."""
+    page = mmap.PAGESIZE
+    service_budget["capacity_bytes"] = 3 * page
+    spec = _rust_spec(cpu_bytes_to_use=16 * page)
+    assert spec.kv_bytes_per_chunk == page
+    assert spec.num_chunks == 3
+    assert spec.cpu_info.cpu_num_chunks == 3
+    assert spec.cpu_info.cpu_kv_cache_size_bytes == 3 * page
+
+
+def test_rust_spec_rejects_a_service_budget_below_one_chunk(service_budget):
+    page = mmap.PAGESIZE
+    service_budget["capacity_bytes"] = page // 2
+    with pytest.raises(ValueError, match=f"--capacity-bytes={page // 2}"):
+        _rust_spec(cpu_bytes_to_use=16 * page)
+
+
+def test_rust_spec_sizes_the_chunked_row(service_budget):
+    """Four workers each hold 128 bytes, so one row is one padded page."""
+    page = mmap.PAGESIZE
+    spec = _rust_spec(
+        cpu_bytes_to_use=4 * page,
+        worker_kv_bytes_per_block=128,
+        world_size=4,
+        rank=2,
+    )
+    assert spec.worker_bytes == 128
+    assert spec.kv_bytes_per_chunk == page
+    assert spec.num_chunks == 4
+    info = spec.cpu_info.as_config_info()
+    assert info["cpu_num_chunks"] == 4
+    assert info["cpu_kv_cache_size_bytes"] == 4 * page
+
+
+def test_rust_spec_fingerprint_covers_the_layout(service_budget):
+    """Only an identical layout produces the fingerprint the service matches on."""
+    fingerprints = {
+        _rust_spec(
+            worker_kv_bytes_per_block=worker_bytes,
+            groups=(OffloadingGroupConfig(16, (layer,), 0),),
+            max_model_len=max_model_len,
+        ).fingerprint
+        for worker_bytes, layer, max_model_len in (
+            (128, "layer", 4096),
+            (128, "layer", 8192),
+            (128, "other_layer", 4096),
+            (256, "layer", 4096),
+        )
+    }
+    assert len(fingerprints) == 4
+    assert _rust_spec().fingerprint == _rust_spec().fingerprint
+
+
+def test_rust_spec_accepts_kv_cache_events_and_publishes_the_geometry(
+    monkeypatch, service_budget
+):
     """The backend publishes store events instead of refusing to start."""
     from dataclasses import replace
 

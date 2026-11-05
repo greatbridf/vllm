@@ -43,8 +43,16 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
 The service's capacity is an aggregate limit across engine namespaces.
 `cpu_bytes_to_use` reserves an engine's share, including page padding and a
 separate slice for every TP worker. Every rank stores its own copy.
-Workers attempt host pinning through the existing DMA worker; pageable fallback
-does not guarantee that Linux keeps all pages resident in DRAM.
+An engine asks the `info` op for `--capacity-bytes` while it starts and trims its
+own `num_chunks` to that budget, so a `cpu_bytes_to_use` the service cannot hold
+costs a warning and a smaller cache instead of a failed `open`; a budget too
+small for one row stops the engine with the minimum to reserve. The realized
+geometry is logged once at INFO, so the engine log matches what the service
+allocated.
+Workers attempt host pinning through the existing DMA worker and register only
+their own slice of every chunk, so pinned memory stays one slice per worker
+instead of the whole multi-rank region; pageable fallback does not guarantee
+that Linux keeps all pages resident in DRAM.
 
 ## Ownership
 

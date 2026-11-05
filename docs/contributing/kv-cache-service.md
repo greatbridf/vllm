@@ -38,7 +38,14 @@ Read this before changing the Rust CPU cache service or its native offloading sp
   socket a killed predecessor left, so a supervisor restarts the service.
 - Keep unsupported topology, events, and secondary-tier combinations explicit.
   The initial backend is single-node TP-only and does not persist across engine
-  sessions. Model names alone do not certify byte-layout compatibility.
+  sessions. Model names alone do not certify byte-layout compatibility. Reject a
+  `kv_connector_extra_config` key the backend cannot honour instead of ignoring
+  it, and fit the requested geometry to the budget the service reports before
+  asking for it, so a bad configuration fails at startup with a named key or a
+  size, not with an opaque rejection from `open`.
+- Pin only the bytes a rank owns. A shared region holds every rank's slice, so
+  register this rank's slices instead of the whole mapping, and treat a failed
+  unregistration at shutdown as a warning, not an error.
 - Validate the actual Rust subprocess and Python descriptor handshake, not only
   mocked RPC calls. Run byte-level storage and lease tests on CPU; GPU DMA and
   cold-versus-reload model output require separate validation on GPU hardware.

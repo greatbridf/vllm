@@ -112,6 +112,33 @@ CPU/GPU validation commands, and hash reporting details. The service stops on
 killed service and refuses a path another process still serves, so a supervisor
 can restart it without manual cleanup.
 
+The spec rejects, before it connects, any `kv_connector_extra_config` key it
+cannot serve, naming the key: `cache_policy_module_path`, `max_tracker_size`, and
+`secondary_tiers` say what to use instead, and any other unknown key is reported
+as unsupported. It honours `service_socket`, `service_timeout`,
+`service_connect_timeout`, `cpu_bytes_to_use`, `blocks_per_chunk`/`block_size`,
+`spec_name`, `offload_region: "shared"`, `eviction_policy: "lru"`,
+`store_threshold` below 2, and the generic `offload_prompt_only`,
+`self_describing_kv_events`, and `sync_load_budget_bytes` settings. A
+`canonical_layout` request is refused. `service_timeout` (default 5 s) bounds each
+control RPC, and `service_connect_timeout` (default 5 s) bounds connecting,
+including the bounded retry that lets an engine start race the service.
+
+At startup the spec asks the service's `info` op for its `--capacity-bytes` and
+caps `num_chunks` to what that budget holds: a `cpu_bytes_to_use` larger than the
+service can serve is trimmed with a warning instead of failing `open` later, and
+a `cpu_bytes_to_use`, or a service budget, too small for one row is rejected with
+the minimum to reserve. The realized geometry (`namespace`, `worker_bytes`,
+`row_bytes`, `num_chunks`, `bytes`, `world_size`) is logged once at INFO, so the
+engine log and `vllm:kv_offload_config_info` agree with what the service
+allocated.
+
+Each rank pins its own slice of every chunk rather than the whole multi-rank
+region, so host-pinned memory stays `num_chunks x worker_bytes` per worker
+instead of `world_size` times that. Registration falls back to whole-region
+registration when that saves less than 3 MiB per row, and unregistration logs a
+warning instead of raising during worker shutdown.
+
 A `store` reservation belongs to the request that made it, so only that request's
 `commit` publishes it. A reservation that is still pending after
 `--pending-timeout-secs` (default 60; 0 disables it) is reclaimed and logged, so a
@@ -267,22 +294,25 @@ Each region's address and size are available as `base_tensor.data_ptr()` and `to
 
 | Key | Required | Default | Scope | Notes |
 | --- | --- | --- | --- | --- |
-| `spec_name` | no | `CPUOffloadingSpec` | both | Set to `TieringOffloadingSpec` for multi-tier. |
+| `spec_name` | no | `CPUOffloadingSpec` | both | Set to `TieringOffloadingSpec` for multi-tier or `RustServiceOffloadingSpec` for the process-separated Rust cache service (see [Rust Cache Service](#rust-cache-service)). |
+| `service_socket` | no | — | `RustServiceOffloadingSpec` | Path of the Rust cache service's Unix socket. Required by that spec; the directory must be `0700` and owned by the calling UID. |
+| `service_timeout` | no | `5.0` | `RustServiceOffloadingSpec` | Seconds allowed for each control RPC. A timeout stops offloading for the engine instead of failing the scheduler step. |
+| `service_connect_timeout` | no | `5.0` | `RustServiceOffloadingSpec` | Seconds allowed for one connect attempt, including the bounded retry that covers a service still starting. |
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |
 | `blocks_per_chunk` | no | `1` | both | Offloaded chunk size in GPU blocks; must be > 0. Alternative to `block_size` for models whose KV cache groups have different block sizes. |
-| `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). |
+| `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). `RustServiceOffloadingSpec` accepts only `lru`. |
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
-| `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
+| `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec` and by `RustServiceOffloadingSpec`, as are negative values. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
-| `offload_region` | no | `shared` | single-tier | Host region backing the CPU tier. `shared`: file-backed mmap in `/dev/shm`, pinned with `cudaHostRegister`. `mmap`: private anonymous DRAM mapping (see [Anonymous DRAM Offload](#anonymous-dram-offload-offload_region-mmap)). `hmm`: plain unpinned per-worker host allocation left for kernel migration (see [Kernel-Managed Offload](#kernel-managed-offload-offload_region-hmm)). |
+| `offload_region` | no | `shared` | single-tier | Host region backing the CPU tier. `shared`: file-backed mmap in `/dev/shm`, pinned with `cudaHostRegister`. `mmap`: private anonymous DRAM mapping (see [Anonymous DRAM Offload](#anonymous-dram-offload-offload_region-mmap)). `hmm`: plain unpinned per-worker host allocation left for kernel migration (see [Kernel-Managed Offload](#kernel-managed-offload-offload_region-hmm)). `RustServiceOffloadingSpec` always uses `shared` and rejects the others. |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
 | `tier_poll_interval_s` | no | `0.001` | multi-tier | Pause between tier-poll rounds for tiers that must be serviced between engine steps (currently `p2p`). See [Threading model](#threading-model). Set to `0` to disable the thread and service those tiers once per engine step instead. |
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
 | `sync_load_budget_bytes` | no | `0` | both | Per-step budget of KV bytes (per GPU) loaded within the same step, so those requests run immediately instead of waiting a step for an async load. Hits that don't fit the remaining budget, or would leave nothing to compute, stay async. `0` disables. |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Recurrent (Mamba / linear-attention) state groups announce state checkpoints, with `kv_cache_spec_kind` `mamba`: an offloaded chunk or partial tail holds one recurrent state, valid at its last hash, so its `BlockStored` carries that single hash, its parent hash and an empty `token_ids`. Consumers align it by hash with the attention group's blocks; a hybrid prefix is reusable only up to a boundary where every group has a residency. Sliding-window and chunked-local attention chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
-| `canonical_layout` | no | `false` | both | Store each offloaded block in a common canonical representation instead of each worker's local GPU page (enables sharing across TP sizes and single-copy storage of replicated KV). See [Canonical Layout](#canonical-layout). |
+| `canonical_layout` | no | `false` | both | Store each offloaded block in a common canonical representation instead of each worker's local GPU page (enables sharing across TP sizes and single-copy storage of replicated KV). See [Canonical Layout](#canonical-layout). Rejected by `RustServiceOffloadingSpec`, which stores a private copy per worker. |
 
 ## Canonical Layout
 
