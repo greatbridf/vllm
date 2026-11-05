@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde_json::{Value, json};
-use vllm_kv_cache_service::cache::{Cache, check_keys, check_request, namespace_bytes};
+use vllm_kv_cache_service::cache::{Cache, Released, check_keys, check_request, namespace_bytes};
 use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
 use vllm_kv_cache_service::protocol::{self, Request};
 
@@ -48,6 +48,10 @@ struct Args {
     /// idle connections open.
     #[arg(long, default_value_t = 900)]
     idle_timeout_secs: u64,
+    /// Free a `store` reservation this many seconds after it was made; 0 keeps
+    /// reservations until their request commits or releases them.
+    #[arg(long, default_value_t = 60)]
+    pending_timeout_secs: u64,
     /// Attach the rswap digest BPF program through sysfs; disabled by default.
     /// Defaults to /sys/kernel/mm/xswap/rswap_attach when no path is given.
     #[arg(
@@ -81,6 +85,7 @@ struct Registry {
     retired: Vec<Namespace>,
     budget: usize,
     rswap_attach: Option<PathBuf>,
+    pending_timeout: Option<Duration>,
 }
 
 /// A reply is built before the wire is touched, so a failed write cannot add a
@@ -278,13 +283,13 @@ fn handle(
         }
         command => {
             let name = namespace.as_deref().ok_or_else(|| reject("handshake required"))?;
-            let cache = {
+            let (cache, pending_timeout) = {
                 let registry = lock_or_recover(registry, "registry");
                 let entry = registry
                     .namespaces
                     .get(name)
                     .ok_or_else(|| reject("cache namespace invalidated"))?;
-                Arc::clone(&entry.cache)
+                (Arc::clone(&entry.cache), registry.pending_timeout)
             };
             let mut cache = lock_or_recover(&cache, "cache");
             // Read-only stats stay available to attached workers; every other
@@ -306,21 +311,21 @@ fn handle(
                 Request::Release { keys, request } => {
                     check_keys(&keys).map_err(reject)?;
                     check_request(&request).map_err(reject)?;
-                    cache.release(&keys, &request);
-                    json!({"ok": true})
+                    released_reply(cache.release(&keys, &request))
                 }
                 Request::ReleaseAll { request } => {
                     check_request(&request).map_err(reject)?;
-                    cache.release_request(&request);
-                    json!({"ok": true})
+                    released_reply(cache.release_request(&request))
                 }
-                Request::Store { keys } => {
+                Request::Store { keys, request } => {
                     check_keys(&keys).map_err(reject)?;
+                    check_request(&request).map_err(reject)?;
                     // The reply echoes every key; reject before reserving slots.
                     if !protocol::store_reply_fits(&keys) {
                         return Err(reject("batch too large for one control frame"));
                     }
-                    match cache.store(&keys) {
+                    reclaim_expired(&mut cache, name, pending_timeout);
+                    match cache.store(&keys, &request) {
                         Some((keys, slots, evicted)) => {
                             json!({
                                 "ok": true,
@@ -332,9 +337,14 @@ fn handle(
                         None => json!({"ok": true, "full": true}),
                     }
                 }
-                Request::Commit { keys, success } => {
+                Request::Commit {
+                    keys,
+                    request,
+                    success,
+                } => {
                     check_keys(&keys).map_err(reject)?;
-                    cache.commit(&keys, success).map_err(reject)?;
+                    check_request(&request).map_err(reject)?;
+                    cache.commit(&keys, &request, success).map_err(reject)?;
                     json!({"ok": true})
                 }
                 Request::Touch { keys } => {
@@ -342,15 +352,42 @@ fn handle(
                     cache.touch(&keys);
                     json!({"ok": true})
                 }
-                Request::Reset => {
-                    cache.reset().map_err(reject)?;
+                Request::Reset { force } => {
+                    reclaim_expired(&mut cache, name, pending_timeout);
+                    cache.reset(force).map_err(reject)?;
                     json!({"ok": true})
                 }
-                Request::Stats => json!({"ok": true, "stats": cache.stats()}),
+                Request::Stats => {
+                    reclaim_expired(&mut cache, name, pending_timeout);
+                    json!({"ok": true, "stats": cache.stats()})
+                }
                 Request::Open { .. } | Request::Attach { .. } => unreachable!(),
             };
             Ok(Reply::Frame(protocol::encode_response(&response)?))
         }
+    }
+}
+
+fn released_reply(released: Released) -> Value {
+    json!({"ok": true, "released": released.leases, "unknown": released.unknown})
+}
+
+/// Frees pending reservations that outlived `--pending-timeout-secs` before a
+/// command that could otherwise see them, and logs each reclaimed request. A
+/// reservation nobody commits would otherwise keep its keys pending forever,
+/// which the connector reports as a hit that never becomes readable.
+fn reclaim_expired(cache: &mut Cache, namespace: &str, pending_timeout: Option<Duration>) {
+    let Some(timeout) = pending_timeout else {
+        return;
+    };
+    for reclaimed in cache.reclaim_expired(Instant::now(), timeout) {
+        log_event!(
+            "reservations_reclaimed",
+            "namespace" = namespace,
+            "request" = reclaimed.request,
+            "keys" = reclaimed.keys,
+            "age_secs" = reclaimed.age.as_secs(),
+        );
     }
 }
 
@@ -692,12 +729,15 @@ fn main() -> io::Result<()> {
         "pid" = std::process::id(),
         "max_connections" = limits.max_connections,
         "idle_timeout_secs" = args.idle_timeout_secs,
+        "pending_timeout_secs" = args.pending_timeout_secs,
     );
     let registry = Arc::new(Mutex::new(Registry {
         namespaces: HashMap::new(),
         retired: Vec::new(),
         budget: args.capacity_bytes,
         rswap_attach: args.rswap_attach,
+        pending_timeout: (args.pending_timeout_secs > 0)
+            .then(|| Duration::from_secs(args.pending_timeout_secs)),
     }));
     let result = accept_connections(&listener, &registry, &limits);
     let reason = if SHUTDOWN.load(Ordering::SeqCst) {
@@ -746,5 +786,6 @@ mod tests {
         .unwrap();
         assert_eq!(args.max_connections, 128);
         assert_eq!(args.idle_timeout_secs, 900);
+        assert_eq!(args.pending_timeout_secs, 60);
     }
 }

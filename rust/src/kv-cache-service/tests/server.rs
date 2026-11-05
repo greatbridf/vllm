@@ -263,7 +263,7 @@ fn worker_mutation_is_rejected_without_invalidating_the_namespace() {
     // SAFETY: the descriptor is owned by this test and no longer used.
     assert_eq!(unsafe { libc::close(descriptors[0]) }, 0);
 
-    let rejection = worker.call(json!({"op": "store", "keys": ["aabb"]}));
+    let rejection = worker.call(json!({"op": "store", "keys": ["aabb"], "request": "r"}));
     assert_eq!(rejection["ok"], false);
     assert!(rejection["error"].as_str().unwrap().contains("workers"));
 
@@ -337,6 +337,103 @@ fn attach_reply_carries_exactly_one_descriptor() {
 }
 
 #[test]
+fn store_from_one_request_cannot_be_published_by_another() {
+    let service = Service::start();
+    let mut client = service.connect();
+    assert_eq!(open(&mut client, "engine-owner")["ok"], true);
+
+    let stored = client.call(json!({"op": "store", "keys": ["aa"], "request": "a"}));
+    assert_eq!(stored["ok"], true);
+    assert_eq!(stored["keys"], json!(["aa"]));
+
+    let rejected = client.call(json!({
+        "op": "commit",
+        "keys": ["aa"],
+        "request": "b",
+        "success": true,
+    }));
+    assert_eq!(rejected["ok"], false);
+    assert!(rejected["error"].as_str().unwrap().contains("does not own the reservation"));
+    // The rejected commit left the reservation pending, not published.
+    let pending = client.call(json!({"op": "lookup", "key": "aa", "request": "a"}));
+    assert_eq!(pending["status"], "pending");
+
+    let committed = client.call(json!({
+        "op": "commit",
+        "keys": ["aa"],
+        "request": "a",
+        "success": true,
+    }));
+    assert_eq!(committed["ok"], true);
+    let hit = client.call(json!({"op": "lookup", "key": "aa", "request": "a"}));
+    assert_eq!(hit["status"], "hit");
+
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    assert_eq!(stats["commits"], 1);
+    assert_eq!(stats["failed_commits"], 1);
+    assert_eq!(stats["pending"], 0);
+}
+
+#[test]
+fn forced_reset_discards_leases_and_pending_reservations() {
+    let service = Service::start();
+    let mut client = service.connect();
+    assert_eq!(open(&mut client, "engine-reset")["ok"], true);
+
+    let both = json!(["aa", "bb"]);
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": both, "request": "a"}))["ok"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
+        true
+    );
+    let hit = client.call(json!({"op": "lookup", "key": "aa", "request": "a"}));
+    assert_eq!(hit["status"], "hit");
+
+    // The lookup lease and the `bb` reservation keep the ordinary reset out.
+    let refused = client.call(json!({"op": "reset"}));
+    assert_eq!(refused["ok"], false);
+    assert!(refused["error"].as_str().unwrap().contains("cannot reset"));
+
+    let forced = client.call(json!({"op": "reset", "force": true}));
+    assert_eq!(forced["ok"], true);
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    assert_eq!(stats["entries"], 0);
+    assert_eq!(stats["pending"], 0);
+    assert_eq!(stats["leased"], 0);
+    assert_eq!(stats["free_chunks"], 2);
+    let missed = client.call(json!({"op": "lookup", "key": "aa", "request": "a"}));
+    assert_eq!(missed["status"], "miss");
+}
+
+#[test]
+fn expired_reservations_are_reclaimed_instead_of_staying_pending() {
+    let service = Service::start_with(&["--pending-timeout-secs", "1"]);
+    let mut client = service.connect();
+    assert_eq!(open(&mut client, "engine-reclaim")["ok"], true);
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": ["aa"], "request": "a"}))["ok"],
+        true
+    );
+
+    // Every `stats` call also reclaims, so polling it is the observable event.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+        if stats["entries"] == 0 {
+            assert_eq!(stats["reclaimed"], 1);
+            break;
+        }
+        assert!(Instant::now() < deadline, "the reservation never expired");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let missed = client.call(json!({"op": "lookup", "key": "aa", "request": "a"}));
+    assert_eq!(missed["status"], "miss");
+}
+
+#[test]
 fn store_batch_that_cannot_be_answered_reserves_no_slot() {
     let service = Service::start();
     let mut client = service.connect();
@@ -355,7 +452,7 @@ fn store_batch_that_cannot_be_answered_reserves_no_slot() {
     // Longest keys that still fit one request frame: echoing them back, twice
     // with a slot per key, exceeds one control frame.
     let keys: Vec<_> = (0..4096).map(|index| format!("{index:0250x}")).collect();
-    let rejection = client.call(json!({"op": "store", "keys": keys}));
+    let rejection = client.call(json!({"op": "store", "keys": keys, "request": "r"}));
     assert_eq!(rejection["ok"], false);
     assert!(
         rejection["error"]

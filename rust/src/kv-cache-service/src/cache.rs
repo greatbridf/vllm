@@ -5,6 +5,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
+use std::time::{Duration, Instant};
 
 use memmap2::{MmapMut, MmapOptions};
 
@@ -23,6 +24,7 @@ struct Slot {
     next: u32,
     readers: Vec<u32>,
     ready: bool,
+    reservation: Option<Reservation>,
 }
 
 impl Slot {
@@ -33,8 +35,26 @@ impl Slot {
             next: NO_SLOT,
             readers: Vec::new(),
             ready: false,
+            reservation: None,
         }
     }
+}
+
+/// The request a pending slot is reserved for and when `store` made it, so only
+/// that request can publish it and a reservation nobody commits can be reclaimed.
+struct Reservation {
+    owner: u32,
+    since: Instant,
+}
+
+/// A batch of expired reservations the service dropped, one entry per owning
+/// request, for the namespace log line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reclaimed {
+    pub request: Box<str>,
+    pub keys: usize,
+    /// Age of the oldest reclaimed reservation of that request.
+    pub age: Duration,
 }
 
 pub struct Cache {
@@ -54,7 +74,88 @@ pub struct Cache {
     lru_head: u32,
     lru_tail: u32,
     leases: LeaseIndex,
+    owners: OwnerIndex,
+    counters: Counters,
     hashes: Option<Box<dyn PageHashes>>,
+}
+
+/// Monotonic per-namespace counters since `open`. `reset` leaves them alone, so a
+/// reservation or lease leak stays visible after the cache itself is emptied.
+#[derive(Default)]
+struct Counters {
+    hits: usize,
+    misses: usize,
+    pending_hits: usize,
+    evictions: usize,
+    stores: usize,
+    commits: usize,
+    aborted: usize,
+    failed_commits: usize,
+    reclaimed: usize,
+}
+
+/// Leases ended by `release` or `release_request`, and the keys or request id
+/// that held none. Unknown input stays non-fatal but is reported, so a client
+/// bug cannot pass as success.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Released {
+    pub leases: usize,
+    pub unknown: usize,
+}
+
+/// Interned names of the requests that own pending reservations, so a slot names
+/// its owner in four bytes. An id keeps its name until the last reservation it
+/// owns ends, so a recycled id never inherits another request's reservation.
+#[derive(Default)]
+struct OwnerIndex {
+    ids: HashMap<Box<str>, u32>,
+    names: Vec<Box<str>>,
+    /// Pending reservations per id, indexed by id.
+    pending: Vec<usize>,
+    /// Ids whose last reservation ended, free for reuse.
+    free: Vec<u32>,
+}
+
+impl OwnerIndex {
+    /// Returns the id of `name`, counting one reservation against it.
+    fn acquire(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.ids.get(name) {
+            self.pending[id as usize] += 1;
+            return id;
+        }
+        let id = match self.free.pop() {
+            Some(id) => {
+                self.names[id as usize] = Box::from(name);
+                id
+            }
+            None => {
+                self.names.push(Box::from(name));
+                self.pending.push(0);
+                u32::try_from(self.names.len() - 1).expect("interned owners fit in u32")
+            }
+        };
+        self.pending[id as usize] = 1;
+        self.ids.insert(Box::from(name), id);
+        id
+    }
+
+    /// Returns the id of `name` while it owns any pending reservation.
+    fn get(&self, name: &str) -> Option<u32> {
+        self.ids.get(name).copied()
+    }
+
+    fn name(&self, id: u32) -> &str {
+        &self.names[id as usize]
+    }
+
+    /// Drops one reservation reference, recycling the id with the last one.
+    fn release(&mut self, id: u32) {
+        self.pending[id as usize] -= 1;
+        if self.pending[id as usize] == 0 {
+            self.ids.remove(&*self.names[id as usize]);
+            self.free.push(id);
+        }
+    }
 }
 
 /// Leases held by in-flight requests, addressed by interned request ids so a
@@ -106,6 +207,12 @@ impl LeaseIndex {
         let id = self.ids.remove(name)?;
         self.released.push(id);
         Some((id, std::mem::take(&mut self.slots[id as usize])))
+    }
+
+    /// Number of requests that currently hold a lease. A request that released
+    /// every key keeps its interned id until `release_request`.
+    fn lease_holders(&self) -> usize {
+        self.slots.iter().filter(|slots| !slots.is_empty()).count()
     }
 }
 
@@ -259,6 +366,8 @@ impl Cache {
             lru_head: NO_SLOT,
             lru_tail: NO_SLOT,
             leases: LeaseIndex::default(),
+            owners: OwnerIndex::default(),
+            counters: Counters::default(),
             hashes,
         })
     }
@@ -272,11 +381,14 @@ impl Cache {
 
     pub fn lookup(&mut self, key: &str, request: &str) -> &'static str {
         let Some(&slot) = self.index.get(key) else {
+            self.counters.misses += 1;
             return "miss";
         };
         if !self.slots[slot as usize].ready {
+            self.counters.pending_hits += 1;
             return "pending";
         }
+        self.counters.hits += 1;
         // Lookup itself takes the read lease, closing the lookup/load race.
         let request = self.leases.intern(request);
         if !self.slots[slot as usize].readers.contains(&request) {
@@ -305,28 +417,43 @@ impl Cache {
             .collect()
     }
 
-    pub fn release(&mut self, keys: &[String], request: &str) {
+    pub fn release(&mut self, keys: &[String], request: &str) -> Released {
+        let mut released = Released::default();
         let Some(request) = self.leases.get(request) else {
-            return;
+            released.unknown = keys.len();
+            return released;
         };
         for key in keys {
             let Some(&slot) = self.index.get(key.as_str()) else {
+                released.unknown += 1;
                 continue;
             };
             let readers = &mut self.slots[slot as usize].readers;
-            if let Some(position) = readers.iter().position(|reader| *reader == request) {
-                readers.swap_remove(position);
-                self.leases.unlease(request, slot);
+            match readers.iter().position(|reader| *reader == request) {
+                Some(position) => {
+                    readers.swap_remove(position);
+                    self.leases.unlease(request, slot);
+                    released.leases += 1;
+                }
+                None => released.unknown += 1,
             }
         }
+        released
     }
 
-    pub fn release_request(&mut self, request: &str) {
+    pub fn release_request(&mut self, request: &str) -> Released {
         let Some((request, slots)) = self.leases.release(request) else {
-            return;
+            return Released {
+                leases: 0,
+                unknown: 1,
+            };
         };
-        for slot in slots {
-            self.slots[slot as usize].readers.retain(|reader| *reader != request);
+        for slot in &slots {
+            self.slots[*slot as usize].readers.retain(|reader| *reader != request);
+        }
+        Released {
+            leases: slots.len(),
+            unknown: 0,
         }
     }
 
@@ -338,7 +465,7 @@ impl Cache {
         }
     }
 
-    pub fn store(&mut self, keys: &[String]) -> Option<StorePlan> {
+    pub fn store(&mut self, keys: &[String], request: &str) -> Option<StorePlan> {
         let incoming: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let missing: Vec<&str> = keys
             .iter()
@@ -356,30 +483,39 @@ impl Cache {
             self.release_slot(slot);
             evicted.push(key);
         }
+        self.counters.evictions += evicted.len();
         let mut reserved = Vec::with_capacity(missing.len());
         let mut slots = Vec::with_capacity(missing.len());
+        let since = Instant::now();
         for key in missing {
             let slot = self.free.pop().expect("capacity checked");
+            let owner = self.owners.acquire(request);
             self.slots[slot as usize].key = Box::from(key);
             self.slots[slot as usize].ready = false;
+            self.slots[slot as usize].reservation = Some(Reservation { owner, since });
             self.push_front(slot);
             self.index.insert(Box::from(key), slot);
             reserved.push(key.to_owned());
             slots.push(slot as usize);
         }
+        self.counters.stores += slots.len();
         Some((reserved, slots, evicted))
     }
 
-    pub fn commit(&mut self, keys: &[String], success: bool) -> io::Result<()> {
-        let mut slots = Vec::with_capacity(keys.len());
-        for key in keys {
-            let slot = *self
-                .index
-                .get(key.as_str())
-                .filter(|slot| !self.slots[**slot as usize].ready)
-                .ok_or_else(|| invalid("commit requires pending reservations"))?;
-            slots.push(slot);
-        }
+    /// Publishes the reservations `keys` hold for `request`, or aborts them.
+    ///
+    /// A reservation belongs to the request that made it: a mismatched or failed
+    /// commit leaves every reservation pending instead of freeing or publishing
+    /// bytes this request never wrote.
+    pub fn commit(&mut self, keys: &[String], request: &str, success: bool) -> io::Result<()> {
+        let slots = match self.reserved_slots(keys, request) {
+            Ok(slots) => slots,
+            Err(error) => {
+                self.counters.failed_commits += 1;
+                return Err(error);
+            }
+        };
+        let committed = slots.len();
         if success {
             // Publish before any entry becomes ready: a failed publish leaves
             // every reservation pending and the caller fails closed.
@@ -389,13 +525,15 @@ impl Cache {
                         for &slot in &slots {
                             hashes.clear(slot as usize);
                         }
+                        self.counters.failed_commits += 1;
                         return Err(error);
                     }
                 }
             }
             for slot in slots {
-                self.slots[slot as usize].ready = true;
+                self.publish_slot(slot);
             }
+            self.counters.commits += committed;
         } else {
             for slot in slots {
                 if let Some(hashes) = &mut self.hashes {
@@ -403,15 +541,80 @@ impl Cache {
                 }
                 self.release_slot(slot);
             }
+            self.counters.aborted += committed;
         }
         Ok(())
     }
 
-    pub fn reset(&mut self) -> io::Result<()> {
-        if self.index.values().any(|slot| {
-            let entry = &self.slots[*slot as usize];
-            !entry.ready || !entry.readers.is_empty()
-        }) {
+    /// Slots `keys` are reserved for `request`, or the error that rejects the
+    /// batch. Every key is checked before any state changes.
+    fn reserved_slots(&self, keys: &[String], request: &str) -> io::Result<Vec<u32>> {
+        let owner = self.owners.get(request);
+        let mut slots = Vec::with_capacity(keys.len());
+        for key in keys {
+            let slot = *self
+                .index
+                .get(key.as_str())
+                .filter(|slot| !self.slots[**slot as usize].ready)
+                .ok_or_else(|| invalid("commit requires pending reservations"))?;
+            let reservation = self.slots[slot as usize]
+                .reservation
+                .as_ref()
+                .ok_or_else(|| invalid("commit does not own the reservation"))?;
+            if Some(reservation.owner) != owner {
+                return Err(invalid("commit does not own the reservation"));
+            }
+            slots.push(slot);
+        }
+        Ok(slots)
+    }
+
+    /// Frees pending reservations older than `timeout` as of `now`, clearing each
+    /// hash before its slot. Returns one record per owning request, for logging.
+    pub fn reclaim_expired(&mut self, now: Instant, timeout: Duration) -> Vec<Reclaimed> {
+        let mut expired = Vec::new();
+        for &slot in self.index.values() {
+            let Some(reservation) = &self.slots[slot as usize].reservation else {
+                continue;
+            };
+            let age = now.saturating_duration_since(reservation.since);
+            if age >= timeout {
+                expired.push((reservation.owner, slot, age));
+            }
+        }
+        let mut reclaimed: Vec<Reclaimed> = Vec::with_capacity(expired.len());
+        for (owner, slot, age) in expired {
+            let request = Box::from(self.owners.name(owner));
+            match reclaimed.iter_mut().find(|entry| entry.request == request) {
+                Some(entry) => {
+                    entry.keys += 1;
+                    entry.age = entry.age.max(age);
+                }
+                None => reclaimed.push(Reclaimed {
+                    request,
+                    keys: 1,
+                    age,
+                }),
+            }
+            if let Some(hashes) = &mut self.hashes {
+                hashes.clear(slot as usize);
+            }
+            self.release_slot(slot);
+        }
+        self.counters.reclaimed += reclaimed.iter().map(|entry| entry.keys).sum::<usize>();
+        reclaimed
+    }
+
+    /// Empties the cache. Without `force` any pending reservation or lease keeps
+    /// it until that transfer ends; with `force` every lease and reservation is
+    /// dropped, which a client may only do after its own transfers are flushed.
+    pub fn reset(&mut self, force: bool) -> io::Result<()> {
+        if !force
+            && self.index.values().any(|slot| {
+                let entry = &self.slots[*slot as usize];
+                !entry.ready || !entry.readers.is_empty()
+            })
+        {
             return Err(invalid(
                 "cannot reset a cache with active transfers or leases",
             ));
@@ -421,6 +624,7 @@ impl Cache {
         }
         self.index.clear();
         self.leases = LeaseIndex::default();
+        self.owners = OwnerIndex::default();
         self.lru_head = NO_SLOT;
         self.lru_tail = NO_SLOT;
         for entry in &mut self.slots {
@@ -442,7 +646,19 @@ impl Cache {
             ("entries", self.index.len()),
             ("pending", pending),
             ("leased", leased),
+            ("free_chunks", self.free.len()),
+            ("hits", self.counters.hits),
+            ("misses", self.counters.misses),
+            ("pending_hits", self.counters.pending_hits),
+            ("evictions", self.counters.evictions),
+            ("stores", self.counters.stores),
+            ("commits", self.counters.commits),
+            ("aborted", self.counters.aborted),
+            ("failed_commits", self.counters.failed_commits),
+            ("reclaimed", self.counters.reclaimed),
+            ("requests", self.leases.lease_holders()),
             ("bytes", self.mapping.len()),
+            ("num_chunks", self.num_chunks),
         ])
     }
 
@@ -491,12 +707,24 @@ impl Cache {
         self.unlink(slot);
         let key = std::mem::take(&mut self.slots[slot as usize].key);
         self.slots[slot as usize].ready = false;
+        if let Some(reservation) = self.slots[slot as usize].reservation.take() {
+            self.owners.release(reservation.owner);
+        }
         debug_assert!(
             self.slots[slot as usize].readers.is_empty(),
             "a leased slot cannot be released"
         );
         self.index.remove(key.as_ref());
         self.free.push(slot);
+    }
+
+    /// Turns a pending reservation into a published entry and ends its owner's
+    /// reference to the reservation.
+    fn publish_slot(&mut self, slot: u32) {
+        self.slots[slot as usize].ready = true;
+        if let Some(reservation) = self.slots[slot as usize].reservation.take() {
+            self.owners.release(reservation.owner);
+        }
     }
 
     /// Collects `needed` eviction victims from the least recently used end,
@@ -537,6 +765,14 @@ impl Cache {
             assert_eq!(
                 &*self.slots[*slot as usize].key, &**key,
                 "index and slot key differ"
+            );
+        }
+        for &slot in self.index.values() {
+            let entry = &self.slots[slot as usize];
+            assert_eq!(
+                entry.ready,
+                entry.reservation.is_none(),
+                "a pending slot has no owner or a published slot still has one"
             );
         }
         let mut listed = 0;
@@ -656,37 +892,37 @@ mod tests {
     fn lookup_lease_prevents_eviction_before_load() {
         let mut cache = cache();
         let first = keys(&["aa", "bb"]);
-        cache.store(&first).unwrap();
+        cache.store(&first, "r").unwrap();
         assert_eq!(cache.lookup("aa", "r"), "pending");
-        cache.commit(&first, true).unwrap();
+        cache.commit(&first, "r", true).unwrap();
         assert_eq!(cache.lookup("aa", "r"), "hit");
-        let (_, _, evicted) = cache.store(&keys(&["cc"])).unwrap();
+        let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
         assert_eq!(evicted, keys(&["bb"]));
         assert_eq!(cache.load(&keys(&["aa"]), "r").unwrap(), vec![0]);
-        assert!(cache.store(&keys(&["dd"])).is_none());
+        assert!(cache.store(&keys(&["dd"]), "r").is_none());
         cache.release_request("r");
-        assert!(cache.store(&keys(&["dd"])).is_some());
+        assert!(cache.store(&keys(&["dd"]), "r").is_some());
     }
 
     #[test]
     fn failed_store_is_never_published() {
         let mut cache = cache();
         let first = keys(&["aa"]);
-        cache.store(&first).unwrap();
-        cache.commit(&first, false).unwrap();
+        cache.store(&first, "r").unwrap();
+        cache.commit(&first, "r", false).unwrap();
         assert_eq!(cache.lookup("aa", "r"), "miss");
-        assert!(cache.commit(&first, true).is_err());
+        assert!(cache.commit(&first, "r", true).is_err());
     }
 
     #[test]
     fn reservation_is_atomic_and_cannot_evict_itself() {
         let mut cache = cache();
         let first = keys(&["aa", "bb"]);
-        cache.store(&first).unwrap();
-        cache.commit(&first, true).unwrap();
-        assert!(cache.store(&keys(&["aa", "bb", "cc"])).is_none());
+        cache.store(&first, "r").unwrap();
+        cache.commit(&first, "r", true).unwrap();
+        assert!(cache.store(&keys(&["aa", "bb", "cc"]), "r").is_none());
         assert_eq!(cache.lookup("aa", "r"), "hit");
-        assert!(cache.reset().is_err());
+        assert!(cache.reset(false).is_err());
     }
 
     #[test]
@@ -720,11 +956,11 @@ mod tests {
     fn store_does_not_publish_and_commit_publishes_once() {
         let (mut cache, ops) = recording_cache(false);
         let first = keys(&["aa"]);
-        cache.store(&first).unwrap();
+        cache.store(&first, "r").unwrap();
         assert!(recorded(&ops).is_empty());
         let slot = slot(&cache, "aa");
         assert!(!ready(&cache, "aa"));
-        cache.commit(&first, true).unwrap();
+        cache.commit(&first, "r", true).unwrap();
         assert_eq!(recorded(&ops), vec![Op::Publish(slot, "aa".into())]);
         assert!(ready(&cache, "aa"));
     }
@@ -733,9 +969,9 @@ mod tests {
     fn failed_publish_keeps_entry_pending_and_returns_error() {
         let (mut cache, ops) = recording_cache(true);
         let first = keys(&["aa"]);
-        cache.store(&first).unwrap();
+        cache.store(&first, "r").unwrap();
         let slot = slot(&cache, "aa");
-        let error = cache.commit(&first, true).unwrap_err();
+        let error = cache.commit(&first, "r", true).unwrap_err();
         assert!(error.to_string().contains("publish failed"));
         assert_eq!(
             recorded(&ops),
@@ -749,9 +985,9 @@ mod tests {
     fn failed_publish_clears_every_slot_in_the_batch() {
         let (mut cache, ops) = recording_cache(true);
         let first = keys(&["aa", "bb"]);
-        cache.store(&first).unwrap();
+        cache.store(&first, "r").unwrap();
         let slots: Vec<_> = first.iter().map(|key| slot(&cache, key)).collect();
-        assert!(cache.commit(&first, true).is_err());
+        assert!(cache.commit(&first, "r", true).is_err());
         assert_eq!(
             recorded(&ops),
             vec![
@@ -767,16 +1003,16 @@ mod tests {
     fn failed_commit_and_eviction_clear_before_releasing_slots() {
         let (mut cache, ops) = recording_cache(false);
         let first = keys(&["aa"]);
-        cache.store(&first).unwrap();
-        cache.commit(&first, false).unwrap();
+        cache.store(&first, "r").unwrap();
+        cache.commit(&first, "r", false).unwrap();
         assert_eq!(recorded(&ops), vec![Op::Clear(0)]);
 
         let both = keys(&["aa", "bb"]);
-        cache.store(&both).unwrap();
-        cache.commit(&both, true).unwrap();
+        cache.store(&both, "r").unwrap();
+        cache.commit(&both, "r", true).unwrap();
         let victim_slot = slot(&cache, "aa");
         ops.lock().unwrap().clear();
-        let (_, _, evicted) = cache.store(&keys(&["cc"])).unwrap();
+        let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
         assert_eq!(evicted, keys(&["aa"]));
         assert_eq!(recorded(&ops), vec![Op::Clear(victim_slot)]);
     }
@@ -785,10 +1021,10 @@ mod tests {
     fn reset_and_invalidate_hashes_call_reset() {
         let (mut cache, ops) = recording_cache(false);
         let first = keys(&["aa"]);
-        cache.store(&first).unwrap();
-        cache.commit(&first, true).unwrap();
+        cache.store(&first, "r").unwrap();
+        cache.commit(&first, "r", true).unwrap();
         ops.lock().unwrap().clear();
-        cache.reset().unwrap();
+        cache.reset(false).unwrap();
         cache.invalidate_hashes();
         assert_eq!(recorded(&ops), vec![Op::Reset, Op::Reset]);
     }
@@ -797,8 +1033,8 @@ mod tests {
     fn touch_lookup_and_load_do_not_publish_hashes() {
         let (mut cache, ops) = recording_cache(false);
         let first = keys(&["aa"]);
-        cache.store(&first).unwrap();
-        cache.commit(&first, true).unwrap();
+        cache.store(&first, "r").unwrap();
+        cache.commit(&first, "r", true).unwrap();
         let before = recorded(&ops);
         let slot = slot(&cache, "aa");
         assert_eq!(cache.lookup("aa", "r"), "hit");
@@ -811,14 +1047,14 @@ mod tests {
     fn eviction_follows_recency_and_lookup_promotes() {
         let mut cache = cache_with(3);
         let stored = keys(&["aa", "bb", "cc"]);
-        cache.store(&stored).unwrap();
-        cache.commit(&stored, true).unwrap();
+        cache.store(&stored, "r").unwrap();
+        cache.commit(&stored, "r", true).unwrap();
         assert_eq!(cache.lookup("aa", "r"), "hit");
         // `bb` is the least recently used key, not the oldest inserted one.
-        assert_eq!(cache.store(&keys(&["dd"])).unwrap().2, keys(&["bb"]));
+        assert_eq!(cache.store(&keys(&["dd"]), "r").unwrap().2, keys(&["bb"]));
         cache.release_request("r");
         cache.touch(&keys(&["cc"]));
-        assert_eq!(cache.store(&keys(&["ee"])).unwrap().2, keys(&["aa"]));
+        assert_eq!(cache.store(&keys(&["ee"]), "r").unwrap().2, keys(&["aa"]));
         cache.assert_slot_accounting();
     }
 
@@ -826,8 +1062,8 @@ mod tests {
     fn release_request_uses_the_lease_index() {
         let mut cache = cache_with(3);
         let stored = keys(&["aa", "bb", "cc"]);
-        cache.store(&stored).unwrap();
-        cache.commit(&stored, true).unwrap();
+        cache.store(&stored, "r1").unwrap();
+        cache.commit(&stored, "r1", true).unwrap();
         assert_eq!(cache.lookup("aa", "r1"), "hit");
         assert_eq!(cache.lookup("bb", "r1"), "hit");
         assert_eq!(cache.lookup("cc", "r2"), "hit");
@@ -839,16 +1075,16 @@ mod tests {
         );
         // Both keys only `r1` leased are evictable again; `r2` still pins `cc`.
         let stored = |cache: &mut Cache, key: &str| {
-            cache.store(&keys(&[key])).unwrap();
-            cache.commit(&keys(&[key]), true).unwrap();
+            cache.store(&keys(&[key]), "r1").unwrap();
+            cache.commit(&keys(&[key]), "r1", true).unwrap();
         };
         stored(&mut cache, "dd");
-        assert_eq!(cache.store(&keys(&["ee"])).unwrap().2, keys(&["bb"]));
-        cache.commit(&keys(&["ee"]), true).unwrap();
-        assert_eq!(cache.store(&keys(&["ff"])).unwrap().2, keys(&["dd"]));
-        cache.commit(&keys(&["ff"]), true).unwrap();
+        assert_eq!(cache.store(&keys(&["ee"]), "r1").unwrap().2, keys(&["bb"]));
+        cache.commit(&keys(&["ee"]), "r1", true).unwrap();
+        assert_eq!(cache.store(&keys(&["ff"]), "r1").unwrap().2, keys(&["dd"]));
+        cache.commit(&keys(&["ff"]), "r1", true).unwrap();
         cache.release_request("r2");
-        assert_eq!(cache.store(&keys(&["gg"])).unwrap().2, keys(&["cc"]));
+        assert_eq!(cache.store(&keys(&["gg"]), "r1").unwrap().2, keys(&["cc"]));
         cache.assert_slot_accounting();
     }
 
@@ -856,9 +1092,9 @@ mod tests {
     fn store_of_mixed_present_and_missing_keys_reserves_only_missing() {
         let mut cache = cache_with(3);
         let stored = keys(&["aa", "bb", "cc"]);
-        cache.store(&stored).unwrap();
-        cache.commit(&stored, true).unwrap();
-        let (reserved, slots, evicted) = cache.store(&keys(&["aa", "dd"])).unwrap();
+        cache.store(&stored, "r").unwrap();
+        cache.commit(&stored, "r", true).unwrap();
+        let (reserved, slots, evicted) = cache.store(&keys(&["aa", "dd"]), "r").unwrap();
         assert_eq!(reserved, keys(&["dd"]));
         assert_eq!(slots.len(), 1);
         // `aa` is in the batch, so the next oldest key is the victim.
@@ -872,13 +1108,13 @@ mod tests {
     fn pending_entries_are_not_evictable_and_can_exhaust_capacity() {
         let mut cache = cache_with(2);
         let first = keys(&["aa", "bb"]);
-        cache.store(&first).unwrap();
+        cache.store(&first, "r").unwrap();
         assert_eq!(cache.stats()["pending"], 2);
-        assert!(cache.store(&keys(&["cc"])).is_none());
-        cache.commit(&first, false).unwrap();
+        assert!(cache.store(&keys(&["cc"]), "r").is_none());
+        cache.commit(&first, "r", false).unwrap();
         assert_eq!(cache.stats()["entries"], 0);
         cache.assert_slot_accounting();
-        assert!(cache.store(&keys(&["cc"])).is_some());
+        assert!(cache.store(&keys(&["cc"]), "r").is_some());
     }
 
     #[test]
@@ -920,6 +1156,7 @@ mod tests {
         let all: Vec<String> = (0..12u8).map(|index| format!("{index:02x}")).collect();
         let requests = ["r0", "r1"];
         let mut reserved: Vec<String> = Vec::new();
+        let mut owner = String::new();
         for _ in 0..512 {
             let request = requests[random.below(requests.len())];
             let start = random.below(all.len());
@@ -930,44 +1167,65 @@ mod tests {
                     batch.push(key);
                 }
             }
-            match random.below(9) {
+            match random.below(10) {
                 0 => {
-                    if let Some((keys, slots, evicted)) = cache.store(&batch) {
+                    if let Some((keys, slots, evicted)) = cache.store(&batch, request) {
                         assert_eq!(keys.len(), slots.len());
                         assert!(slots.iter().all(|slot| *slot < cache.num_chunks));
                         assert!(evicted.iter().all(|key| !keys.contains(key)));
                         reserved = keys;
+                        owner = request.to_owned();
                         // Commit most reservations at once so the mix spends more
                         // of its time on published chunks than on pending ones.
                         if random.below(4) != 0 {
-                            assert!(cache.commit(&reserved, random.below(4) != 0).is_ok());
+                            assert!(cache.commit(&reserved, &owner, random.below(4) != 0).is_ok());
                             reserved.clear();
                         }
                     }
                 }
                 1 => {
-                    if cache.commit(&reserved, true).is_ok() {
+                    if cache.commit(&reserved, &owner, true).is_ok() {
                         reserved.clear();
                     }
                 }
                 2 => {
-                    if cache.commit(&reserved, false).is_ok() {
+                    if cache.commit(&reserved, &owner, false).is_ok() {
                         reserved.clear();
                     }
                 }
                 3 => {
+                    // A request that did not reserve these keys cannot commit them.
+                    if request != owner && !reserved.is_empty() {
+                        assert!(cache.commit(&reserved, request, true).is_err());
+                    }
+                }
+                4 => {
                     let status = cache.lookup(&batch[0], request);
                     assert!(matches!(status, "hit" | "miss" | "pending"));
                 }
-                4 => {
+                5 => {
                     if let Ok(slots) = cache.load(&batch, request) {
                         assert!(slots.iter().all(|slot| *slot < cache.num_chunks));
                     }
                 }
-                5 => cache.release(&batch, request),
-                6 => cache.release_request(request),
+                6 => {
+                    cache.release(&batch, request);
+                }
                 7 => {
-                    let _ = cache.reset();
+                    cache.release_request(request);
+                }
+                8 => {
+                    if random.below(4) == 0 {
+                        // Reclaim every reservation, as an idle namespace's timeout would.
+                        cache.reclaim_expired(
+                            Instant::now() + Duration::from_secs(3600),
+                            Duration::from_secs(60),
+                        );
+                        reserved.clear();
+                    } else {
+                        let _ = cache.reset(random.below(2) == 0);
+                        reserved.clear();
+                    }
                 }
                 _ => cache.touch(&batch),
             }
@@ -976,6 +1234,169 @@ mod tests {
             assert!(stats["pending"] <= stats["entries"]);
             assert!(stats["leased"] <= stats["entries"]);
             assert!(stats["entries"] <= cache.num_chunks);
+            assert_eq!(stats["free_chunks"] + stats["entries"], cache.num_chunks);
         }
+    }
+
+    #[test]
+    fn commit_by_another_request_leaves_the_reservation_pending() {
+        let mut cache = cache();
+        let first = keys(&["aa"]);
+        cache.store(&first, "a").unwrap();
+        let error = cache.commit(&first, "b", true).unwrap_err();
+        assert_eq!(error.to_string(), "commit does not own the reservation");
+        assert!(!ready(&cache, "aa"));
+        assert_eq!(cache.lookup("aa", "b"), "pending");
+        assert_eq!(cache.stats()["failed_commits"], 1);
+        assert_eq!(cache.stats()["pending"], 1);
+        cache.commit(&first, "a", true).unwrap();
+        assert_eq!(cache.lookup("aa", "a"), "hit");
+        assert_eq!(cache.stats()["commits"], 1);
+        cache.assert_slot_accounting();
+    }
+
+    #[test]
+    fn owner_keeps_its_name_while_any_reservation_it_made_is_pending() {
+        let mut cache = cache();
+        let both = keys(&["aa", "bb"]);
+        cache.store(&both, "a").unwrap();
+        cache.commit(&keys(&["aa"]), "a", false).unwrap();
+        // `a` still owns the `bb` reservation, so another request cannot take it.
+        assert!(cache.commit(&keys(&["bb"]), "b", true).is_err());
+        cache.commit(&keys(&["bb"]), "a", true).unwrap();
+        assert!(ready(&cache, "bb"));
+        cache.assert_slot_accounting();
+    }
+
+    #[test]
+    fn reclaim_expired_frees_only_expired_reservations_and_clears_hashes() {
+        let (mut cache, ops) = recording_cache(false);
+        let both = keys(&["aa", "bb"]);
+        cache.store(&both, "a").unwrap();
+        let expired_slot = slot(&cache, "aa");
+        // Age one reservation past the timeout without sleeping.
+        cache.slots[expired_slot].reservation.as_mut().unwrap().since = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("the monotonic clock is older than the timeout");
+        let reclaimed = cache.reclaim_expired(Instant::now(), Duration::from_secs(60));
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(&*reclaimed[0].request, "a");
+        assert_eq!(reclaimed[0].keys, 1);
+        assert!(reclaimed[0].age >= Duration::from_secs(60));
+        assert_eq!(recorded(&ops), vec![Op::Clear(expired_slot)]);
+        assert_eq!(cache.lookup("aa", "a"), "miss");
+        assert_eq!(cache.lookup("bb", "a"), "pending");
+        assert_eq!(cache.stats()["reclaimed"], 1);
+        assert_eq!(cache.stats()["pending"], 1);
+        assert_eq!(cache.stats()["free_chunks"], 1);
+        cache.assert_slot_accounting();
+        // The surviving reservation is still its owner's to publish.
+        cache.commit(&keys(&["bb"]), "a", true).unwrap();
+        assert!(ready(&cache, "bb"));
+    }
+
+    #[test]
+    fn forced_reset_discards_leases_and_pending_reservations() {
+        let mut cache = cache_with(3);
+        let stored = keys(&["aa", "bb"]);
+        cache.store(&stored, "r").unwrap();
+        cache.store(&keys(&["cc"]), "r").unwrap();
+        cache.commit(&keys(&["aa"]), "r", true).unwrap();
+        assert_eq!(cache.lookup("aa", "r"), "hit");
+        // A lease and a pending reservation both keep the ordinary reset out.
+        assert!(cache.reset(false).is_err());
+        cache.reset(true).unwrap();
+        assert_eq!(cache.stats()["entries"], 0);
+        assert_eq!(cache.stats()["pending"], 0);
+        assert_eq!(cache.stats()["leased"], 0);
+        assert_eq!(cache.stats()["free_chunks"], 3);
+        assert_eq!(cache.stats()["requests"], 0);
+        assert_eq!(cache.lookup("aa", "r"), "miss");
+        assert!(cache.load(&keys(&["aa"]), "r").is_err());
+        cache.assert_slot_accounting();
+        assert!(cache.store(&stored, "r").is_some());
+    }
+
+    #[test]
+    fn stats_counters_track_store_commit_abort_and_eviction() {
+        let mut cache = cache_with(2);
+        let first = keys(&["aa"]);
+        cache.store(&first, "r").unwrap();
+        cache.commit(&first, "r", true).unwrap();
+        // Committing a published key changes nothing and is counted as a failure.
+        assert!(cache.commit(&first, "r", true).is_err());
+        let second = keys(&["bb"]);
+        cache.store(&second, "r").unwrap();
+        assert_eq!(cache.lookup("bb", "r"), "pending");
+        cache.commit(&second, "r", false).unwrap();
+        let mut stats = cache.stats();
+        assert_eq!(stats["stores"], 2);
+        assert_eq!(stats["commits"], 1);
+        assert_eq!(stats["aborted"], 1);
+        assert_eq!(stats["failed_commits"], 1);
+        assert_eq!(stats["pending_hits"], 1);
+        assert_eq!(stats["evictions"], 0);
+        assert_eq!(stats["hits"], 0);
+        assert_eq!(stats["misses"], 0);
+        assert_eq!(stats["requests"], 0);
+        assert_eq!(stats["entries"], 1);
+
+        // The aborted reservation left a free slot; filling it makes the next
+        // store evict the least recently used key.
+        cache.store(&second, "r").unwrap();
+        cache.commit(&second, "r", true).unwrap();
+        let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
+        assert_eq!(evicted, keys(&["aa"]));
+        cache.commit(&keys(&["cc"]), "r", true).unwrap();
+        assert_eq!(cache.lookup("cc", "r"), "hit");
+        assert_eq!(cache.lookup("dd", "r"), "miss");
+        stats = cache.stats();
+        assert_eq!(stats["stores"], 4);
+        assert_eq!(stats["commits"], 3);
+        assert_eq!(stats["aborted"], 1);
+        assert_eq!(stats["failed_commits"], 1);
+        assert_eq!(stats["evictions"], 1);
+        assert_eq!(stats["hits"], 1);
+        assert_eq!(stats["misses"], 1);
+        assert_eq!(stats["requests"], 1);
+        assert_eq!(stats["entries"], 2);
+        assert_eq!(stats["free_chunks"], 0);
+        assert_eq!(stats["num_chunks"], 2);
+        assert_eq!(stats["bytes"], cache.mapping.len());
+        // Counters describe the namespace, not one epoch, so `reset` keeps them.
+        cache.reset(true).unwrap();
+        assert_eq!(cache.stats()["hits"], 1);
+    }
+
+    #[test]
+    fn release_reports_keys_and_requests_without_a_lease() {
+        let mut cache = cache_with(2);
+        let stored = keys(&["aa", "bb"]);
+        cache.store(&stored, "r").unwrap();
+        cache.commit(&stored, "r", true).unwrap();
+        assert_eq!(cache.lookup("aa", "r"), "hit");
+        assert_eq!(
+            cache.release(&keys(&["aa", "bb", "cc"]), "r"),
+            Released {
+                leases: 1,
+                unknown: 2,
+            }
+        );
+        assert_eq!(
+            cache.release_request("unknown"),
+            Released {
+                leases: 0,
+                unknown: 1,
+            }
+        );
+        assert_eq!(cache.lookup("bb", "r"), "hit");
+        assert_eq!(
+            cache.release_request("r"),
+            Released {
+                leases: 1,
+                unknown: 0,
+            }
+        );
+        assert_eq!(cache.stats()["requests"], 0);
     }
 }

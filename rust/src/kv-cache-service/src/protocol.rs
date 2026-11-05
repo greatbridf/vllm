@@ -50,15 +50,21 @@ pub enum Request {
     },
     Store {
         keys: Vec<String>,
+        request: String,
     },
     Commit {
         keys: Vec<String>,
+        request: String,
         success: bool,
     },
     Touch {
         keys: Vec<String>,
     },
-    Reset,
+    Reset {
+        /// Drop leases and pending reservations instead of refusing the reset.
+        #[serde(default)]
+        force: bool,
+    },
     Stats,
 }
 
@@ -75,7 +81,7 @@ impl Request {
             Request::Store { .. } => "store",
             Request::Commit { .. } => "commit",
             Request::Touch { .. } => "touch",
-            Request::Reset => "reset",
+            Request::Reset { .. } => "reset",
             Request::Stats => "stats",
         }
     }

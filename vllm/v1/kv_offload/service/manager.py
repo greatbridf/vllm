@@ -5,6 +5,7 @@
 from collections import defaultdict
 from collections.abc import Collection
 
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LookupResult,
     OffloadingManager,
@@ -15,6 +16,8 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.service.client import MAX_KEYS, CacheServiceClient
+
+logger = init_logger(__name__)
 
 
 class ServiceOffloadingManager(OffloadingManager):
@@ -62,7 +65,9 @@ class ServiceOffloadingManager(OffloadingManager):
     def prepare_store(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> PrepareStoreOutput | None:
-        response = self.client.call("store", keys=self._keys(keys))
+        response = self.client.call(
+            "store", keys=self._keys(keys), request=req_context.req_id
+        )
         if response.get("full"):
             return None
         new_keys = [OffloadKey(bytes.fromhex(key)) for key in response["keys"]]
@@ -80,7 +85,12 @@ class ServiceOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         success: bool = True,
     ) -> None:
-        self.client.call("commit", keys=self._keys(keys), success=success)
+        self.client.call(
+            "commit",
+            keys=self._keys(keys),
+            request=req_context.req_id,
+            success=success,
+        )
         self._stores[req_context.req_id] -= 1
         self._maybe_release(req_context.req_id)
 
@@ -98,13 +108,27 @@ class ServiceOffloadingManager(OffloadingManager):
             and self._loads[request] == 0
             and self._stores[request] == 0
         ):
-            self.client.call("release_request", request=request)
+            released = self.client.call("release_request", request=request)
+            if released["unknown"]:
+                logger.warning_once(
+                    "KV cache service knows no leases for a request reported as "
+                    "finished; the service and this process disagree on lease "
+                    "accounting (see release_request)."
+                )
             self._finished.remove(request)
             self._loads.pop(request, None)
             self._stores.pop(request, None)
 
     def reset_cache(self) -> None:
-        self.client.call("reset")
+        self._reset(force=False)
+
+    def _reset(self, force: bool) -> None:
+        """Empties the cache.
+
+        `force` also drops leases and pending reservations, so a caller may pass
+        it only once it has flushed every job that still holds one.
+        """
+        self.client.call("reset", force=force)
 
     def shutdown(self) -> None:
         self.client.close()

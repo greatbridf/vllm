@@ -58,6 +58,36 @@ Lookup acquires a request lease before reporting a hit, so a later allocation
 cannot evict the load source. Request leases are released after finish and all
 pending transfers. Active leases and pending stores cannot be reset or evicted.
 
+A reservation belongs to the request that made it: `store` records the owner, and
+`commit` rejects a batch reserved by another request with
+`commit does not own the reservation` and leaves those reservations pending. A
+reservation nobody commits would stay pending for the life of the namespace, and
+the connector reports a pending key as a hit that is not readable yet, so
+`store`, `stats`, and `reset` first reclaim pending reservations older than
+`--pending-timeout-secs` (default 60; 0 disables). Each reclaimed request is
+logged as `reservations_reclaimed` with the namespace, key count, and age. A
+`commit` that arrives after its reservation was reclaimed is rejected like any
+other commit without a pending reservation, so keep the timeout above the slowest
+store a worker performs.
+
+`release` and `release_request` still succeed on unknown input, but report what
+they ended: `{"ok": true, "released": N, "unknown": M}` counts the leases
+dropped and the keys or request ids that held none.
+
+`stats` reports the namespace state (`entries`, `pending`, `leased`,
+`free_chunks`, `bytes`, `num_chunks`, `requests` for requests currently holding
+a lease) plus counters that are monotonic since the namespace opened and survive
+`reset`: `hits`, `misses`, `pending_hits`, `evictions`, `stores`, `commits`,
+`aborted`, `reclaimed` in keys, and the rejected or failed `commit` calls in
+`failed_commits`. A leaked lease or reservation shows up there instead of only as
+a stalled cache.
+
+A `reset` refuses a cache with a pending reservation or a lease. `reset` with
+`"force": true` instead drops every lease and reservation, clears the slots, and
+empties the cache; a caller may only send one after flushing every transfer whose
+slot it abandons. The connector sends a plain `reset` today; a forced one needs
+the two-phase flush that is not implemented yet.
+
 Eviction takes the least recently used key: a `lookup` hit and a `touch` both
 promote a key, so a shared prefix that is read again outlives keys that nothing
 has looked up since they were stored. A `store` batch never evicts a key it
@@ -70,6 +100,8 @@ unknown handshake field all leave the caller free to retry or give up without
 losing the cache. Only frame-level failures (bad length, non-JSON, unknown op)
 and I/O errors close a connection. Attached workers may read `stats`; every
 other command mutates scheduler-owned metadata and is rejected for them.
+`store` and `commit` both carry the request that owns the reservation, so a
+request id must be the same one across the whole lifetime of that request.
 No reply is written while the namespace registry is locked, so a client that
 stops reading blocks only its own connection, for at most the 5 s write timeout.
 
@@ -99,8 +131,8 @@ client side, so keep the timeout above the engine's longest idle period or
 disable it with 0. One connection is one thread and one descriptor, so both
 limits bound the process. Transient accept failures (`EMFILE`, `ENFILE`,
 `ENOMEM`) are logged and retried after a short backoff rather than ending the
-service.
-
+service. `--pending-timeout-secs` (default 60; 0 disables) bounds how long a
+reservation may stay pending; see Ownership.
 Every event writes one line to stderr, starting with `kv-cache-service: start`
 (socket, capacity, pid, and both limits) and ending with `shutdown`: namespace
 open and attach, retirement with the sessions left, the reclaimed socket, and

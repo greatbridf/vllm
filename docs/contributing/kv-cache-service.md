@@ -8,6 +8,14 @@ Read this before changing the Rust CPU cache service or its native offloading sp
   boundary. The service owns allocation; workers retain GPU DMA execution.
 - Lookup hits hold a lease before returning. Keep leases through all dependent
   loads; publish stores only after every participating worker reports completion.
+- A reservation belongs to the request that made it: reject a `commit` from any
+  other request and keep the reservation pending. Bound how long a reservation may
+  stay pending, because the connector reports a pending key as a hit that is not
+  readable yet and retries it instead of missing. Keep the counters that show a
+  leaked reservation or lease in `stats`.
+- A forced reset is the only way out of leases and pending reservations, so it
+  must belong to a caller that flushed its own transfers first. Never recycle a
+  dropped slot while a worker could still write to it.
 - A lost worker may still have DMA in flight. Invalidate its namespace rather
   than reclaiming slots into the same mapping. Do not reconnect old workers to a
   newly created namespace.

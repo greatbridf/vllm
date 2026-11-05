@@ -112,6 +112,17 @@ CPU/GPU validation commands, and hash reporting details. The service stops on
 killed service and refuses a path another process still serves, so a supervisor
 can restart it without manual cleanup.
 
+A `store` reservation belongs to the request that made it, so only that request's
+`commit` publishes it. A reservation that is still pending after
+`--pending-timeout-secs` (default 60; 0 disables it) is reclaimed and logged, so a
+request that dies between `store` and `complete_store` cannot leave a key that the
+scheduler keeps retrying as a hit that never becomes readable. A `reset`, which is
+what `/reset_prefix_cache` reaches, is refused while any reservation or lookup
+lease is still outstanding. The service's `stats` op reports the namespace
+counters (`hits`, `misses`, `pending_hits`, `evictions`, `stores`, `commits`,
+`aborted`, `failed_commits`, `reclaimed`, and the requests holding leases) that
+make such a leak visible.
+
 Hash reporting is optional and off by default. Pass `--rswap-attach` (or
 `--hash-attach`), optionally with a sysfs path that defaults to
 `/sys/kernel/mm/xswap/rswap_attach`, to the service. It requires an

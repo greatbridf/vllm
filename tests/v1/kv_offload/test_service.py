@@ -123,6 +123,46 @@ def test_rust_service_shares_rank_slices_and_publishes_only_completed_stores(ser
         manager.shutdown()
 
 
+def test_store_commit_round_trip_publishes_the_leased_slot(service):
+    manager = _spec(service).get_manager()
+    request = ReqContext("first")
+    try:
+        key = OffloadKey(b"round-trip")
+        output = manager.prepare_store([key], request)
+        assert output is not None
+        assert manager.lookup(key, request) is LookupResult.HIT_PENDING
+        manager.complete_store([key], request)
+        assert manager.lookup(key, request) is LookupResult.HIT
+        load = manager.prepare_load([key], request)
+        assert load.block_ids == output.store_spec.block_ids
+        stats = manager.client.call("stats")["stats"]
+        assert stats["commits"] == 1
+        assert stats["failed_commits"] == 0
+        assert stats["pending"] == 0
+        assert stats["pending_hits"] == 1
+        assert stats["leased"] == 1
+        manager.on_request_finished(request)
+        manager.complete_load([key], request)
+    finally:
+        manager.shutdown()
+
+
+def test_commit_from_a_request_that_did_not_reserve_is_rejected(service):
+    manager = _spec(service).get_manager()
+    request = ReqContext("first")
+    try:
+        key = OffloadKey(b"foreign-commit")
+        assert manager.prepare_store([key], request) is not None
+        # A rejected call also closes the client, so this is the last call this
+        # manager makes.
+        with pytest.raises(RuntimeError, match="does not own the reservation"):
+            manager.client.call(
+                "commit", keys=[key.hex()], request="another", success=True
+            )
+    finally:
+        manager.shutdown()
+
+
 def test_lookup_lease_prevents_eviction_and_failed_store_is_removed(service):
     manager = _spec(service).get_manager()
     request = ReqContext("first")
