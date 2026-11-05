@@ -58,6 +58,11 @@ Lookup acquires a request lease before reporting a hit, so a later allocation
 cannot evict the load source. Request leases are released after finish and all
 pending transfers. Active leases and pending stores cannot be reset or evicted.
 
+Eviction takes the least recently used key: a `lookup` hit and a `touch` both
+promote a key, so a shared prefix that is read again outlives keys that nothing
+has looked up since they were stored. A `store` batch never evicts a key it
+contains, and a reservation is not a victim until it is committed.
+
 A rejection (`{"ok": false, "error": ...}`) keeps the session and its namespace
 alive: an invalid key or request id, an unknown namespace, a commit without a
 matching reservation, a `store` batch too large for one control frame, and an

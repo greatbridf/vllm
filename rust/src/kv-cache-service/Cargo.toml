@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 clap.workspace = true
-indexmap.workspace = true
 libc.workspace = true
 memmap2.workspace = true
 serde.workspace = true
