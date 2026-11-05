@@ -127,6 +127,17 @@ cargo test --manifest-path rust/Cargo.toml -p vllm-kv-cache-service
   tests/v1/kv_offload/test_service.py -v
 ```
 
+On a machine booted into an rswap-capable kernel (`CONFIG_RSWAP`) with an rswap
+backend configured, `test_service_rswap.py` also covers the kernel side: it
+pushes pages through the service, reclaims exactly those pages into a private
+rswap device, and checks that each one is stored under its published digest and
+reloads unchanged. It needs root and an idle swap setup, so it is opt-in:
+
+```bash
+sudo VLLM_TEST_KV_SERVICE_RSWAP=1 .venv/bin/python -m pytest \
+  --confcutdir=tests/v1/kv_offload tests/v1/kv_offload/test_service_rswap.py -v
+```
+
 With the service running and CUDA model weights available:
 
 ```bash

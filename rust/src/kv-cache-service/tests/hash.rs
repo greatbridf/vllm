@@ -8,7 +8,7 @@ use vllm_kv_cache_service::bpf;
 #[cfg(rswap_bpf_object)]
 use vllm_kv_cache_service::bpf::{Arena, Mapping, Program};
 #[cfg(rswap_bpf_object)]
-use vllm_kv_cache_service::hash::{ARENA_PAGE_SIZE, ArenaMetadata, arena_pages};
+use vllm_kv_cache_service::hash::{ArenaMetadata, arena_pages};
 use vllm_kv_cache_service::hash::{CANONICAL_KEY_LEN, HASH_LEN, LENGTH_LEN, LENGTH_OFF};
 use vllm_kv_cache_service::hash::{OFFSET_LEN, OFFSET_OFF};
 #[cfg(rswap_bpf_object)]
@@ -134,8 +134,9 @@ fn test_run_or_skip(prog_fd: i32, ctx: &mut [u8; 56]) -> Option<u32> {
 #[test]
 fn privileged_program_reads_published_arena_metadata() {
     let num_entries = 2;
-    let pages = arena_pages(num_entries).unwrap();
-    let len = pages * ARENA_PAGE_SIZE;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let pages = arena_pages(num_entries, page_size).unwrap();
+    let len = pages * page_size;
     let user_va = match bpf::next_arena_va(len) {
         Ok(user_va) => user_va,
         Err(error) => panic!("arena VA: {error}"),

@@ -32,6 +32,7 @@ pub const LENGTH_OFF: usize = CANONICAL_KEY_LEN;
 pub const OFFSET_OFF: usize = CANONICAL_KEY_LEN + LENGTH_LEN;
 pub const HASH_LEN: usize = 48;
 
+/// Smallest host page size the arena ABI supports; the header is 4 KiB wide.
 pub const ARENA_PAGE_SIZE: usize = 4096;
 pub const ARENA_MAGIC: u64 = 0x5253_5741_5041_5248;
 pub const ARENA_VERSION: u64 = 1;
@@ -521,9 +522,9 @@ impl HashFactory for RswapConfig {
         }
         #[cfg(rswap_bpf_object)]
         {
-            let pages = arena_pages(geometry.num_entries)?;
+            let pages = arena_pages(geometry.num_entries, geometry.page_size)?;
             let len = pages
-                .checked_mul(ARENA_PAGE_SIZE)
+                .checked_mul(geometry.page_size)
                 .ok_or_else(|| invalid("arena size overflow"))?;
             let user_va = bpf::next_arena_va(len)?;
             let arena = Arena::create(pages as u32, user_va)?;
@@ -590,6 +591,10 @@ impl Drop for RswapHashReports {
 
 /// Writes one `<vaddr-hex> <prog-fd>` sysfs attach command.
 ///
+/// The command must reach the attribute as a single write: sysfs stores run
+/// once per `write(2)`, so a formatted multi-part write parses as several
+/// truncated commands.
+///
 /// Args:
 ///     path: Kernel sysfs attach attribute, or a test file.
 ///     vaddr: Base virtual address of the shared mapping's VMA.
@@ -598,9 +603,9 @@ impl Drop for RswapHashReports {
 /// Raises:
 ///     An `io::Error` if the attribute cannot be opened or written.
 pub fn write_attach(path: &Path, vaddr: u64, prog_fd: i32) -> io::Result<()> {
+    let command = format!("{vaddr:#x} {prog_fd}\n");
     let mut file = OpenOptions::new().write(true).open(path)?;
-    writeln!(file, "{vaddr:#x} {prog_fd}")?;
-    Ok(())
+    file.write_all(command.as_bytes())
 }
 
 fn entries_end(num_entries: usize) -> io::Result<usize> {
@@ -613,11 +618,25 @@ fn entries_end(num_entries: usize) -> io::Result<usize> {
 }
 
 /// Returns the arena page count needed for `num_entries` entries.
-pub fn arena_pages(num_entries: usize) -> io::Result<usize> {
-    let pages = entries_end(num_entries)?.div_ceil(ARENA_PAGE_SIZE);
-    let bytes = pages
-        .checked_mul(ARENA_PAGE_SIZE)
-        .ok_or_else(|| invalid("arena size overflow"))?;
+///
+/// Args:
+///     num_entries: Entries the arena must hold.
+///     page_size: Host page size; `BPF_MAP_TYPE_ARENA` sizes and maps in host
+///         pages, and the mapping length must match the map exactly.
+///
+/// Returns:
+///     The number of `page_size` pages that cover the header and entries.
+///
+/// Raises:
+///     An `io::Error` for overflow or an arena larger than 4 GiB.
+pub fn arena_pages(num_entries: usize, page_size: usize) -> io::Result<usize> {
+    if page_size < ARENA_PAGE_SIZE || !page_size.is_power_of_two() {
+        return Err(invalid(
+            "arena page size must be a power of two of at least 4 KiB",
+        ));
+    }
+    let pages = entries_end(num_entries)?.div_ceil(page_size);
+    let bytes = pages.checked_mul(page_size).ok_or_else(|| invalid("arena size overflow"))?;
     if pages == 0 || bytes > MAX_ARENA_BYTES {
         return Err(invalid("arena metadata exceeds the 4 GiB arena limit"));
     }
@@ -755,8 +774,7 @@ mod tests {
 
     #[test]
     fn metadata_publishes_and_clears_arena_entries() {
-        let len = entries_end(4).unwrap().div_ceil(ARENA_PAGE_SIZE) * ARENA_PAGE_SIZE;
-        let mapping = Mapping::anonymous(len).unwrap();
+        let mapping = Mapping::anonymous(entries_end(4).unwrap()).unwrap();
         let arena = ArenaMetadata::new(mapping, 0x3000_0000, 4096, 4, 2).unwrap();
         let header = arena.header();
         assert_eq!(header.magic, ARENA_MAGIC);
@@ -794,10 +812,14 @@ mod tests {
 
     #[test]
     fn arena_pages_cover_header_and_entries() {
-        assert_eq!(arena_pages(1).unwrap(), 2);
-        assert_eq!(arena_pages(64).unwrap(), 2);
-        assert_eq!(arena_pages(65).unwrap(), 3);
-        assert!(arena_pages(usize::MAX).is_err());
+        assert_eq!(arena_pages(1, ARENA_PAGE_SIZE).unwrap(), 2);
+        assert_eq!(arena_pages(64, ARENA_PAGE_SIZE).unwrap(), 2);
+        assert_eq!(arena_pages(65, ARENA_PAGE_SIZE).unwrap(), 3);
+        assert_eq!(arena_pages(1, 16384).unwrap(), 1);
+        assert_eq!(arena_pages(4096, 16384).unwrap(), 17);
+        assert!(arena_pages(usize::MAX, ARENA_PAGE_SIZE).is_err());
+        assert!(arena_pages(1, 2048).is_err());
+        assert!(arena_pages(1, 5000).is_err());
     }
 
     #[test]
