@@ -18,7 +18,9 @@ Read this before changing the Rust CPU cache service or its native offloading sp
   and padding. Follow the model's existing replay behavior for non-cacheable
   scratch and bounded-replay state.
 - Keep the socket private and authenticate local peers by UID. Bound control
-  frames, keys, geometry, and allocation sizes; seal shared-memory file sizes.
+  frames, keys, geometry, allocation sizes, connections, and idle time; seal
+  shared-memory file sizes. Stop cleanly on `SIGTERM`/`SIGINT` and reclaim the
+  socket a killed predecessor left, so a supervisor restarts the service.
 - Keep unsupported topology, events, and secondary-tier combinations explicit.
   The initial backend is single-node TP-only and does not persist across engine
   sessions. Model names alone do not certify byte-layout compatibility.

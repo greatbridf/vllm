@@ -6,7 +6,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,42 +16,109 @@ use tempfile::TempDir;
 
 const CAPACITY: usize = 64 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP: Duration = Duration::from_secs(10);
 
 struct Service {
     child: Child,
     path: PathBuf,
-    _dir: TempDir,
+    dir: Arc<TempDir>,
 }
 
 impl Service {
     fn start() -> Service {
+        Service::start_with(&[])
+    }
+
+    fn start_with(extra_args: &[&str]) -> Service {
         let dir = tempfile::tempdir().unwrap();
         fs_permissions(dir.path(), 0o700);
+        Service::start_at(Arc::new(dir), extra_args)
+    }
+
+    /// Starts a service on an existing temporary directory's socket path.
+    fn start_at(dir: Arc<TempDir>, extra_args: &[&str]) -> Service {
         let path = dir.path().join("cache.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_vllm-kv-cache-service"))
             .arg("--socket")
             .arg(&path)
             .arg("--capacity-bytes")
             .arg(CAPACITY.to_string())
+            .args(extra_args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let service = Service {
-            child,
-            path,
-            _dir: dir,
-        };
+        let service = Service { child, path, dir };
         service.wait_until_listening();
         service
     }
 
     fn wait_until_listening(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + STARTUP;
         while !self.path.exists() {
             assert!(Instant::now() < deadline, "service startup timed out");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Waits until the process accepts a new connection, which a left-over
+    /// socket path alone cannot prove.
+    fn wait_until_serving(&mut self) {
+        let deadline = Instant::now() + STARTUP;
+        loop {
+            if UnixStream::connect(&self.path).is_ok() {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "service exited before serving ({status}): {}",
+                    self.stderr()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "service never accepted a connection"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Kills the service without a chance to clean up, then hands back its
+    /// directory so a replacement can start on the socket path it left behind.
+    fn kill_hard(mut self) -> Arc<TempDir> {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        assert!(
+            self.path.exists(),
+            "SIGKILL must leave the socket path behind"
+        );
+        Arc::clone(&self.dir)
+    }
+
+    fn signal_and_wait(&mut self, signal: libc::c_int) -> (ExitStatus, String) {
+        // SAFETY: the pid names the child this test spawned.
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, signal) },
+            0
+        );
+        let deadline = Instant::now() + STARTUP;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "service ignored signal {signal}");
+            thread::sleep(Duration::from_millis(10));
+        };
+        (status, self.stderr())
+    }
+
+    /// Everything the service wrote to stderr; only valid once it exited.
+    fn stderr(&mut self) -> String {
+        let mut text = String::new();
+        if let Some(stderr) = self.child.stderr.as_mut() {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        text
     }
 
     fn connect(&self) -> Client {
@@ -303,4 +371,103 @@ fn store_batch_that_cannot_be_answered_reserves_no_slot() {
         "a rejected batch must not reserve"
     );
     assert_eq!(stats["stats"]["pending"], 0);
+}
+
+#[test]
+fn starts_after_reclaiming_a_stale_socket() {
+    let first = Service::start();
+    let dir = first.kill_hard();
+
+    let mut service = Service::start_at(Arc::clone(&dir), &[]);
+    service.wait_until_serving();
+    let mut client = service.connect();
+    assert_eq!(open(&mut client, "engine-reclaimed")["ok"], true);
+    assert_eq!(client.call(json!({"op": "stats"}))["ok"], true);
+}
+
+#[test]
+fn refuses_to_start_when_another_service_is_listening() {
+    let service = Service::start();
+
+    let second = Command::new(env!("CARGO_BIN_EXE_vllm-kv-cache-service"))
+        .arg("--socket")
+        .arg(&service.path)
+        .arg("--capacity-bytes")
+        .arg(CAPACITY.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !second.status.success(),
+        "a second service took over a live socket"
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("another service is listening on"),
+        "unexpected refusal: {stderr}"
+    );
+
+    let mut client = service.connect();
+    assert_eq!(open(&mut client, "engine-live")["ok"], true);
+}
+
+#[test]
+fn sigterm_unlinks_the_socket_and_exits_zero() {
+    let mut service = Service::start();
+    let mut client = service.connect();
+    assert_eq!(open(&mut client, "engine-term")["ok"], true);
+
+    let (status, stderr) = service.signal_and_wait(libc::SIGTERM);
+
+    assert!(status.success(), "exit status {status}: {stderr}");
+    assert!(
+        !service.path.exists(),
+        "a clean stop must unlink the socket path"
+    );
+    assert!(
+        stderr.contains("kv-cache-service: shutdown reason=signal"),
+        "missing shutdown event: {stderr}"
+    );
+}
+
+#[test]
+fn connection_cap_rejects_excess_clients() {
+    let service = Service::start_with(&["--max-connections", "2"]);
+    let mut first = service.connect();
+    assert_eq!(open(&mut first, "engine-cap-a")["ok"], true);
+    let mut second = service.connect();
+    assert_eq!(open(&mut second, "engine-cap-b")["ok"], true);
+
+    let mut excess = service.connect();
+    let mut buffer = [0u8; 4];
+    let read = excess
+        .stream
+        .read(&mut buffer)
+        .expect("the excess client must be closed, not reset");
+    assert_eq!(read, 0, "the excess client must observe EOF");
+
+    assert_eq!(first.call(json!({"op": "stats"}))["ok"], true);
+    assert_eq!(second.call(json!({"op": "stats"}))["ok"], true);
+}
+
+#[test]
+fn idle_connection_is_closed_after_the_timeout() {
+    let service = Service::start_with(&["--idle-timeout-secs", "1"]);
+    let mut client = service.connect();
+
+    let started = Instant::now();
+    let mut buffer = [0u8; 4];
+    let read = client
+        .stream
+        .read(&mut buffer)
+        .expect("the idle connection must be closed, not left open");
+    let elapsed = started.elapsed();
+
+    assert_eq!(read, 0, "the idle peer must observe EOF");
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "closed before the idle timeout: {elapsed:?}"
+    );
 }

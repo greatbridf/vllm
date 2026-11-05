@@ -20,9 +20,10 @@ alias `--hash-attach`) to the command above to enable it. The flag accepts an
 optional sysfs path and defaults to
 `/sys/kernel/mm/xswap/rswap_attach`.
 
-An existing socket is not overwritten. After stopping the service, remove its
-stale socket before restarting. Use a private directory owned by the service
-user; only same-UID clients are accepted.
+An existing socket is not overwritten by a running service: a start refuses
+when another process still accepts connections on the path, and reclaims the
+socket a killed process left behind. Use a private directory owned by the
+service user; only same-UID clients are accepted.
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
@@ -72,6 +73,41 @@ are never reused by a new namespace, and remain charged to capacity while
 attached clients retain their sessions. Service errors fail the connector
 closed; this version does not reconnect or silently treat a failed receive as a
 hit.
+
+## Lifecycle
+
+`SIGTERM` and `SIGINT` stop the accept loop, unlink the socket path, and exit
+with status 0, so a supervisor can restart the service without cleaning up
+first. After a process was killed without that chance, the next start probes the
+path instead of failing: a service that still accepts connections is refused
+with `another service is listening on <path>`, while a socket that refuses
+connections is unlinked and rebound. Any other probe error refuses the start
+with the operating-system error.
+
+`--max-connections` (default 128) bounds simultaneous clients. A connection over
+the limit is accepted and closed at once, so the excess client fails fast
+instead of waiting in the listen backlog. `--idle-timeout-secs` (default 900; 0
+disables it) closes a connection that sends no request for that long, which
+reclaims the session of a client that died without closing its socket. A closed
+idle connection is indistinguishable from any other dropped connection on the
+client side, so keep the timeout above the engine's longest idle period or
+disable it with 0. One connection is one thread and one descriptor, so both
+limits bound the process. Transient accept failures (`EMFILE`, `ENFILE`,
+`ENOMEM`) are logged and retried after a short backoff rather than ending the
+service.
+
+Every event writes one line to stderr, starting with `kv-cache-service: start`
+(socket, capacity, pid, and both limits) and ending with `shutdown`: namespace
+open and attach, retirement with the sessions left, the reclaimed socket, and
+rejected or failed requests with the operation name. Per-lookup paths log
+nothing.
+
+A request loop runs under `catch_unwind`, so a build with unwinding answers
+`{"ok": false, "error": "internal error"}` and closes only that connection, and
+a poisoned registry or cache lock is recovered instead of wedging every
+namespace. This workspace builds its binaries with `panic = "abort"`, where a
+panic ends the process instead; the socket path it leaves behind is reclaimed by
+the next start.
 
 ## Hash reporting
 

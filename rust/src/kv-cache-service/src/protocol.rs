@@ -62,6 +62,25 @@ pub enum Request {
     Stats,
 }
 
+impl Request {
+    /// Wire name of the operation, for logs.
+    pub fn op(&self) -> &'static str {
+        match self {
+            Request::Open { .. } => "open",
+            Request::Attach { .. } => "attach",
+            Request::Lookup { .. } => "lookup",
+            Request::Load { .. } => "load",
+            Request::Release { .. } => "release",
+            Request::ReleaseAll { .. } => "release_request",
+            Request::Store { .. } => "store",
+            Request::Commit { .. } => "commit",
+            Request::Touch { .. } => "touch",
+            Request::Reset => "reset",
+            Request::Stats => "stats",
+        }
+    }
+}
+
 /// Whether a `store` reply that echoes every reserved and evicted key plus one
 /// slot id per reserved key still fits in a single frame.
 ///

@@ -107,7 +107,10 @@ This differs from `offload_region: "mmap"`, which allocates memory inside worker
 
 See the [Rust cache service guide](../../rust/src/kv-cache-service/README.md)
 for startup commands, DeepSeek-V4.1-Flash configuration, supported scope,
-CPU/GPU validation commands, and hash reporting details.
+CPU/GPU validation commands, and hash reporting details. The service stops on
+`SIGTERM`/`SIGINT` and removes its socket; a start reclaims a socket left by a
+killed service and refuses a path another process still serves, so a supervisor
+can restart it without manual cleanup.
 
 Hash reporting is optional and off by default. Pass `--rswap-attach` (or
 `--hash-attach`), optionally with a sysfs path that defaults to
