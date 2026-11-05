@@ -365,11 +365,14 @@ old session knew. A replay that has nothing to adopt, because the namespace was
 retired or its grace period ended, is rejected and disables offloading, since a
 second mapping the workers do not hold would be worse than no offloading at all.
 Every other operation stops offloading for that engine instead of failing the
-scheduler step: a lookup becomes a miss and reservations, completions, touches,
-and resets become no-ops. A rejection after such a reconnect disables offloading
-the same way. A reply that breaks the slot contract raises instead, since it means
-a service bug and not a lost connection. No lookup ever reports a hit the service
-did not take a lease for.
+scheduler step: a lookup becomes a miss, a store reservation becomes `None`, and
+completions, touches, and resets become no-ops. A rejection disables offloading
+the same way, including one that reaches the store path, which has reserved
+nothing. `prepare_load` is the one operation that raises, because the connector
+has already committed to the tokens its lookup reported and loading from a source
+the service cannot name is worse than a failed step. A reply that breaks the slot
+contract raises instead, since it means a service bug and not a lost connection.
+No lookup ever reports a hit the service did not take a lease for.
 
 ## Lifecycle
 

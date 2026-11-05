@@ -96,13 +96,13 @@ class ServiceOffloadingManager(OffloadingManager):
     A transport failure disables offloading for the rest of the engine instead
     of failing the scheduler step: a lookup becomes a miss, a store reservation
     becomes `None`, and completions, touches, and resets become no-ops. A lookup
-    the service rejects after a reconnect counts as the same failure, because a
-    service that dropped the namespace cannot serve it again. `prepare_load`
-    raises instead, since a lookup that could not reach the service missed
-    first. A commit the service refuses, which a reservation older than its
-    pending timeout leaves behind, drops that reservation instead of raising. A
-    reply that breaks the slot contract is a service bug rather than a transport
-    failure, so it raises `CacheServiceError` instead of degrading.
+    or a store the service rejects counts as the same failure, because it reserves
+    nothing and the step must survive it. `prepare_load` raises instead, since a
+    lookup that could not reach the service missed first. A commit the service
+    refuses, which a reservation older than its pending timeout leaves behind,
+    drops that reservation instead of raising. A reply that breaks the slot
+    contract is a service bug rather than a transport failure, so it raises
+    `CacheServiceError` instead of degrading.
 
     `get_stats()` reports the CPU-tier metrics from one `stats` RPC per
     collection, `config_info()` the chunk geometry the spec negotiated with the
@@ -239,6 +239,21 @@ class ServiceOffloadingManager(OffloadingManager):
             self._request_state(request).leased = True
         return results
 
+    def _chunk_slots(self, reply: dict[str, Any], expected: int) -> list[int]:
+        """Returns the one chunk slot per key a reply carries, or raises."""
+        slots = reply.get("slots")
+        if not isinstance(slots, list) or len(slots) != expected:
+            raise CacheServiceError(
+                f"KV cache service returned {slots!r} slots for {expected} keys"
+            )
+        if not all(
+            isinstance(slot, int) and 0 <= slot < self.num_chunks for slot in slots
+        ):
+            raise CacheServiceError(
+                f"KV cache service returned a slot outside 0..{self.num_chunks}"
+            )
+        return slots
+
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> CPULoadStoreSpec:
@@ -246,15 +261,8 @@ class ServiceOffloadingManager(OffloadingManager):
         encoded = self._encode(keys)
         slots: list[int] = []
         for batch in _batches(encoded):
-            slots += self.client.call("load", keys=batch, request=request)["slots"]
-        if len(slots) != len(encoded):
-            raise CacheServiceError(
-                f"KV cache service returned {len(slots)} slots for {len(encoded)} keys"
-            )
-        if not all(0 <= slot < self.num_chunks for slot in slots):
-            raise CacheServiceError(
-                f"KV cache service returned a slot outside 0..{self.num_chunks}"
-            )
+            reply = self.client.call("load", keys=batch, request=request)
+            slots += self._chunk_slots(reply, len(batch))
         state = self._request_state(request)
         state.loads += 1
         state.leased = True
@@ -281,27 +289,35 @@ class ServiceOffloadingManager(OffloadingManager):
         request = self._wire_id(req_context.req_id)
         stored: list[OffloadKey] = []
         slots: list[int] = []
-        evicted: list[OffloadKey] = []
+        evicted_keys: list[OffloadKey] = []
         for batch in _batches(self._encode(keys)):
             self._allocation_sizes.append(len(batch))
-            response = self._call_or_degrade("store", keys=batch, request=request)
+            try:
+                response = self._call_or_degrade("store", keys=batch, request=request)
+            except CacheServiceError as error:
+                # A store the service refuses has reserved nothing, so this is
+                # not a lost connection: stop reserving and leave those chunks
+                # in GPU memory instead of ending the scheduler step.
+                self._degrade("store", error)
+                break
             if response is None or response.get("full"):
                 break
-            reserved = response["keys"]
-            if len(reserved) != len(response["slots"]):
+            reserved = response.get("keys")
+            evicted = response.get("evicted")
+            if not isinstance(reserved, list) or not isinstance(evicted, list):
                 raise CacheServiceError(
-                    "KV cache service reserved a different number of keys and slots"
+                    f"KV cache service reserved no key of {len(batch)} asked for"
                 )
+            slots += self._chunk_slots(response, len(reserved))
             stored += [OffloadKey(bytes.fromhex(key)) for key in reserved]
-            slots += response["slots"]
-            evicted += [OffloadKey(bytes.fromhex(key)) for key in response["evicted"]]
+            evicted_keys += [OffloadKey(bytes.fromhex(key)) for key in evicted]
         if not stored:
             return None
-        if self._events is not None and evicted:
+        if self._events is not None and evicted_keys:
             # This store made room, so the removal is one this manager caused.
             self._events.append(
                 OffloadingEvent(
-                    keys=evicted,
+                    keys=evicted_keys,
                     medium=Medium.CPU,
                     removed=True,
                     removal_expected=True,
@@ -310,7 +326,7 @@ class ServiceOffloadingManager(OffloadingManager):
         state = self._request_state(request)
         state.stores += 1
         state.reserved.update(key.hex() for key in stored)
-        return PrepareStoreOutput(stored, CPULoadStoreSpec(slots), evicted)
+        return PrepareStoreOutput(stored, CPULoadStoreSpec(slots), evicted_keys)
 
     def complete_store(
         self,
@@ -451,7 +467,17 @@ class ServiceOffloadingManager(OffloadingManager):
             return None
         if response is None:
             return None
-        counters = response["stats"]
+        counters = response.get("stats")
+        if not isinstance(counters, dict) or not {"entries", "pending"} <= set(
+            counters
+        ):
+            # Metrics never fail a scheduler step, not even on a reply this
+            # client cannot read.
+            logger.warning_once(
+                "KV cache service reported no namespace counters in %s",
+                ", ".join(sorted(response)) or "an empty reply",
+            )
+            return None
         stats = OffloadingConnectorStats()
         usage = counters["entries"] / self.num_chunks if self.num_chunks else 0.0
         write_usage = counters["pending"] / self.num_chunks if self.num_chunks else 0.0

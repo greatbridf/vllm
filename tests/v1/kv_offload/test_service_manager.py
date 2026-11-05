@@ -46,6 +46,12 @@ class FakeClient:
         self.full_after: int | None = None
         # Slots to answer a load with, when they differ from one per key.
         self.load_slots: list[int] | None = None
+        # Slots to answer a store with, when they differ from one per key.
+        self.store_slots: list[int] | None = None
+        # Answer `store` alone with a rejection instead.
+        self.reject_store = False
+        # Replace the whole `stats` reply.
+        self.stats_reply: dict[str, Any] | None = None
         # Answer every RPC with a transport failure instead.
         self.unavailable = False
         # Answer every RPC with a rejection instead.
@@ -81,17 +87,27 @@ class FakeClient:
         return {"ok": True, "statuses": list(statuses)}
 
     def _load(self, keys: list[str], request: str) -> dict[str, Any]:
-        slots = self.load_slots if self.load_slots is not None else range(len(keys))
+        slots = self.load_slots if self.load_slots is not None else self._slots(keys)
         return {"ok": True, "slots": list(slots)}
+
+    @staticmethod
+    def _slots(keys: list[str]) -> list[int]:
+        # Slots are chunk ids of the namespace, so they repeat modulo its size.
+        return [index % NUM_CHUNKS for index in range(len(keys))]
 
     def _store(self, keys: list[str], request: str) -> dict[str, Any]:
         self._store_calls += 1
+        if self.reject_store:
+            raise CacheServiceError(
+                "KV cache service rejected store: batch too large for one control frame"
+            )
         if self.full_after is not None and self._store_calls > self.full_after:
             return {"ok": True, "full": True}
+        slots = self.store_slots if self.store_slots is not None else self._slots(keys)
         return {
             "ok": True,
             "keys": list(keys),
-            "slots": list(range(len(keys))),
+            "slots": list(slots),
             "evicted": list(self.evicted),
         }
 
@@ -108,6 +124,8 @@ class FakeClient:
         return {"ok": True}
 
     def _stats(self) -> dict[str, Any]:
+        if self.stats_reply is not None:
+            return self.stats_reply
         return {"ok": True, "stats": dict(self.counters)}
 
     def _close(self) -> dict[str, Any]:
@@ -316,6 +334,31 @@ def test_prepare_load_rejects_slot_out_of_range():
         manager.prepare_load([make_key(0), make_key(1)], ReqContext("request"))
 
 
+def test_prepare_store_rejects_slot_out_of_range():
+    """A slot outside the namespace would make a worker write unrelated memory."""
+    client = FakeClient()
+    client.store_slots = [0, NUM_CHUNKS]
+    manager = make_manager(client)
+
+    with pytest.raises(CacheServiceError, match="outside"):
+        manager.prepare_store([make_key(0), make_key(1)], ReqContext("request"))
+
+
+def test_prepare_store_stops_reserving_when_the_service_refuses_it():
+    """A refused store reserved nothing, so it must not end the scheduler step."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+
+    client.reject_store = True
+    assert manager.prepare_store([make_key()], request) is None
+
+    # Offloading is off from here, so a later lookup does not touch the service.
+    client.calls.clear()
+    assert manager.lookup(make_key(), request) is LookupResult.MISS
+    assert client.calls == []
+
+
 def test_prepare_store_splits_batches_above_max_keys():
     client = FakeClient()
     manager = make_manager(client)
@@ -330,8 +373,7 @@ def test_prepare_store_splits_batches_above_max_keys():
     store_spec = output.store_spec
     assert isinstance(store_spec, CPULoadStoreSpec)
     assert [int(slot) for slot in store_spec.block_ids] == [
-        *range(MAX_KEYS),
-        *range(5),
+        index % NUM_CHUNKS for index in range(MAX_KEYS + 5)
     ]
 
 
@@ -484,6 +526,16 @@ def test_get_stats_is_none_when_the_service_is_degraded():
     manager = make_manager(rejected)
     assert manager.get_stats() is None
     assert len(rejected.ops("stats")) == 1
+
+
+def test_get_stats_is_none_for_a_reply_without_counters():
+    """Metrics never fail a step, not even on a reply this client cannot read."""
+    client = FakeClient()
+    client.stats_reply = {"ok": True}
+    manager = make_manager(client)
+
+    assert manager.get_stats() is None
+    assert len(client.ops("stats")) == 1
 
 
 def test_config_info_reports_the_negotiated_geometry():
