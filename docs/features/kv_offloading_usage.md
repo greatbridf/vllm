@@ -117,11 +117,16 @@ A `store` reservation belongs to the request that made it, so only that request'
 `--pending-timeout-secs` (default 60; 0 disables it) is reclaimed and logged, so a
 request that dies between `store` and `complete_store` cannot leave a key that the
 scheduler keeps retrying as a hit that never becomes readable. A `reset`, which is
-what `/reset_prefix_cache` reaches, is refused while any reservation or lookup
-lease is still outstanding. The service's `stats` op reports the namespace
-counters (`hits`, `misses`, `pending_hits`, `evictions`, `stores`, `commits`,
-`aborted`, `failed_commits`, `reclaimed`, and the requests holding leases) that
-make such a leak visible.
+what `/reset_prefix_cache` reaches, happens in two phases: the connector releases
+its leases, keeps stepping while workers report the transfers the reset flushed,
+and only then sends the forced reset that recycles the slots. The service's
+`stats` op reports the namespace counters (`hits`, `misses`, `pending_hits`,
+`evictions`, `stores`, `commits`, `aborted`, `failed_commits`, `reclaimed`, and the
+requests holding leases) that make such a leak visible.
+
+A service that stops answering, or that dropped the engine's namespace, does not
+abort the scheduler step: the connector logs one error, reports every later lookup
+as a miss, and stops reserving, until the engine is restarted.
 
 Hash reporting is optional and off by default. Pass `--rswap-attach` (or
 `--hash-attach`), optionally with a sysfs path that defaults to

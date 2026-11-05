@@ -15,7 +15,12 @@ Read this before changing the Rust CPU cache service or its native offloading sp
   leaked reservation or lease in `stats`.
 - A forced reset is the only way out of leases and pending reservations, so it
   must belong to a caller that flushed its own transfers first. Never recycle a
-  dropped slot while a worker could still write to it.
+  dropped slot while a worker could still write to it. The connector provides
+  that flush fence: `reset_cache()` releases what it tracks, and
+  `on_reset_flushed()` ends the reset once the workers reported the flush.
+- A transport failure must not fail the scheduler step. Degrade to a miss, stop
+  reserving, and keep the engine live; a reply that breaks the slot contract is
+  a service bug, so raise it rather than degrading.
 - A lost worker may still have DMA in flight. Invalidate its namespace rather
   than reclaiming slots into the same mapping. Do not reconnect old workers to a
   newly created namespace.

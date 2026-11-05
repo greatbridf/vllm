@@ -85,8 +85,11 @@ a stalled cache.
 A `reset` refuses a cache with a pending reservation or a lease. `reset` with
 `"force": true` instead drops every lease and reservation, clears the slots, and
 empties the cache; a caller may only send one after flushing every transfer whose
-slot it abandons. The connector sends a plain `reset` today; a forced one needs
-the two-phase flush that is not implemented yet.
+slot it abandons. The connector resets in two phases: `reset_cache()` releases
+the leases it tracks, and the forced `reset` follows from `on_reset_flushed()`
+once every worker reported the transfers the reset flushed. It keeps the engine
+stepping until then, because a dropped slot may not be recycled while a worker
+could still write to it.
 
 Eviction takes the least recently used key: a `lookup` hit and a `touch` both
 promote a key, so a shared prefix that is read again outlives keys that nothing
@@ -107,9 +110,19 @@ stops reading blocks only its own connection, for at most the 5 s write timeout.
 
 Disconnecting an attached client still invalidates its namespace. Old mappings
 are never reused by a new namespace, and remain charged to capacity while
-attached clients retain their sessions. Service errors fail the connector
-closed; this version does not reconnect or silently treat a failed receive as a
-hit.
+attached clients retain their sessions. A request id is digested before it goes
+on the wire, so any user-supplied id fits the 256-byte limit; the service sees
+one stable 32-character id per request.
+
+A control RPC that fails at the transport level closes the client. A read-only
+`lookup` reconnects and repeats itself once, and every other operation stops
+offloading for that engine instead of failing the scheduler step: a lookup
+becomes a miss and reservations, completions, touches, and resets become
+no-ops. A rejection after such a reconnect disables offloading the same way,
+because a namespace the service dropped cannot serve the request again. A reply
+that breaks the slot contract raises instead, since it means a service bug and
+not a lost connection. No lookup ever reports a hit the service did not take a
+lease for.
 
 ## Lifecycle
 

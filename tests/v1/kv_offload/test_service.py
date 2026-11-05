@@ -17,7 +17,10 @@ import torch
 
 from tests.v1.kv_offload.conftest import make_offloading_config
 from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
-from vllm.v1.kv_offload.service.client import CacheServiceClient
+from vllm.v1.kv_offload.service.client import (
+    CacheServiceClient,
+    CacheServiceUnavailable,
+)
 from vllm.v1.kv_offload.service.region import ServiceOffloadRegion
 from vllm.v1.kv_offload.service.spec import RustServiceOffloadingSpec
 
@@ -116,6 +119,8 @@ def test_rust_service_shares_rank_slices_and_publishes_only_completed_stores(ser
         manager.complete_load([key], request)
         assert manager.client.call("stats")["stats"]["leased"] == 0
         manager.reset_cache()
+        # The connector flushes in-flight transfers, then reports the flush.
+        manager.on_reset_flushed()
         assert manager.lookup(key, ReqContext("next")) is LookupResult.MISS
     finally:
         for region in regions:
@@ -153,12 +158,12 @@ def test_commit_from_a_request_that_did_not_reserve_is_rejected(service):
     try:
         key = OffloadKey(b"foreign-commit")
         assert manager.prepare_store([key], request) is not None
-        # A rejected call also closes the client, so this is the last call this
-        # manager makes.
         with pytest.raises(RuntimeError, match="does not own the reservation"):
             manager.client.call(
                 "commit", keys=[key.hex()], request="another", success=True
             )
+        # A rejected request keeps the connection and the reservation alive.
+        assert manager.client.call("stats")["stats"]["pending"] == 1
     finally:
         manager.shutdown()
 
@@ -178,6 +183,7 @@ def test_lookup_lease_prevents_eviction_and_failed_store_is_removed(service):
         assert manager.lookup(third, request) is LookupResult.MISS
         manager.on_request_finished(request)
         manager.reset_cache()
+        manager.on_reset_flushed()
     finally:
         manager.shutdown()
 
@@ -282,3 +288,11 @@ def test_oversized_control_frame_does_not_terminate_service(service):
             manager.shutdown()
     finally:
         client.close()
+
+
+def test_client_connect_error_names_the_socket_path(tmp_path, monkeypatch):
+    import vllm.v1.kv_offload.service.client as client_module
+
+    monkeypatch.setattr(client_module, "_CONNECT_BACKOFF_S", 0.0)
+    with pytest.raises(CacheServiceUnavailable, match="missing.sock"):
+        CacheServiceClient(str(tmp_path / "missing.sock"))

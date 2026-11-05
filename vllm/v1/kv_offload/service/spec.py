@@ -94,7 +94,7 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
             except Exception:
                 client.close()
                 raise
-            self._manager = ServiceOffloadingManager(client)
+            self._manager = ServiceOffloadingManager(client, self.num_chunks)
         return self._manager
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
