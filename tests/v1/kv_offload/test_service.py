@@ -276,6 +276,23 @@ def test_service_rejects_capacity_overflow(service):
         client.close()
 
 
+def test_info_reports_the_capacity_of_the_service(service):
+    client = CacheServiceClient(service)
+    try:
+        info = client.call("info")
+    finally:
+        client.close()
+
+    assert info["capacity_bytes"] == 64 * PAGE
+    assert info["used_bytes"] == 0
+    assert info["retired_bytes"] == 0
+    assert info["namespaces"] == 0
+    assert info["sessions"] == 0
+    assert info["max_connections"] >= 1
+    assert isinstance(info["version"], str)
+    assert info["uptime_ms"] >= 0
+
+
 def test_oversized_control_frame_does_not_terminate_service(service):
     client = CacheServiceClient(service)
     try:

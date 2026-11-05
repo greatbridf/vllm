@@ -86,6 +86,7 @@ struct Registry {
     budget: usize,
     rswap_attach: Option<PathBuf>,
     pending_timeout: Option<Duration>,
+    started: Instant,
 }
 
 /// A reply is built before the wire is touched, so a failed write cannot add a
@@ -179,9 +180,27 @@ fn geometry(cache: &Cache) -> Value {
     })
 }
 
+/// Service-wide state for an operator or a probe, reported without reading any
+/// slot.
+fn info(registry: &Registry, limits: &Limits) -> Value {
+    json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
+        "uptime_ms": registry.started.elapsed().as_millis() as u64,
+        "capacity_bytes": registry.budget,
+        "used_bytes": registry.used_bytes(),
+        "retired_bytes": registry.retired_bytes(),
+        "namespaces": registry.namespaces.len(),
+        "sessions": registry.sessions(),
+        "max_connections": limits.max_connections,
+    })
+}
+
 fn handle(
     request: Request,
     registry: &Mutex<Registry>,
+    limits: &Limits,
     session: u64,
     namespace: &mut Option<String>,
 ) -> Result<Reply, Failure> {
@@ -281,6 +300,11 @@ fn handle(
             *namespace = Some(name);
             Ok(Reply::Attach { frame, fd })
         }
+        Request::Info => {
+            let registry = lock_or_recover(registry, "registry");
+            let frame = protocol::encode_response(&info(&registry, limits))?;
+            Ok(Reply::Frame(frame))
+        }
         command => {
             let name = namespace.as_deref().ok_or_else(|| reject("handshake required"))?;
             let (cache, pending_timeout) = {
@@ -361,7 +385,7 @@ fn handle(
                     reclaim_expired(&mut cache, name, pending_timeout);
                     json!({"ok": true, "stats": cache.stats()})
                 }
-                Request::Open { .. } | Request::Attach { .. } => unreachable!(),
+                Request::Open { .. } | Request::Attach { .. } | Request::Info => unreachable!(),
             };
             Ok(Reply::Frame(protocol::encode_response(&response)?))
         }
@@ -420,7 +444,7 @@ fn serve(
             }
         };
         let op = request.op();
-        let written = match handle(request, registry, session, namespace) {
+        let written = match handle(request, registry, limits, session, namespace) {
             Ok(Reply::Frame(frame)) => protocol::write_frame(stream, &frame),
             Ok(Reply::Attach { frame, fd }) => protocol::write_frame(stream, &frame)
                 .and_then(|()| protocol::send_fd(stream, fd.as_fd())),
@@ -540,6 +564,25 @@ impl Registry {
         self.namespaces.values().chain(&self.retired).fold(0, |used, entry| {
             used.saturating_add(lock_or_recover(&entry.cache, "cache").mapping.len())
         })
+    }
+
+    /// Bytes still held by namespaces whose scheduler is gone but whose workers
+    /// keep the mapping.
+    fn retired_bytes(&self) -> usize {
+        self.retired
+            .iter()
+            .map(|entry| lock_or_recover(&entry.cache, "cache").mapping.len())
+            .sum()
+    }
+
+    /// Sessions of live and retired namespaces, which is what the connection
+    /// limit bounds.
+    fn sessions(&self) -> usize {
+        self.namespaces
+            .values()
+            .chain(&self.retired)
+            .map(|entry| entry.sessions.len())
+            .sum()
     }
 }
 
@@ -738,6 +781,7 @@ fn main() -> io::Result<()> {
         rswap_attach: args.rswap_attach,
         pending_timeout: (args.pending_timeout_secs > 0)
             .then(|| Duration::from_secs(args.pending_timeout_secs)),
+        started: Instant::now(),
     }));
     let result = accept_connections(&listener, &registry, &limits);
     let reason = if SHUTDOWN.load(Ordering::SeqCst) {

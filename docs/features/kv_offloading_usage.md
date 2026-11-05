@@ -128,6 +128,26 @@ A service that stops answering, or that dropped the engine's namespace, does not
 abort the scheduler step: the connector logs one error, reports every later lookup
 as a miss, and stops reserving, until the engine is restarted.
 
+The connector reports the CPU tier's metrics from that namespace state, with one
+`stats` RPC per collection and none per lookup:
+`vllm:kv_offload_cpu_cache_usage_perc` from the chunks in use,
+`vllm:kv_offload_cpu_cache_write_usage_perc` from the chunks pending a store,
+`vllm:kv_offload_cpu_cache_read_usage_perc` from the rest, and one
+`vllm:kv_offload_cpu_allocation_size` observation per store batch. The service's
+own counters, which no declared metric carries, are logged at debug level, and
+`vllm:kv_offload_config_info` holds the chunk geometry the engine negotiated, so
+it matches the bytes the service allocated. A hit in this tier is attributed to
+`CacheHitSource.HOST`, like the in-process CPU tier.
+
+KV cache events are supported: with `enable_kv_cache_events` (from
+`--kv-events-config`), the connector publishes a `BlockStored` event for each
+committed key and a `BlockRemoved` event for the keys a store evicted, so an
+event-driven consumer learns the resident set without reading `stats`.
+`self_describing_kv_events` behaves as it does for the CPU tier. A store whose
+transfer failed announces its keys as a metadata-only removal. A forced reset
+(`/reset_prefix_cache`) empties the service without publishing removals, exactly
+as the in-process CPU tier does.
+
 Hash reporting is optional and off by default. Pass `--rswap-attach` (or
 `--hash-attach`), optionally with a sysfs path that defaults to
 `/sys/kernel/mm/xswap/rswap_attach`, to the service. It requires an

@@ -66,6 +66,8 @@ pub enum Request {
         force: bool,
     },
     Stats,
+    /// Service-wide state, available before any handshake.
+    Info,
 }
 
 impl Request {
@@ -83,6 +85,7 @@ impl Request {
             Request::Touch { .. } => "touch",
             Request::Reset { .. } => "reset",
             Request::Stats => "stats",
+            Request::Info => "info",
         }
     }
 }

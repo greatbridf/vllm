@@ -7,14 +7,21 @@ from typing import Any
 
 import pytest
 
-from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    Medium,
+    OffloadingEvent,
+    OffloadKey,
+    ReqContext,
+)
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec, CPUOffloadingInfo
 from vllm.v1.kv_offload.service.client import (
     MAX_KEYS,
     CacheServiceError,
     CacheServiceUnavailable,
 )
 from vllm.v1.kv_offload.service.manager import ServiceOffloadingManager
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 NUM_CHUNKS = 8
 
@@ -41,6 +48,10 @@ class FakeClient:
         self.unavailable = False
         # Answer every RPC with a rejection instead.
         self.reject = False
+        # Keys the service reports as evicted by the next store.
+        self.evicted: list[str] = []
+        # Namespace counters the service reports from `stats`.
+        self.counters: dict[str, int] = {"entries": 0, "pending": 0, "leased": 0}
         self._store_calls = 0
 
     def call(self, op: str, retry: bool = False, **fields: Any) -> dict[str, Any]:
@@ -72,7 +83,7 @@ class FakeClient:
             "ok": True,
             "keys": list(keys),
             "slots": list(range(len(keys))),
-            "evicted": [],
+            "evicted": list(self.evicted),
         }
 
     def _commit(self, keys: list[str], request: str, success: bool) -> dict[str, Any]:
@@ -87,9 +98,21 @@ class FakeClient:
     def _reset(self, force: bool) -> dict[str, Any]:
         return {"ok": True}
 
+    def _stats(self) -> dict[str, Any]:
+        return {"ok": True, "stats": dict(self.counters)}
 
-def make_manager(client: FakeClient | None = None) -> ServiceOffloadingManager:
-    return ServiceOffloadingManager(client or FakeClient(), NUM_CHUNKS)
+
+def make_manager(
+    client: FakeClient | None = None,
+    info: CPUOffloadingInfo | None = None,
+    enable_events: bool = False,
+) -> ServiceOffloadingManager:
+    return ServiceOffloadingManager(
+        client or FakeClient(),
+        NUM_CHUNKS,
+        info=info,
+        enable_events=enable_events,
+    )
 
 
 def test_lookup_lease_released_only_after_finish_and_all_jobs():
@@ -298,3 +321,141 @@ def test_rejected_lookup_degrades_instead_of_raising():
     assert manager.lookup(make_key(), request) is LookupResult.MISS
     assert manager.prepare_store([make_key()], request) is None
     assert len(client.calls) == 1
+
+
+def test_get_stats_maps_service_counters_to_the_cpu_metrics():
+    """One stats RPC per collection fills the gauges and the store histogram."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    client.counters = {"entries": 4, "pending": 1, "leased": 1}
+
+    manager.prepare_store([make_key(index) for index in range(MAX_KEYS + 5)], request)
+    assert manager.lookup(make_key(), request) is LookupResult.HIT
+    assert client.ops("stats") == []
+
+    stats = manager.get_stats()
+
+    assert stats is not None
+    assert stats.reduce() == {
+        "vllm:kv_offload_cpu_cache_usage_perc": 4 / NUM_CHUNKS,
+        "vllm:kv_offload_cpu_cache_write_usage_perc": 1 / NUM_CHUNKS,
+        "vllm:kv_offload_cpu_cache_read_usage_perc": 3 / NUM_CHUNKS,
+        "vllm:kv_offload_cpu_allocation_size_count": 2,
+        "vllm:kv_offload_cpu_allocation_size_sum": MAX_KEYS + 5,
+    }
+    assert len(client.ops("stats")) == 1
+
+    # The allocation sizes belong to one collection only.
+    again = manager.get_stats()
+    assert again is not None
+    assert "vllm:kv_offload_cpu_allocation_size_count" not in again.reduce()
+
+
+def test_get_stats_is_none_when_the_service_is_degraded():
+    client = FakeClient()
+    manager = make_manager(client)
+
+    client.unavailable = True
+    assert manager.get_stats() is None
+    # Offloading stays off, so a later collection sends nothing either.
+    assert manager.get_stats() is None
+    assert len(client.ops("stats")) == 1
+
+    # A namespace the service dropped reports no metrics, and that must not
+    # reach the scheduler step either.
+    rejected = FakeClient()
+    rejected.reject = True
+    manager = make_manager(rejected)
+    assert manager.get_stats() is None
+    assert len(rejected.ops("stats")) == 1
+
+
+def test_config_info_reports_the_negotiated_geometry():
+    info = CPUOffloadingInfo(
+        cpu_num_chunks=NUM_CHUNKS,
+        cpu_blocks_per_chunk=1,
+        cpu_kv_cache_size_bytes=NUM_CHUNKS * 4096,
+        cpu_kv_cache_size_tokens=128,
+    )
+
+    assert make_manager(info=info).config_info() == [info.as_config_info()]
+    # A manager built without geometry publishes no label values.
+    assert make_manager().config_info() == [{}]
+
+
+def test_get_load_source_is_host():
+    manager = make_manager()
+
+    assert (
+        manager.get_load_source(make_key(), ReqContext("request"))
+        is CacheHitSource.HOST
+    )
+
+
+def test_take_events_reports_stored_evicted_and_failed_stores():
+    """Stored, evicted, and abandoned chunks are announced like the CPU tier."""
+    client = FakeClient()
+    manager = make_manager(client, enable_events=True)
+    request = ReqContext("request")
+    stored = make_key(0)
+    evicted = make_key(1)
+    client.evicted = [evicted.hex()]
+
+    output = manager.prepare_store([stored], request)
+    assert output is not None
+    assert output.evicted_keys == [evicted]
+    assert list(manager.take_events()) == [
+        OffloadingEvent(
+            keys=[evicted],
+            medium=Medium.CPU,
+            removed=True,
+            removal_expected=True,
+        )
+    ]
+
+    manager.complete_store([stored], request)
+    [event] = manager.take_events()
+    assert event.keys == [stored]
+    assert (event.removed, event.removal_expected, event.metadata_only) == (
+        False,
+        True,
+        False,
+    )
+    assert event.req_context is request
+
+    failed = make_key(2)
+    client.evicted = []
+    assert manager.prepare_store([failed], request) is not None
+    manager.complete_store([failed], request, success=False)
+    [event] = manager.take_events()
+    assert event.keys == [failed]
+    assert (event.removed, event.metadata_only) == (True, True)
+
+    # The drain detached its batch, so nothing is replayed.
+    assert list(manager.take_events()) == []
+
+
+def test_events_are_off_unless_the_spec_enables_them():
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    client.evicted = [make_key(1).hex()]
+
+    assert manager.prepare_store([make_key(0)], request) is not None
+    manager.complete_store([make_key(0)], request)
+
+    assert list(manager.take_events()) == []
+
+
+def test_partially_consumed_drain_does_not_replay_events():
+    client = FakeClient()
+    manager = make_manager(client, enable_events=True)
+    request = ReqContext("request")
+    for index in range(2):
+        assert manager.prepare_store([make_key(index)], request) is not None
+        manager.complete_store([make_key(index)], request)
+
+    events = iter(manager.take_events())
+    assert next(events).keys == [make_key(0)]
+    assert list(manager.take_events()) == []

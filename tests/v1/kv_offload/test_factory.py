@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for native offloading specs and their factory."""
 
+import mmap
 import os
 import uuid
 from typing import Any
@@ -17,6 +18,8 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
+    OffloadKey,
+    ReqContext,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingGroupConfig,
@@ -25,6 +28,7 @@ from vllm.v1.kv_offload.cpu.common import CPUOffloadingInfo
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+from vllm.v1.kv_offload.service.spec import RustServiceOffloadingSpec
 from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
@@ -967,3 +971,46 @@ def test_tiering_spec_rejects_secondary_tiers_across_nodes(
     # them every group is queried, even after one spans nodes, since each
     # query is a collective that the group's other ranks also join.
     assert sorted(queried) == (["pcp", "pp", "tp"] if secondary_tiers else [])
+
+
+def test_rust_spec_accepts_kv_cache_events_and_publishes_the_geometry(monkeypatch):
+    """The backend publishes store events instead of refusing to start."""
+    from dataclasses import replace
+
+    page = mmap.PAGESIZE
+    spec = RustServiceOffloadingSpec(
+        replace(
+            make_offloading_config(
+                cpu_bytes_to_use=2 * page,
+                worker_kv_bytes_per_block=64,
+                world_size=2,
+                extra_config={"service_socket": "/tmp/cache.sock"},
+            ),
+            enable_kv_cache_events=True,
+        )
+    )
+    assert isinstance(spec, RustServiceOffloadingSpec)
+
+    key = OffloadKey(b"stored")
+    evicted = OffloadKey(b"evicted")
+    client = MagicMock()
+    client.call.return_value = {
+        "ok": True,
+        "keys": [key.hex()],
+        "slots": [0],
+        "evicted": [evicted.hex()],
+    }
+    monkeypatch.setattr(spec, "_client", lambda: client)
+    manager = spec.get_manager()
+
+    (info,) = manager.config_info()
+    assert info == spec.cpu_info.as_config_info()
+    assert info["cpu_num_chunks"] == spec.num_chunks == 2
+    assert info["cpu_blocks_per_chunk"] == spec.blocks_per_chunk == 1
+    assert info["cpu_kv_cache_size_bytes"] == 2 * page
+    assert info["cpu_kv_cache_size_tokens"] == 32
+
+    assert manager.prepare_store([key], ReqContext("request")) is not None
+    [event] = manager.take_events()
+    assert event.keys == [evicted]
+    assert event.removed

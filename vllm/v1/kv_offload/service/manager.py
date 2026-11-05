@@ -3,26 +3,37 @@
 """Scheduler adapter for Rust-owned cache keys and reservations."""
 
 import hashlib
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
+    ConfigInfoMapping,
     LookupResult,
+    Medium,
+    OffloadingEvent,
     OffloadingManager,
     OffloadKey,
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
 )
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.common import (
+    CPULoadStoreSpec,
+    CPUOffloadingInfo,
+    CPUOffloadingMetrics,
+)
 from vllm.v1.kv_offload.service.client import (
     MAX_KEYS,
     CacheServiceClient,
     CacheServiceError,
     CacheServiceUnavailable,
 )
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 logger = init_logger(__name__)
 
@@ -84,15 +95,33 @@ class ServiceOffloadingManager(OffloadingManager):
     raises instead, since a lookup that could not reach the service missed
     first. A reply that breaks the slot contract is a service bug rather than a
     transport failure, so it raises `CacheServiceError` instead of degrading.
+
+    `get_stats()` reports the CPU-tier metrics from one `stats` RPC per
+    collection, `config_info()` the chunk geometry the spec negotiated with the
+    service, and `take_events()` the store and eviction events its own store
+    calls produced once KV cache events are enabled.
     """
 
-    def __init__(self, client: CacheServiceClient, num_chunks: int):
+    def __init__(
+        self,
+        client: CacheServiceClient,
+        num_chunks: int,
+        info: CPUOffloadingInfo | None = None,
+        enable_events: bool = False,
+    ):
         self.client = client
         self.num_chunks = num_chunks
+        # Static labels the connector publishes; empty when the spec gave none.
+        self._config_info: ConfigInfoMapping = (
+            info.as_config_info() if info is not None else {}
+        )
         # Keyed by the wire id, so the map lives exactly as long as the request.
         self._requests: dict[str, _RequestLeases] = {}
         self._reset_pending = False
         self._degraded = False
+        # Chunks each store call asked the service for since the last drain.
+        self._allocation_sizes: list[int] = []
+        self._events: list[OffloadingEvent] | None = [] if enable_events else None
 
     @staticmethod
     def _wire_id(req_id: str) -> str:
@@ -207,6 +236,7 @@ class ServiceOffloadingManager(OffloadingManager):
         slots: list[int] = []
         evicted: list[OffloadKey] = []
         for batch in _batches(self._encode(keys)):
+            self._allocation_sizes.append(len(batch))
             response = self._call_or_degrade("store", keys=batch, request=request)
             if response is None or response.get("full"):
                 break
@@ -220,6 +250,16 @@ class ServiceOffloadingManager(OffloadingManager):
             evicted += [OffloadKey(bytes.fromhex(key)) for key in response["evicted"]]
         if not stored:
             return None
+        if self._events is not None and evicted:
+            # This store made room, so the removal is one this manager caused.
+            self._events.append(
+                OffloadingEvent(
+                    keys=evicted,
+                    medium=Medium.CPU,
+                    removed=True,
+                    removal_expected=True,
+                )
+            )
         state = self._request_state(request)
         state.stores += 1
         state.reserved.update(key.hex() for key in stored)
@@ -248,6 +288,27 @@ class ServiceOffloadingManager(OffloadingManager):
                 return
         state.stores -= 1
         state.reserved.difference_update(encoded)
+        if self._events is not None and keys:
+            if success:
+                self._events.append(
+                    OffloadingEvent(
+                        keys=list(keys),
+                        medium=Medium.CPU,
+                        removed=False,
+                        removal_expected=True,
+                        req_context=req_context,
+                    )
+                )
+            else:
+                # The service released the metadata of a store that failed.
+                self._events.append(
+                    OffloadingEvent(
+                        keys=list(keys),
+                        medium=Medium.CPU,
+                        removed=True,
+                        metadata_only=True,
+                    )
+                )
         self._maybe_release(request)
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
@@ -307,6 +368,55 @@ class ServiceOffloadingManager(OffloadingManager):
             self._call_or_degrade(op, **fields)
         except CacheServiceError as error:
             self._degrade(op, error)
+
+    def get_load_source(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> CacheHitSource:
+        return CacheHitSource.HOST
+
+    def config_info(self) -> Sequence[ConfigInfoMapping]:
+        """Reports the chunk geometry the spec negotiated with the service."""
+        return [self._config_info]
+
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        """Reports the CPU-tier metrics from one `stats` RPC per collection."""
+        allocation_sizes, self._allocation_sizes = self._allocation_sizes, []
+        try:
+            response = self._call_or_degrade("stats")
+        except CacheServiceError as error:
+            # Metrics never fail a scheduler step, and a namespace the service
+            # dropped cannot report them.
+            self._degrade("stats", error)
+            return None
+        if response is None:
+            return None
+        counters = response["stats"]
+        stats = OffloadingConnectorStats()
+        usage = counters["entries"] / self.num_chunks if self.num_chunks else 0.0
+        write_usage = counters["pending"] / self.num_chunks if self.num_chunks else 0.0
+        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
+        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC, write_usage)
+        stats.set_gauge(
+            CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC,
+            max(usage - write_usage, 0.0),
+        )
+        for allocation_size in allocation_sizes:
+            stats.observe_histogram(
+                CPUOffloadingMetrics.CPU_ALLOCATION_SIZE, allocation_size
+            )
+        # No declared metric carries the service's own counters, so they reach
+        # the operator through the log instead of an invented metric name.
+        logger.debug("KV cache service namespace counters: %s", counters)
+        return stats
+
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        """Drains the store and eviction events collected since the last call."""
+        if self._events is None:
+            return
+        # Detach the batch up front so a partially consumed drain cannot replay
+        # a key a retry has since re-stored.
+        events, self._events = self._events, []
+        yield from events
 
     def shutdown(self) -> None:
         self.client.close()

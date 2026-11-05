@@ -80,7 +80,15 @@ a lease) plus counters that are monotonic since the namespace opened and survive
 `reset`: `hits`, `misses`, `pending_hits`, `evictions`, `stores`, `commits`,
 `aborted`, `reclaimed` in keys, and the rejected or failed `commit` calls in
 `failed_commits`. A leaked lease or reservation shows up there instead of only as
-a stalled cache.
+a stalled cache. `stats` reads no slot beyond the reservation and lease flags it
+counts.
+
+`info` needs no handshake and reports the service rather than one namespace:
+`version`, `pid`, `uptime_ms`, `capacity_bytes`, `used_bytes` (live plus retired
+mappings), `retired_bytes`, `namespaces` (live ones), `sessions` (live and
+retired), and `max_connections`. A probe or an operator can call it before any
+engine opened a namespace; like every other command it still requires a same-UID
+peer.
 
 A `reset` refuses a cache with a pending reservation or a lease. `reset` with
 `"force": true` instead drops every lease and reservation, clears the slots, and
@@ -211,8 +219,8 @@ when enabled, and model output is unaffected.
 - Linux, trusted same-UID local clients, single-node TP-only.
 - Complete physical packed rows, including DeepSeek MLA/indexer bytes and padding.
 - Existing model replay for non-cacheable compressor and bounded-replay state.
-- No secondary tiers, persistent cache, cross-engine cache reuse, KV events,
-  context parallelism, pipeline parallelism, or shared-copy TP deduplication.
+- No secondary tiers, persistent cache, cross-engine cache reuse, context
+  parallelism, pipeline parallelism, or shared-copy TP deduplication.
 - Bounded synchronous control RPCs are a correctness-first MVP. Batch/pipelined
   lookups, background liveness checks and CUDA-IPC service-side DMA are future work.
 - A `store` batch whose reply cannot fit in one 1 MiB frame is rejected with

@@ -471,6 +471,31 @@ fn store_batch_that_cannot_be_answered_reserves_no_slot() {
 }
 
 #[test]
+fn info_reports_service_capacity_without_a_handshake() {
+    let service = Service::start();
+    let mut client = service.connect();
+
+    let info = client.call(json!({"op": "info"}));
+    assert_eq!(info["ok"], true);
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(info["capacity_bytes"].as_u64(), Some(CAPACITY as u64));
+    assert_eq!(info["used_bytes"].as_u64(), Some(0));
+    assert_eq!(info["retired_bytes"].as_u64(), Some(0));
+    assert_eq!(info["namespaces"].as_u64(), Some(0));
+    assert_eq!(info["sessions"].as_u64(), Some(0));
+    assert_eq!(info["max_connections"].as_u64(), Some(128));
+    assert!(info["pid"].as_u64().is_some_and(|pid| pid > 0));
+
+    // An open namespace is charged to the service, and its session is counted.
+    let opened = open(&mut client, "engine-info");
+    assert_eq!(opened["ok"], true);
+    let info = client.call(json!({"op": "info"}));
+    assert_eq!(info["used_bytes"], opened["total_bytes"]);
+    assert_eq!(info["namespaces"].as_u64(), Some(1));
+    assert_eq!(info["sessions"].as_u64(), Some(1));
+}
+
+#[test]
 fn starts_after_reclaiming_a_stale_socket() {
     let first = Service::start();
     let dir = first.kill_hard();

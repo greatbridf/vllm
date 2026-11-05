@@ -9,6 +9,7 @@ from dataclasses import asdict, replace
 
 from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
 from vllm.v1.kv_offload.config import OffloadingConfig
+from vllm.v1.kv_offload.cpu.common import CPUOffloadingInfo
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.service.client import CacheServiceClient
@@ -32,8 +33,6 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
             raise ValueError("Rust cache service initially supports only LRU eviction")
         if config.extra_config.get("store_threshold", 0) >= 2:
             raise ValueError("Rust cache service does not support store filtering")
-        if config.enable_kv_cache_events:
-            raise ValueError("Rust cache service does not yet publish KV cache events")
         if config.extra_config.get("canonical_layout"):
             raise ValueError("Rust cache service does not support canonical_layout")
         # The service owns one copy per worker, without replicated-rank dedup.
@@ -61,6 +60,11 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
             raise ValueError(
                 "CPU budget must fit at least one chunk and int32 slot IDs"
             )
+        # The inherited info was built before the overrides above, so rebuild it
+        # from the geometry the service is asked to allocate.
+        self.cpu_info = CPUOffloadingInfo.from_config(
+            self.config, self.num_chunks, self.kv_bytes_per_chunk
+        )
         self.fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -94,7 +98,12 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
             except Exception:
                 client.close()
                 raise
-            self._manager = ServiceOffloadingManager(client, self.num_chunks)
+            self._manager = ServiceOffloadingManager(
+                client,
+                self.num_chunks,
+                info=self.cpu_info,
+                enable_events=self.kv_events_config.enable_kv_cache_events,
+            )
         return self._manager
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
