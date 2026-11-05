@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-mod cache;
-mod protocol;
-
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -15,9 +12,9 @@ use std::thread;
 
 use clap::Parser;
 use serde_json::{Value, json};
-
-use cache::{Cache, check_keys, check_request};
-use protocol::Request;
+use vllm_kv_cache_service::cache::{Cache, check_keys, check_request};
+use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
+use vllm_kv_cache_service::protocol::{self, Request};
 
 #[derive(Parser)]
 struct Args {
@@ -27,12 +24,22 @@ struct Args {
     /// Aggregate upper bound on bytes allocated across cache namespaces.
     #[arg(long)]
     capacity_bytes: usize,
+    /// Attach the rswap digest BPF program through sysfs; disabled by default.
+    /// Defaults to /sys/kernel/mm/xswap/rswap_attach when no path is given.
+    #[arg(
+        long,
+        visible_alias = "hash-attach",
+        num_args = 0..=1,
+        default_missing_value = "/sys/kernel/mm/xswap/rswap_attach"
+    )]
+    rswap_attach: Option<PathBuf>,
 }
 
 struct State {
     caches: HashMap<String, Cache>,
     retired: Vec<Cache>,
     budget: usize,
+    rswap_attach: Option<PathBuf>,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -85,13 +92,18 @@ fn handle(
                 .chain(state.retired.iter())
                 .map(|cache| cache.mapping.len())
                 .sum();
-            let cache = Cache::new(
+            let remaining = state.budget.saturating_sub(used);
+            let factory = state.rswap_attach.as_ref().map(|path| RswapConfig {
+                attach_path: path.clone(),
+            });
+            let cache = Cache::with_hashes(
                 session,
                 fingerprint,
                 worker_bytes,
                 world_size,
                 num_chunks,
-                state.budget.saturating_sub(used),
+                remaining,
+                factory.as_ref().map(|factory| factory as &dyn HashFactory),
             )?;
             protocol::write_response(stream, &geometry(&cache))?;
             state.caches.insert(name.clone(), cache);
@@ -157,7 +169,12 @@ fn handle(
                     check_keys(&keys)?;
                     match cache.store(&keys) {
                         Some((keys, slots, evicted)) => {
-                            json!({"ok": true, "keys": keys, "slots": slots, "evicted": evicted})
+                            json!({
+                                "ok": true,
+                                "keys": keys,
+                                "slots": slots,
+                                "evicted": evicted
+                            })
                         }
                         None => json!({"ok": true, "full": true}),
                     }
@@ -206,6 +223,7 @@ fn serve(mut stream: UnixStream, state: Arc<Mutex<State>>, session: u64) {
         if state.caches.get(&name).is_some_and(|cache| cache.sessions.contains(&session))
             && let Some(mut cache) = state.caches.remove(&name)
         {
+            cache.invalidate_hashes();
             cache.sessions.remove(&session);
             if !cache.sessions.is_empty() {
                 state.retired.push(cache);
@@ -213,6 +231,7 @@ fn serve(mut stream: UnixStream, state: Arc<Mutex<State>>, session: u64) {
         }
         for cache in &mut state.retired {
             cache.sessions.remove(&session);
+            cache.invalidate_hashes();
         }
         state.retired.retain(|cache| !cache.sessions.is_empty());
     }
@@ -256,6 +275,7 @@ fn main() -> io::Result<()> {
         caches: HashMap::new(),
         retired: Vec::new(),
         budget: args.capacity_bytes,
+        rswap_attach: args.rswap_attach,
     }));
     let mut session = 0u64;
     for connection in listener.incoming() {
@@ -268,4 +288,30 @@ fn main() -> io::Result<()> {
         thread::spawn(move || serve(stream, state, session));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn rswap_attach_defaults_to_sysfs_path() {
+        let args = Args::try_parse_from([
+            "vllm-kv-cache-service",
+            "--socket",
+            "/tmp/cache.sock",
+            "--capacity-bytes",
+            "4096",
+            "--rswap-attach",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.rswap_attach.as_deref(),
+            Some(Path::new("/sys/kernel/mm/xswap/rswap_attach"))
+        );
+    }
 }

@@ -79,7 +79,7 @@ pub fn write_response(stream: &mut UnixStream, response: &Value) -> io::Result<(
 }
 
 pub fn send_fd(stream: &UnixStream, fd: BorrowedFd<'_>) -> io::Result<()> {
-    let mut marker = [b'F'];
+    let mut marker = *b"F";
     let mut iov = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: 1,

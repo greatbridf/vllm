@@ -9,6 +9,7 @@ use std::os::fd::FromRawFd;
 use indexmap::IndexMap;
 use memmap2::{MmapMut, MmapOptions};
 
+use crate::hash::{HashFactory, HashGeometry, PageHashes};
 use crate::protocol::MAX_KEYS;
 
 pub struct Entry {
@@ -30,7 +31,11 @@ pub struct Cache {
     pub sessions: HashSet<u64>,
     entries: IndexMap<String, Entry>,
     free: Vec<usize>,
+    hashes: Option<Box<dyn PageHashes>>,
 }
+
+/// Keys, slots, and evicted keys returned by `Cache::store`.
+pub type StorePlan = (Vec<String>, Vec<usize>, Vec<String>);
 
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
@@ -67,6 +72,26 @@ impl Cache {
         num_chunks: usize,
         budget: usize,
     ) -> io::Result<Self> {
+        Self::with_hashes(
+            owner,
+            fingerprint,
+            worker_bytes,
+            world_size,
+            num_chunks,
+            budget,
+            None,
+        )
+    }
+
+    pub fn with_hashes(
+        owner: u64,
+        fingerprint: String,
+        worker_bytes: usize,
+        world_size: usize,
+        num_chunks: usize,
+        budget: usize,
+        factory: Option<&dyn HashFactory>,
+    ) -> io::Result<Self> {
         if worker_bytes == 0 || world_size == 0 || world_size > 64 || num_chunks == 0 {
             return Err(invalid("invalid cache geometry"));
         }
@@ -86,10 +111,9 @@ impl Cache {
             .filter(|size| *size <= budget && *size <= isize::MAX as usize)
             .ok_or_else(|| invalid("cache exceeds service capacity"))?;
         let name = CString::new("vllm-kv-cache").expect("literal contains no NUL");
+        let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
         // SAFETY: name is NUL-terminated; the returned descriptor is owned below.
-        let fd = unsafe {
-            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
-        };
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -111,6 +135,21 @@ impl Cache {
         // SAFETY: the sealed file length covers the mapping. The service never
         // reads/writes these bytes; leased workers access disjoint rank slices.
         let mapping = unsafe { MmapOptions::new().len(size).map_mut(&file)? };
+        let hashes = if let Some(factory) = factory {
+            let pages_per_chunk =
+                row_bytes.checked_div(page).ok_or_else(|| invalid("cache geometry overflow"))?;
+            let num_entries = num_chunks
+                .checked_mul(pages_per_chunk)
+                .ok_or_else(|| invalid("cache geometry overflow"))?;
+            Some(factory.open(HashGeometry {
+                data_base_va: mapping.as_ptr() as u64,
+                page_size: page,
+                num_entries,
+                pages_per_chunk,
+            })?)
+        } else {
+            None
+        };
         Ok(Self {
             owner,
             fingerprint,
@@ -124,7 +163,15 @@ impl Cache {
             sessions: HashSet::from([owner]),
             entries: IndexMap::new(),
             free: (0..num_chunks).rev().collect(),
+            hashes,
         })
+    }
+
+    /// Clears all published per-page hashes.
+    pub fn invalidate_hashes(&mut self) {
+        if let Some(hashes) = &mut self.hashes {
+            hashes.reset();
+        }
     }
 
     pub fn lookup(&mut self, key: &str, request: &str) -> &'static str {
@@ -173,13 +220,16 @@ impl Cache {
         }
     }
 
-    pub fn store(&mut self, keys: &[String]) -> Option<(Vec<String>, Vec<usize>, Vec<String>)> {
+    pub fn store(&mut self, keys: &[String]) -> Option<StorePlan> {
         let missing: Vec<_> =
             keys.iter().filter(|key| !self.entries.contains_key(*key)).cloned().collect();
         let victims: Vec<_> = self
             .entries
             .iter()
-            .filter(|(key, entry)| entry.ready && entry.readers.is_empty() && !keys.contains(key))
+            .filter(|(key, entry)| {
+                let retained = keys.contains(key);
+                entry.ready && entry.readers.is_empty() && !retained
+            })
             .map(|(key, _)| key.clone())
             .take(missing.len().saturating_sub(self.free.len()))
             .collect();
@@ -188,6 +238,9 @@ impl Cache {
         }
         for victim in &victims {
             let entry = self.entries.shift_remove(victim).expect("selected entry");
+            if let Some(hashes) = &mut self.hashes {
+                hashes.clear(entry.slot);
+            }
             self.free.push(entry.slot);
         }
         let mut slots = Vec::with_capacity(missing.len());
@@ -210,10 +263,29 @@ impl Cache {
         if keys.iter().any(|key| self.entries.get(key).is_none_or(|entry| entry.ready)) {
             return Err(invalid("commit requires pending reservations"));
         }
-        for key in keys {
-            if success {
+        let slots: Vec<usize> =
+            keys.iter().map(|key| self.entries.get(key).expect("validated").slot).collect();
+        if success {
+            // Publish before any entry becomes ready: a failed publish leaves
+            // every reservation pending and the caller fails closed.
+            if let Some(hashes) = &mut self.hashes {
+                for (key, &slot) in keys.iter().zip(&slots) {
+                    if let Err(error) = hashes.publish(slot, key) {
+                        for &slot in &slots {
+                            hashes.clear(slot);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            for key in keys {
                 self.entries.get_mut(key).expect("validated").ready = true;
-            } else {
+            }
+        } else {
+            for (key, &slot) in keys.iter().zip(&slots) {
+                if let Some(hashes) = &mut self.hashes {
+                    hashes.clear(slot);
+                }
                 let entry = self.entries.shift_remove(key).expect("validated");
                 self.free.push(entry.slot);
             }
@@ -226,6 +298,9 @@ impl Cache {
             return Err(invalid(
                 "cannot reset a cache with active transfers or leases",
             ));
+        }
+        if let Some(hashes) = &mut self.hashes {
+            hashes.reset();
         }
         self.entries.clear();
         self.free = (0..self.num_chunks).rev().collect();
@@ -248,9 +323,61 @@ impl Cache {
     }
 }
 
+impl Drop for Cache {
+    fn drop(&mut self) {
+        self.invalidate_hashes();
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Op {
+        Publish(usize, String),
+        Clear(usize),
+        Reset,
+    }
+
+    struct RecordingFactory {
+        ops: Arc<Mutex<Vec<Op>>>,
+        fail_publish: bool,
+    }
+
+    impl HashFactory for RecordingFactory {
+        fn open(&self, _geometry: HashGeometry) -> io::Result<Box<dyn PageHashes>> {
+            Ok(Box::new(RecordingHashes {
+                ops: Arc::clone(&self.ops),
+                fail_publish: self.fail_publish,
+            }))
+        }
+    }
+
+    struct RecordingHashes {
+        ops: Arc<Mutex<Vec<Op>>>,
+        fail_publish: bool,
+    }
+
+    impl PageHashes for RecordingHashes {
+        fn publish(&mut self, slot: usize, key: &str) -> io::Result<()> {
+            self.ops.lock().unwrap().push(Op::Publish(slot, key.to_owned()));
+            if self.fail_publish {
+                return Err(io::Error::other("publish failed"));
+            }
+            Ok(())
+        }
+
+        fn clear(&mut self, slot: usize) {
+            self.ops.lock().unwrap().push(Op::Clear(slot));
+        }
+
+        fn reset(&mut self) {
+            self.ops.lock().unwrap().push(Op::Reset);
+        }
+    }
 
     fn cache() -> Cache {
         Cache::new(1, "test".into(), 64, 1, 2, 2 * 1024 * 1024).unwrap()
@@ -258,6 +385,29 @@ mod tests {
 
     fn keys(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).into()).collect()
+    }
+
+    fn recording_cache(fail_publish: bool) -> (Cache, Arc<Mutex<Vec<Op>>>) {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let factory = RecordingFactory {
+            ops: Arc::clone(&ops),
+            fail_publish,
+        };
+        let cache = Cache::with_hashes(
+            1,
+            "test".into(),
+            64,
+            1,
+            2,
+            2 * 1024 * 1024,
+            Some(&factory as &dyn HashFactory),
+        )
+        .unwrap();
+        (cache, ops)
+    }
+
+    fn recorded(ops: &Arc<Mutex<Vec<Op>>>) -> Vec<Op> {
+        ops.lock().unwrap().clone()
     }
 
     #[test]
@@ -302,5 +452,105 @@ mod tests {
         assert!(Cache::new(1, "test".into(), usize::MAX, 2, 1, 8192).is_err());
         assert!(check_keys(&keys(&["aa", "aa"])).is_err());
         assert!(check_keys(&keys(&["not-hex"])).is_err());
+    }
+
+    #[test]
+    fn default_cache_stats_have_no_hash_keys() {
+        let stats = cache().stats();
+        assert!(!stats.contains_key("hash_entries"));
+        assert!(!stats.contains_key("hash_ready"));
+        assert!(!stats.contains_key("metadata_entries"));
+        assert!(!stats.contains_key("metadata_ready"));
+    }
+
+    #[test]
+    fn store_does_not_publish_and_commit_publishes_once() {
+        let (mut cache, ops) = recording_cache(false);
+        let first = keys(&["aa"]);
+        cache.store(&first).unwrap();
+        assert!(recorded(&ops).is_empty());
+        let slot = cache.entries.get("aa").unwrap().slot;
+        assert!(!cache.entries.get("aa").unwrap().ready);
+        cache.commit(&first, true).unwrap();
+        assert_eq!(recorded(&ops), vec![Op::Publish(slot, "aa".into())]);
+        assert!(cache.entries.get("aa").unwrap().ready);
+    }
+
+    #[test]
+    fn failed_publish_keeps_entry_pending_and_returns_error() {
+        let (mut cache, ops) = recording_cache(true);
+        let first = keys(&["aa"]);
+        cache.store(&first).unwrap();
+        let slot = cache.entries.get("aa").unwrap().slot;
+        let error = cache.commit(&first, true).unwrap_err();
+        assert!(error.to_string().contains("publish failed"));
+        assert_eq!(
+            recorded(&ops),
+            vec![Op::Publish(slot, "aa".into()), Op::Clear(slot)]
+        );
+        assert!(!cache.entries.get("aa").unwrap().ready);
+        assert_eq!(cache.lookup("aa", "r"), "pending");
+    }
+
+    #[test]
+    fn failed_publish_clears_every_slot_in_the_batch() {
+        let (mut cache, ops) = recording_cache(true);
+        let first = keys(&["aa", "bb"]);
+        cache.store(&first).unwrap();
+        let slots: Vec<_> = first.iter().map(|key| cache.entries.get(key).unwrap().slot).collect();
+        assert!(cache.commit(&first, true).is_err());
+        assert_eq!(
+            recorded(&ops),
+            vec![
+                Op::Publish(slots[0], "aa".into()),
+                Op::Clear(slots[0]),
+                Op::Clear(slots[1]),
+            ]
+        );
+        assert!(first.iter().all(|key| !cache.entries.get(key).unwrap().ready));
+    }
+
+    #[test]
+    fn failed_commit_and_eviction_clear_before_releasing_slots() {
+        let (mut cache, ops) = recording_cache(false);
+        let first = keys(&["aa"]);
+        cache.store(&first).unwrap();
+        cache.commit(&first, false).unwrap();
+        assert_eq!(recorded(&ops), vec![Op::Clear(0)]);
+
+        let both = keys(&["aa", "bb"]);
+        cache.store(&both).unwrap();
+        cache.commit(&both, true).unwrap();
+        let victim_slot = cache.entries.get("aa").unwrap().slot;
+        ops.lock().unwrap().clear();
+        let (_, _, evicted) = cache.store(&keys(&["cc"])).unwrap();
+        assert_eq!(evicted, keys(&["aa"]));
+        assert_eq!(recorded(&ops), vec![Op::Clear(victim_slot)]);
+    }
+
+    #[test]
+    fn reset_and_invalidate_hashes_call_reset() {
+        let (mut cache, ops) = recording_cache(false);
+        let first = keys(&["aa"]);
+        cache.store(&first).unwrap();
+        cache.commit(&first, true).unwrap();
+        ops.lock().unwrap().clear();
+        cache.reset().unwrap();
+        cache.invalidate_hashes();
+        assert_eq!(recorded(&ops), vec![Op::Reset, Op::Reset]);
+    }
+
+    #[test]
+    fn touch_lookup_and_load_do_not_publish_hashes() {
+        let (mut cache, ops) = recording_cache(false);
+        let first = keys(&["aa"]);
+        cache.store(&first).unwrap();
+        cache.commit(&first, true).unwrap();
+        let before = recorded(&ops);
+        let slot = cache.entries.get("aa").unwrap().slot;
+        assert_eq!(cache.lookup("aa", "r"), "hit");
+        assert_eq!(cache.load(&keys(&["aa"]), "r").unwrap(), vec![slot]);
+        cache.touch(&first);
+        assert_eq!(recorded(&ops), before);
     }
 }

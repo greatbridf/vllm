@@ -106,8 +106,28 @@ vLLM workers map its shared-memory descriptors and execute GPU copies.
 This differs from `offload_region: "mmap"`, which allocates memory inside workers.
 
 See the [Rust cache service guide](../../rust/src/kv-cache-service/README.md)
-for startup commands, DeepSeek-V4.1-Flash configuration, supported scope, and
-CPU/GPU validation commands.
+for startup commands, DeepSeek-V4.1-Flash configuration, supported scope,
+CPU/GPU validation commands, and hash reporting details.
+
+Hash reporting is optional and off by default. Pass `--rswap-attach` (or
+`--hash-attach`), optionally with a sysfs path that defaults to
+`/sys/kernel/mm/xswap/rswap_attach`, to the service. It requires an
+rswap-capable kernel (`CONFIG_RSWAP`) and `BPF_PROG_TYPE_SYSCALL` support. The
+service loads `bpf/rswap_hash.bpf.c` with CAP_BPF and attaches it to the memfd
+VMA with CAP_SYS_ADMIN by writing `"<vaddr-hex> <prog-fd>"` to the sysfs path.
+The program receives
+`{vaddr, hash[48]}` and returns non-zero only when it has a digest; the 48-byte
+hash is 36 canonical chunk-key bytes, a 4-byte key length whose high bit marks
+malformed input, and an 8-byte chunk-relative page offset in pages. The service
+keeps one `BPF_MAP_TYPE_ARENA` per namespace with a header page and one
+64-byte entry per base page (a single ready flag, the hash, and the page
+index); the program reads that arena directly with `BPF_F_ARENA_SCALAR` and
+makes no helper calls. The kernel copies the hash into the swap cluster before
+the mapping disappears, and the program runs under the page table lock. The
+service detaches on namespace disconnect. Attachment is per-VMA in the writing
+task's mm: each process that maps the memfd needs its own attachment, and
+workers are a TODO. This changes no wire responses, geometry fields, worker
+mappings, or model output.
 
 ## Anonymous DRAM Offload (`offload_region: "mmap"`)
 

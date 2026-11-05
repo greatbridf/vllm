@@ -15,6 +15,11 @@ rust/target/debug/vllm-kv-cache-service \
   --capacity-bytes 68719476736
 ```
 
+Hash reporting is disabled by default; add `--rswap-attach` (or the visible
+alias `--hash-attach`) to the command above to enable it. The flag accepts an
+optional sysfs path and defaults to
+`/sys/kernel/mm/xswap/rswap_attach`.
+
 An existing socket is not overwritten. After stopping the service, remove its
 stale socket before restarting. Use a private directory owned by the service
 user; only same-UID clients are accepted.
@@ -56,6 +61,53 @@ Disconnecting any attached client invalidates the namespace. Old mappings are
 never reused by a new namespace, and remain charged to capacity while attached
 clients retain their sessions. Service errors fail the connector closed; this
 version does not reconnect or silently treat a failed receive as a hit.
+
+## Hash reporting
+
+Hash reporting is optional and off by default. Pass `--rswap-attach` (or
+`--hash-attach`), optionally with a sysfs path that defaults to
+`/sys/kernel/mm/xswap/rswap_attach`, to enable it. It requires an
+rswap-capable kernel (`CONFIG_RSWAP`) with `BPF_PROG_TYPE_SYSCALL` support.
+Cargo builds `bpf/rswap_hash.bpf.c` with clang when available; without clang,
+`--rswap-attach` is unavailable at runtime.
+
+At namespace open, the service loads the embedded BPF object with CAP_BPF and
+attaches it to the memfd VMA with CAP_SYS_ADMIN by writing
+`"<vaddr-hex> <prog-fd>"` to the sysfs path, for example:
+
+```bash
+echo "<vaddr-hex> <prog-fd>" > /sys/kernel/mm/xswap/rswap_attach
+```
+
+The program receives `{vaddr, hash[48]}` and returns non-zero only when it has
+a digest; the kernel copies the 48-byte hash into the swap cluster before the
+mapping disappears. The program runs under the page table lock, so it must not
+sleep or fault, and it calls no helpers: it reads arena memory directly.
+
+The service owns one `BPF_MAP_TYPE_ARENA` per namespace, mapped at a
+4 GiB-aligned VA. Arena page 0 holds the geometry header and each following 64-byte
+entry describes one base page: a single `AtomicBool` ready flag, the 48-byte
+hash, and the absolute page index. Userspace publishes by writing the hash
+while the flag is false and then storing the flag with `Release`; the program
+acquires `BPF_F_ARENA_SCALAR`, so the arena address is a scalar and its loads
+are rewritten to `BPF_PROBE_MEM32` arena accesses. The arena VA is baked into
+the program at load time, and the arena fd is bound through `fd_array`.
+
+This is the same layout and publication protocol the eBPF arena POC uses. Only
+touched entries fault arena pages in, so arena memory grows with published
+pages. The 48-byte hash is a 36-byte canonical chunk key, a 4-byte
+little-endian original key length whose high bit marks malformed public input,
+and an 8-byte little-endian chunk-relative page offset in pages at the end.
+Shorter keys are zero-padded to 36 bytes and longer keys use a SHA-256
+fingerprint; the length field disambiguates them. Publishing happens on
+successful commit; failed commits, evictions, resets, and namespace disconnect
+clear the ready flags. Namespace disconnect writes `"<vaddr-hex> 0"` to
+detach.
+
+Attachment is per-VMA in the writing task's mm: each process that maps the
+memfd needs its own attachment, and workers are a TODO. This metadata-only
+option changes no wire responses, geometry fields, or worker mappings, even
+when enabled, and model output is unaffected.
 
 ## Scope
 
