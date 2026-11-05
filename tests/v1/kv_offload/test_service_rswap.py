@@ -39,7 +39,8 @@ from vllm.v1.kv_offload.service.spec import RustServiceOffloadingSpec
 
 PAGE = mmap.PAGESIZE
 PAGES_PER_CHUNK = 4
-CHUNKS = 8
+# Raise VLLM_TEST_KV_SERVICE_RSWAP_CHUNKS for a larger cache footprint.
+CHUNKS = int(os.environ.get("VLLM_TEST_KV_SERVICE_RSWAP_CHUNKS", "8"))
 CACHE_BYTES = CHUNKS * PAGES_PER_CHUNK * PAGE
 # Above the default xswap priority so this test's pages land on its own device.
 DEVICE_PRIORITY = 32767

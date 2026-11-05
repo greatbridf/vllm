@@ -136,6 +136,11 @@ reloads unchanged. It needs root and an idle swap setup, so it is opt-in:
 ```bash
 sudo VLLM_TEST_KV_SERVICE_RSWAP=1 .venv/bin/python -m pytest \
   --confcutdir=tests/v1/kv_offload tests/v1/kv_offload/test_service_rswap.py -v
+
+# Larger footprint (chunks x 4 pages of the host page size):
+sudo VLLM_TEST_KV_SERVICE_RSWAP=1 VLLM_TEST_KV_SERVICE_RSWAP_CHUNKS=256 \
+  .venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
+  tests/v1/kv_offload/test_service_rswap.py -v
 ```
 
 With the service running and CUDA model weights available:
