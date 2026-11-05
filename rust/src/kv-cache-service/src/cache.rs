@@ -11,7 +11,7 @@ use memmap2::{MmapMut, MmapOptions};
 use serde::Serialize;
 
 use crate::hash::{HashFactory, HashGeometry, PageHashes};
-use crate::protocol::MAX_KEYS;
+use crate::protocol::{MAX_KEYS, store_reply_fits};
 
 /// Absent slot, at either end of the LRU order. Chunk ids stay below it.
 const NO_SLOT: u32 = u32::MAX;
@@ -228,6 +228,15 @@ impl LeaseIndex {
 
 /// Keys, slots, and evicted keys returned by `Cache::store`.
 pub type StorePlan = (Vec<String>, Vec<usize>, Vec<String>);
+
+/// Why `Cache::store` reserved nothing for a batch.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StoreRejection {
+    /// No chunk could be freed: every one is leased, reserved, or in the batch.
+    Full,
+    /// The reply that echoes the reserved and evicted keys exceeds one frame.
+    Unanswerable,
+}
 
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
@@ -481,15 +490,29 @@ impl Cache {
         }
     }
 
-    pub fn store(&mut self, keys: &[String], request: &str) -> Option<StorePlan> {
+    /// Reserves a slot for every key the cache does not already hold, evicting
+    /// the least recently used chunks that make room.
+    ///
+    /// A cache that cannot make room ([`StoreRejection::Full`]) and a reply that
+    /// would not fit one control frame ([`StoreRejection::Unanswerable`]) both
+    /// leave every slot, key, and counter as they were, so a caller that cannot be
+    /// answered keeps the cache it had.
+    pub fn store(&mut self, keys: &[String], request: &str) -> Result<StorePlan, StoreRejection> {
         let incoming: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let missing: Vec<&str> = keys
             .iter()
             .map(String::as_str)
             .filter(|key| !self.index.contains_key(*key))
             .collect();
-        let victims =
-            self.eviction_victims(missing.len().saturating_sub(self.free.len()), &incoming)?;
+        let needed = missing.len().saturating_sub(self.free.len());
+        let victims = self.eviction_victims(needed, &incoming).ok_or(StoreRejection::Full)?;
+        // The reply echoes the evicted keys too, and they were stored by an
+        // earlier batch, so they may be longer than any key in this one.
+        let echoed: Vec<&str> =
+            victims.iter().map(|slot| &*self.slots[*slot as usize].key).collect();
+        if !store_reply_fits(&missing, &echoed) {
+            return Err(StoreRejection::Unanswerable);
+        }
         let mut evicted = Vec::with_capacity(victims.len());
         for slot in victims {
             let key = self.slots[slot as usize].key.to_string();
@@ -515,7 +538,7 @@ impl Cache {
             slots.push(slot as usize);
         }
         self.counters.stores += slots.len();
-        Some((reserved, slots, evicted))
+        Ok((reserved, slots, evicted))
     }
 
     /// Publishes the reservations `keys` hold for `request`, or aborts them.
@@ -915,9 +938,9 @@ mod tests {
         let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
         assert_eq!(evicted, keys(&["bb"]));
         assert_eq!(cache.load(&keys(&["aa"]), "r").unwrap(), vec![0]);
-        assert!(cache.store(&keys(&["dd"]), "r").is_none());
+        assert_eq!(cache.store(&keys(&["dd"]), "r"), Err(StoreRejection::Full));
         cache.release_request("r");
-        assert!(cache.store(&keys(&["dd"]), "r").is_some());
+        assert!(cache.store(&keys(&["dd"]), "r").is_ok());
     }
 
     #[test]
@@ -936,7 +959,10 @@ mod tests {
         let first = keys(&["aa", "bb"]);
         cache.store(&first, "r").unwrap();
         cache.commit(&first, "r", true).unwrap();
-        assert!(cache.store(&keys(&["aa", "bb", "cc"]), "r").is_none());
+        assert_eq!(
+            cache.store(&keys(&["aa", "bb", "cc"]), "r"),
+            Err(StoreRejection::Full)
+        );
         assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         assert!(cache.reset(false).is_err());
     }
@@ -1175,11 +1201,30 @@ mod tests {
         let first = keys(&["aa", "bb"]);
         cache.store(&first, "r").unwrap();
         assert_eq!(cache.stats()["pending"], 2);
-        assert!(cache.store(&keys(&["cc"]), "r").is_none());
+        assert_eq!(cache.store(&keys(&["cc"]), "r"), Err(StoreRejection::Full));
         cache.commit(&first, "r", false).unwrap();
         assert_eq!(cache.stats()["entries"], 0);
         cache.assert_slot_accounting();
-        assert!(cache.store(&keys(&["cc"]), "r").is_some());
+        assert!(cache.store(&keys(&["cc"]), "r").is_ok());
+    }
+
+    #[test]
+    fn store_that_cannot_echo_its_evictions_reserves_nothing() {
+        // Long stored keys and short incoming ones: only the evicted keys make
+        // the reply exceed one frame, which the incoming batch alone cannot show.
+        let mut cache = Cache::new(1, 64, 1, 2048, 64 * 1024 * 1024).unwrap();
+        let long: Vec<String> = (0..2048).map(|index| format!("{index:0510x}")).collect();
+        for batch in long.chunks(512) {
+            cache.store(batch, "r").unwrap();
+            cache.commit(batch, "r", true).unwrap();
+        }
+        let before = cache.stats();
+        let short: Vec<String> = (0..2048).map(|index| format!("{index:04x}")).collect();
+        assert_eq!(cache.store(&short, "r"), Err(StoreRejection::Unanswerable));
+        // Nothing was evicted or reserved: the caller keeps the cache it had.
+        assert_eq!(cache.stats(), before);
+        cache.assert_slot_accounting();
+        assert_eq!(cache.lookup(&long[0], "r"), Status::Hit);
     }
 
     #[test]
@@ -1234,7 +1279,7 @@ mod tests {
             }
             match random.below(10) {
                 0 => {
-                    if let Some((keys, slots, evicted)) = cache.store(&batch, request) {
+                    if let Ok((keys, slots, evicted)) = cache.store(&batch, request) {
                         assert_eq!(keys.len(), slots.len());
                         assert!(slots.iter().all(|slot| *slot < cache.num_chunks));
                         assert!(evicted.iter().all(|key| !keys.contains(key)));
@@ -1378,7 +1423,7 @@ mod tests {
         assert_eq!(cache.lookup("aa", "r"), Status::Miss);
         assert!(cache.load(&keys(&["aa"]), "r").is_err());
         cache.assert_slot_accounting();
-        assert!(cache.store(&stored, "r").is_some());
+        assert!(cache.store(&stored, "r").is_ok());
     }
 
     #[test]

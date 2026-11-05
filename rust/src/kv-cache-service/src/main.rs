@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde_json::{Value, json};
-use vllm_kv_cache_service::cache::{Cache, Released, check_keys, check_request, namespace_bytes};
+use vllm_kv_cache_service::cache::{
+    Cache, Released, StoreRejection, check_keys, check_request, namespace_bytes,
+};
 use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
 use vllm_kv_cache_service::protocol::{self, Request};
 
@@ -366,13 +368,9 @@ fn handle(
                 Request::Store { keys, request } => {
                     check_keys(&keys).map_err(reject)?;
                     check_request(&request).map_err(reject)?;
-                    // The reply echoes every key; reject before reserving slots.
-                    if !protocol::store_reply_fits(&keys) {
-                        return Err(reject("batch too large for one control frame"));
-                    }
                     reclaim_expired(&mut cache, name, pending_timeout);
                     match cache.store(&keys, &request) {
-                        Some((keys, slots, evicted)) => {
+                        Ok((keys, slots, evicted)) => {
                             json!({
                                 "ok": true,
                                 "keys": keys,
@@ -380,7 +378,12 @@ fn handle(
                                 "evicted": evicted
                             })
                         }
-                        None => json!({"ok": true, "full": true}),
+                        Err(StoreRejection::Full) => json!({"ok": true, "full": true}),
+                        // Nothing was reserved, so the caller may retry the batch
+                        // in smaller pieces on this session.
+                        Err(StoreRejection::Unanswerable) => {
+                            return Err(reject("batch too large for one control frame"));
+                        }
                     }
                 }
                 Request::Commit {

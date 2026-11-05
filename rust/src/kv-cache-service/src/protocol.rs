@@ -108,13 +108,14 @@ impl Request {
 /// Whether a `store` reply that echoes every reserved and evicted key plus one
 /// slot id per reserved key still fits in a single frame.
 ///
-/// `keys` must already be validated by `cache::check_keys`, so JSON escaping
-/// never expands a hex key. A reply that cannot fit is rejected before the
-/// cache mutates, so the caller can retry with a smaller batch.
-pub fn store_reply_fits(keys: &[String]) -> bool {
-    let echoed: usize = keys.iter().map(|key| key.len() + 3).sum();
-    // Every key is echoed at most twice: once as reserved, once as evicted.
-    2 * echoed + keys.len() * SLOT_BYTES + ENVELOPE_BYTES <= MAX_FRAME
+/// `reserved` and `evicted` must already be validated by `cache::check_keys`, so
+/// JSON escaping never expands a hex key. Both count: an evicted key was stored
+/// by an earlier batch, so it may be longer than any key this batch carries. A
+/// reply that cannot fit is rejected before the cache mutates, so the caller can
+/// retry with a smaller batch.
+pub fn store_reply_fits(reserved: &[&str], evicted: &[&str]) -> bool {
+    let echoed = |keys: &[&str]| -> usize { keys.iter().map(|key| key.len() + 3).sum() };
+    echoed(reserved) + echoed(evicted) + reserved.len() * SLOT_BYTES + ENVELOPE_BYTES <= MAX_FRAME
 }
 
 pub fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
@@ -222,15 +223,16 @@ mod tests {
     }
 
     #[test]
-    fn store_reply_bound_covers_every_key_twice() {
+    fn store_reply_bound_covers_reserved_and_evicted_keys() {
         let digest_keys = hex_keys(64, MAX_KEYS);
+        let reserved: Vec<&str> = digest_keys.iter().map(String::as_str).collect();
         let reply = serde_json::json!({
             "ok": true,
             "keys": digest_keys,
             "slots": vec![MAX_KEYS - 1; MAX_KEYS],
             "evicted": digest_keys,
         });
-        assert!(store_reply_fits(&digest_keys));
+        assert!(store_reply_fits(&reserved, &reserved));
         assert!(encode_response(&reply).unwrap().len() <= 4 + MAX_FRAME);
 
         // A batch of the longest keys that still fits in one request frame can
@@ -238,7 +240,14 @@ mod tests {
         let long_keys = hex_keys(250, MAX_KEYS);
         let request = serde_json::json!({"op": "store", "keys": long_keys});
         assert!(serde_json::to_vec(&request).unwrap().len() <= MAX_FRAME);
-        assert!(!store_reply_fits(&long_keys));
+        let long: Vec<&str> = long_keys.iter().map(String::as_str).collect();
+        assert!(!store_reply_fits(&long, &[]));
+
+        // Short keys evicting long ones: the evicted keys alone fill the frame.
+        let short = hex_keys(4, MAX_KEYS);
+        let short: Vec<&str> = short.iter().map(String::as_str).collect();
+        assert!(store_reply_fits(&short, &[]));
+        assert!(!store_reply_fits(&short, &long));
     }
 
     #[test]

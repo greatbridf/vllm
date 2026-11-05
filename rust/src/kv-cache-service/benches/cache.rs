@@ -115,7 +115,7 @@ fn store_evict(c: &mut Criterion) {
                         let start = Instant::now();
                         let plan = cache.store(black_box(&incoming), STORE_REQUEST);
                         elapsed += start.elapsed();
-                        assert!(plan.is_some(), "a full cache must make room");
+                        assert!(plan.is_ok(), "a full cache must make room");
                     }
                     elapsed
                 })

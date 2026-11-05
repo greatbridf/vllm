@@ -548,10 +548,11 @@ when enabled, and model output is unaffected.
 - Bounded synchronous control RPCs are a correctness-first MVP. Lookups are
   batched through `lookup_many`; the connector does not pipeline its requests,
   and background liveness checks and CUDA-IPC service-side DMA are future work.
-- A `store` batch whose reply cannot fit in one 1 MiB frame is rejected with
-  `batch too large for one control frame` before any slot is reserved. A
-  `lookup_many` reply carries statuses only, so a batch bounded by `MAX_KEYS`
-  always fits.
+- A `store` batch whose reply cannot fit in one 1 MiB frame, counting the keys
+  it echoes as reserved and the evicted keys it reports, is rejected with
+  `batch too large for one control frame` before any slot is reserved or
+  evicted. A `lookup_many` reply carries statuses only, so a batch bounded by
+  `MAX_KEYS` always fits.
 
 Numbers the service enforces:
 
