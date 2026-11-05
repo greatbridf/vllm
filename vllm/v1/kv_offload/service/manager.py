@@ -99,7 +99,9 @@ class ServiceOffloadingManager(OffloadingManager):
     `get_stats()` reports the CPU-tier metrics from one `stats` RPC per
     collection, `config_info()` the chunk geometry the spec negotiated with the
     service, and `take_events()` the store and eviction events its own store
-    calls produced once KV cache events are enabled.
+    calls produced once KV cache events are enabled. `lookup_many()` answers a
+    whole batch of a scan with one RPC per `MAX_KEYS` keys instead of one per
+    key.
     """
 
     def __init__(
@@ -179,6 +181,15 @@ class ServiceOffloadingManager(OffloadingManager):
         if response is None:
             return LookupResult.MISS
         status = response.get("status")
+        result = self._lookup_result(status)
+        if result is LookupResult.HIT:
+            # The service takes the lease itself and reports a hit only then.
+            self._request_state(request).leased = True
+        return result
+
+    @staticmethod
+    def _lookup_result(status: Any) -> LookupResult:
+        """Maps one wire status, deferring on one this client does not know."""
         result = _LOOKUP_RESULTS.get(status) if isinstance(status, str) else None
         if result is None:
             logger.warning_once(
@@ -187,10 +198,37 @@ class ServiceOffloadingManager(OffloadingManager):
                 status,
             )
             return LookupResult.RETRY
-        if result is LookupResult.HIT:
-            # The service takes the lease itself and reports a hit only then.
-            self._request_state(request).leased = True
         return result
+
+    def lookup_many(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> list[LookupResult]:
+        """Answers one `lookup_many` RPC per batch instead of one per key."""
+        request = self._wire_id(req_context.req_id)
+        encoded = self._encode(keys)
+        results: list[LookupResult] = []
+        for batch in _batches(encoded):
+            try:
+                response = self._call_or_degrade(
+                    "lookup_many", retry=True, keys=batch, request=request
+                )
+            except CacheServiceError as error:
+                # Same reasoning as `lookup`: a request the service cannot
+                # answer is a miss, and offloading is over for this engine.
+                self._degrade("lookup_many", error)
+                response = None
+            if response is None:
+                return [LookupResult.MISS] * len(encoded)
+            statuses = response.get("statuses")
+            if not isinstance(statuses, list) or len(statuses) != len(batch):
+                raise CacheServiceError(
+                    f"KV cache service returned {statuses!r} for {len(batch)} keys"
+                )
+            results += [self._lookup_result(status) for status in statuses]
+        if LookupResult.HIT in results:
+            # The service took the leases itself and reports a hit only then.
+            self._request_state(request).leased = True
+        return results
 
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext

@@ -58,6 +58,14 @@ Lookup acquires a request lease before reporting a hit, so a later allocation
 cannot evict the load source. Request leases are released after finish and all
 pending transfers. Active leases and pending stores cannot be reset or evicted.
 
+`lookup` reports the status of one key. `lookup_many` reports the same for a
+batch of up to 4096 keys, as `{"ok": true, "statuses": [...]}` with one status
+per key in the order they were sent, and takes the same lease and LRU promotion
+per hit. It saves round trips, not work: the connector asks a full-attention
+prefix in batches of 4096 keys and a sliding-window tail one window at a time,
+so a batch may hold leases for hits below the miss that ends its scan until the
+request finishes.
+
 A reservation belongs to the request that made it: `store` records the owner, and
 `commit` rejects a batch reserved by another request with
 `commit does not own the reservation` and leaves those reservations pending. A
@@ -221,10 +229,13 @@ when enabled, and model output is unaffected.
 - Existing model replay for non-cacheable compressor and bounded-replay state.
 - No secondary tiers, persistent cache, cross-engine cache reuse, context
   parallelism, pipeline parallelism, or shared-copy TP deduplication.
-- Bounded synchronous control RPCs are a correctness-first MVP. Batch/pipelined
-  lookups, background liveness checks and CUDA-IPC service-side DMA are future work.
+- Bounded synchronous control RPCs are a correctness-first MVP. Lookups are
+  batched through `lookup_many`; pipelined RPCs, background liveness checks and
+  CUDA-IPC service-side DMA are future work.
 - A `store` batch whose reply cannot fit in one 1 MiB frame is rejected with
-  `batch too large for one control frame` before any slot is reserved.
+  `batch too large for one control frame` before any slot is reserved. A
+  `lookup_many` reply carries statuses only, so a batch bounded by `MAX_KEYS`
+  always fits.
 
 ## Tests
 

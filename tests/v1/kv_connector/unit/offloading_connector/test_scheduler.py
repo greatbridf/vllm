@@ -3317,6 +3317,7 @@ def _make_scheduler_with_lookup(
     """Create an OffloadingConnectorScheduler with a mocked manager.lookup.
 
     Keys are addressed by their integer hash; `default` answers anything else.
+    The batched call the scan makes answers through the same per-key map.
     """
     manager = MagicMock(spec=OffloadingManager)
 
@@ -3327,6 +3328,9 @@ def _make_scheduler_with_lookup(
         return lookup_results.get(int(block_hash.decode()), default)
 
     manager.lookup.side_effect = lookup
+    manager.lookup_many.side_effect = lambda keys, req_context: [
+        manager.lookup(key, req_context) for key in keys
+    ]
 
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
@@ -3506,7 +3510,8 @@ class TestMaximalPrefixLookup:
             {1: LookupResult.HIT_PENDING, 2: LookupResult.MISS, 3: LookupResult.HIT}
         )
         assert _maximal_lookup(sched, to_keys([1, 2, 3])) is None
-        assert _as_mock(sched.manager.lookup).call_count == 2
+        # One batch asks about every key; the scan still ends at the miss.
+        assert _as_mock(sched.manager.lookup_many).call_count == 1
         _as_mock(sched._events_tracker.record_lookup).assert_called_once_with(
             _LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, 0, to_keys([1])[0]
         )
@@ -3517,8 +3522,9 @@ class TestMaximalPrefixLookup:
             {1: LookupResult.RETRY, 2: LookupResult.MISS, 3: LookupResult.HIT}
         )
         assert _maximal_lookup(sched, to_keys([1, 2, 3])) is None
-        # lookup should have been called for blocks 1 and 2 (stops at miss)
-        assert _as_mock(sched.manager.lookup).call_count == 2
+        # One batch asks about every key; the scan still stops at the miss, so
+        # the key past it never becomes a hit.
+        assert _as_mock(sched.manager.lookup_many).call_count == 1
         _as_mock(sched._events_tracker.record_lookup).assert_not_called()
 
 
@@ -3643,6 +3649,105 @@ class TestSlidingWindowLookup:
         assert (
             sched._sliding_window_lookup(to_keys([1, 2, 3]), 3, _EMPTY_REQ_CTX) is None
         )
+
+
+def _status_manager(
+    statuses: dict[int, LookupResult],
+    *,
+    batched: bool,
+) -> MagicMock:
+    """A manager answering from `statuses`, batched or through the default loop."""
+    manager = MagicMock(spec=OffloadingManager)
+
+    def lookup(key, req_context):
+        return statuses.get(int(get_offload_block_hash(key)), LookupResult.MISS)
+
+    manager.lookup.side_effect = lookup
+    if batched:
+        manager.lookup_many.side_effect = lambda keys, req_context: [
+            lookup(key, req_context) for key in keys
+        ]
+    else:
+        # The `OffloadingManager` default: one `lookup` per key.
+        manager.lookup_many.side_effect = lambda keys, req_context: (
+            OffloadingManager.lookup_many(manager, keys, req_context)
+        )
+    return manager
+
+
+def _scan_with_manager(
+    manager: MagicMock,
+    keys: list[OffloadKey],
+    window: int | None,
+) -> tuple[int | None, list]:
+    """Runs one lookup scan and returns its result and recorded lookups."""
+    sched = object.__new__(OffloadingConnectorScheduler)
+    sched.manager = manager
+    sched._events_tracker = MagicMock()
+    if window is None:
+        result = _maximal_lookup(sched, keys, start_chunk_idx=2)
+    else:
+        result = sched._sliding_window_lookup(keys, window, _EMPTY_REQ_CTX)
+    return result, _as_mock(sched._events_tracker.record_lookup).call_args_list
+
+
+def test_a_long_prefix_costs_one_manager_call_per_batch():
+    """1024 chunks must cost one batched call, not one call per chunk."""
+    batches: list[list[OffloadKey]] = []
+    manager = MagicMock(spec=OffloadingManager)
+
+    def lookup_many(keys, req_context):
+        batches.append(list(keys))
+        return [LookupResult.HIT] * len(keys)
+
+    manager.lookup_many.side_effect = lookup_many
+    keys = to_keys(range(1024))
+
+    assert _scan_with_manager(manager, keys, None)[0] == len(keys)
+    assert len(batches) == 1
+    assert len(batches[0]) == len(keys)
+    manager.lookup.assert_not_called()
+
+
+def test_a_sliding_window_scan_costs_one_manager_call_per_window():
+    """A 1024-chunk tail scan must not cost one call per chunk either."""
+    batches: list[list[OffloadKey]] = []
+    manager = MagicMock(spec=OffloadingManager)
+
+    def lookup_many(keys, req_context):
+        batches.append(list(keys))
+        return [LookupResult.HIT] * len(keys)
+
+    manager.lookup_many.side_effect = lookup_many
+    keys = to_keys(range(1024))
+
+    assert _scan_with_manager(manager, keys, 2)[0] == len(keys)
+    assert len(batches) == 1
+    manager.lookup.assert_not_called()
+
+
+# Status patterns a scan has to treat exactly the same way batched or per key.
+_SCAN_PATTERNS = [
+    [LookupResult.HIT] * 5,
+    [LookupResult.HIT, LookupResult.MISS] + [LookupResult.HIT] * 3,
+    [LookupResult.RETRY] + [LookupResult.HIT] * 4,
+    [LookupResult.HIT_PENDING, LookupResult.HIT, LookupResult.MISS],
+    [LookupResult.MISS] * 3,
+    [LookupResult.HIT, LookupResult.HIT_PENDING, LookupResult.RETRY, LookupResult.HIT],
+]
+
+
+@pytest.mark.parametrize("window", [None, 1, 2, 3, 5])
+@pytest.mark.parametrize("pattern", _SCAN_PATTERNS)
+def test_batched_scan_matches_the_looping_scan(pattern, window):
+    """The batch must change the number of manager calls, nothing else."""
+    statuses = dict(enumerate(pattern))
+    keys = to_keys(range(len(pattern)))
+
+    batched = _scan_with_manager(_status_manager(statuses, batched=True), keys, window)
+    looping = _scan_with_manager(_status_manager(statuses, batched=False), keys, window)
+
+    assert batched == looping
 
 
 # ---------------------------------------------------------------------------

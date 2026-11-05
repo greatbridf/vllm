@@ -128,6 +128,12 @@ A service that stops answering, or that dropped the engine's namespace, does not
 abort the scheduler step: the connector logs one error, reports every later lookup
 as a miss, and stops reserving, until the engine is restarted.
 
+A lookup scan costs one RPC per batch instead of one per chunk: `lookup_many`
+answers up to 4096 keys at once, so a 4096-chunk full-attention prefix costs one
+RPC and a sliding-window tail costs one per window it has to widen. A batch may
+lease hits below the miss that ends its scan; those leases end with the request
+like every other lookup lease.
+
 The connector reports the CPU tier's metrics from that namespace state, with one
 `stats` RPC per collection and none per lookup:
 `vllm:kv_offload_cpu_cache_usage_perc` from the chunks in use,

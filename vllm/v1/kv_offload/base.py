@@ -348,6 +348,26 @@ class OffloadingManager(ABC):
         """
         pass
 
+    def lookup_many(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> list[LookupResult]:
+        """Checks whether each block of ``keys`` is offloaded and ready.
+
+        The default asks ``lookup`` once per key. A manager that can answer a
+        batch more cheaply overrides this; the result keeps the order of
+        ``keys`` and each entry is what ``lookup`` would have returned for it,
+        including the lease a hit takes.
+
+        Args:
+            keys: the keys identifying the blocks to lookup, in order.
+            req_context: per-request context (e.g. kv_transfer_params).
+
+        Returns:
+            One result per key, in the order of ``keys``.
+
+        """
+        return [self.lookup(key, req_context) for key in keys]
+
     def get_load_source(
         self, key: OffloadKey, req_context: ReqContext
     ) -> CacheHitSource:

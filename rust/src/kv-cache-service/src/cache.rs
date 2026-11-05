@@ -8,6 +8,7 @@ use std::os::fd::FromRawFd;
 use std::time::{Duration, Instant};
 
 use memmap2::{MmapMut, MmapOptions};
+use serde::Serialize;
 
 use crate::hash::{HashFactory, HashGeometry, PageHashes};
 use crate::protocol::MAX_KEYS;
@@ -55,6 +56,15 @@ pub struct Reclaimed {
     pub keys: usize,
     /// Age of the oldest reclaimed reservation of that request.
     pub age: Duration,
+}
+
+/// What `Cache::lookup` found for one key, spelled as the wire reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Hit,
+    Pending,
+    Miss,
 }
 
 pub struct Cache {
@@ -379,14 +389,14 @@ impl Cache {
         }
     }
 
-    pub fn lookup(&mut self, key: &str, request: &str) -> &'static str {
+    pub fn lookup(&mut self, key: &str, request: &str) -> Status {
         let Some(&slot) = self.index.get(key) else {
             self.counters.misses += 1;
-            return "miss";
+            return Status::Miss;
         };
         if !self.slots[slot as usize].ready {
             self.counters.pending_hits += 1;
-            return "pending";
+            return Status::Pending;
         }
         self.counters.hits += 1;
         // Lookup itself takes the read lease, closing the lookup/load race.
@@ -396,7 +406,13 @@ impl Cache {
             self.leases.lease(request, slot);
         }
         self.promote(slot);
-        "hit"
+        Status::Hit
+    }
+
+    /// Looks up one request's keys in order, with the status `lookup` reports
+    /// for each and the same lease and LRU effect.
+    pub fn lookup_many(&mut self, keys: &[String], request: &str) -> Vec<Status> {
+        keys.iter().map(|key| self.lookup(key, request)).collect()
     }
 
     pub fn load(&self, keys: &[String], request: &str) -> io::Result<Vec<usize>> {
@@ -893,9 +909,9 @@ mod tests {
         let mut cache = cache();
         let first = keys(&["aa", "bb"]);
         cache.store(&first, "r").unwrap();
-        assert_eq!(cache.lookup("aa", "r"), "pending");
+        assert_eq!(cache.lookup("aa", "r"), Status::Pending);
         cache.commit(&first, "r", true).unwrap();
-        assert_eq!(cache.lookup("aa", "r"), "hit");
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
         assert_eq!(evicted, keys(&["bb"]));
         assert_eq!(cache.load(&keys(&["aa"]), "r").unwrap(), vec![0]);
@@ -910,7 +926,7 @@ mod tests {
         let first = keys(&["aa"]);
         cache.store(&first, "r").unwrap();
         cache.commit(&first, "r", false).unwrap();
-        assert_eq!(cache.lookup("aa", "r"), "miss");
+        assert_eq!(cache.lookup("aa", "r"), Status::Miss);
         assert!(cache.commit(&first, "r", true).is_err());
     }
 
@@ -921,7 +937,7 @@ mod tests {
         cache.store(&first, "r").unwrap();
         cache.commit(&first, "r", true).unwrap();
         assert!(cache.store(&keys(&["aa", "bb", "cc"]), "r").is_none());
-        assert_eq!(cache.lookup("aa", "r"), "hit");
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         assert!(cache.reset(false).is_err());
     }
 
@@ -978,7 +994,7 @@ mod tests {
             vec![Op::Publish(slot, "aa".into()), Op::Clear(slot)]
         );
         assert!(!ready(&cache, "aa"));
-        assert_eq!(cache.lookup("aa", "r"), "pending");
+        assert_eq!(cache.lookup("aa", "r"), Status::Pending);
     }
 
     #[test]
@@ -1037,7 +1053,7 @@ mod tests {
         cache.commit(&first, "r", true).unwrap();
         let before = recorded(&ops);
         let slot = slot(&cache, "aa");
-        assert_eq!(cache.lookup("aa", "r"), "hit");
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         assert_eq!(cache.load(&keys(&["aa"]), "r").unwrap(), vec![slot]);
         cache.touch(&first);
         assert_eq!(recorded(&ops), before);
@@ -1049,7 +1065,7 @@ mod tests {
         let stored = keys(&["aa", "bb", "cc"]);
         cache.store(&stored, "r").unwrap();
         cache.commit(&stored, "r", true).unwrap();
-        assert_eq!(cache.lookup("aa", "r"), "hit");
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         // `bb` is the least recently used key, not the oldest inserted one.
         assert_eq!(cache.store(&keys(&["dd"]), "r").unwrap().2, keys(&["bb"]));
         cache.release_request("r");
@@ -1058,15 +1074,64 @@ mod tests {
         cache.assert_slot_accounting();
     }
 
+    /// Keys in LRU order, most recently used first.
+    fn lru_order(cache: &Cache) -> Vec<String> {
+        let mut order = Vec::new();
+        let mut slot = cache.lru_head;
+        while slot != NO_SLOT {
+            order.push(cache.slots[slot as usize].key.to_string());
+            slot = cache.slots[slot as usize].next;
+        }
+        order
+    }
+
+    #[test]
+    fn lookup_many_matches_one_lookup_per_key() {
+        // `aa` and `ee` are published, `bb` and `cc` are reserved but
+        // uncommitted, and `dd` was never stored.
+        let stored = keys(&["aa", "cc", "ee"]);
+        let mixed = keys(&["ee", "dd", "aa", "bb"]);
+        let mut batched = cache_with(4);
+        let mut per_key = cache_with(4);
+        for cache in [&mut batched, &mut per_key] {
+            cache.store(&stored, "r").unwrap();
+            cache.commit(&keys(&["aa", "ee"]), "r", true).unwrap();
+            cache.store(&keys(&["bb"]), "r").unwrap();
+        }
+
+        let statuses = batched.lookup_many(&mixed, "r");
+        let expected: Vec<Status> = mixed.iter().map(|key| per_key.lookup(key, "r")).collect();
+
+        assert_eq!(statuses, expected);
+        assert_eq!(
+            statuses,
+            vec![Status::Hit, Status::Miss, Status::Hit, Status::Pending]
+        );
+        // Same leases: the request that batched the lookups loads the same
+        // hits, and a request that took no lease loads nothing.
+        assert_eq!(
+            batched.load(&keys(&["aa", "ee"]), "r").unwrap(),
+            per_key.load(&keys(&["aa", "ee"]), "r").unwrap()
+        );
+        assert!(batched.load(&keys(&["aa"]), "other").is_err());
+        // Same counters and the same promotion order.
+        assert_eq!(batched.stats(), per_key.stats());
+        assert_eq!(lru_order(&batched), lru_order(&per_key));
+        assert_eq!(batched.stats()["hits"], 2);
+        assert_eq!(batched.stats()["misses"], 1);
+        assert_eq!(batched.stats()["pending_hits"], 1);
+        batched.assert_slot_accounting();
+    }
+
     #[test]
     fn release_request_uses_the_lease_index() {
         let mut cache = cache_with(3);
         let stored = keys(&["aa", "bb", "cc"]);
         cache.store(&stored, "r1").unwrap();
         cache.commit(&stored, "r1", true).unwrap();
-        assert_eq!(cache.lookup("aa", "r1"), "hit");
-        assert_eq!(cache.lookup("bb", "r1"), "hit");
-        assert_eq!(cache.lookup("cc", "r2"), "hit");
+        assert_eq!(cache.lookup("aa", "r1"), Status::Hit);
+        assert_eq!(cache.lookup("bb", "r1"), Status::Hit);
+        assert_eq!(cache.lookup("cc", "r2"), Status::Hit);
         cache.release_request("r1");
         assert!(cache.load(&keys(&["aa"]), "r1").is_err());
         assert_eq!(
@@ -1200,8 +1265,7 @@ mod tests {
                     }
                 }
                 4 => {
-                    let status = cache.lookup(&batch[0], request);
-                    assert!(matches!(status, "hit" | "miss" | "pending"));
+                    assert_eq!(cache.lookup_many(&batch, request).len(), batch.len());
                 }
                 5 => {
                     if let Ok(slots) = cache.load(&batch, request) {
@@ -1246,11 +1310,11 @@ mod tests {
         let error = cache.commit(&first, "b", true).unwrap_err();
         assert_eq!(error.to_string(), "commit does not own the reservation");
         assert!(!ready(&cache, "aa"));
-        assert_eq!(cache.lookup("aa", "b"), "pending");
+        assert_eq!(cache.lookup("aa", "b"), Status::Pending);
         assert_eq!(cache.stats()["failed_commits"], 1);
         assert_eq!(cache.stats()["pending"], 1);
         cache.commit(&first, "a", true).unwrap();
-        assert_eq!(cache.lookup("aa", "a"), "hit");
+        assert_eq!(cache.lookup("aa", "a"), Status::Hit);
         assert_eq!(cache.stats()["commits"], 1);
         cache.assert_slot_accounting();
     }
@@ -1284,8 +1348,8 @@ mod tests {
         assert_eq!(reclaimed[0].keys, 1);
         assert!(reclaimed[0].age >= Duration::from_secs(60));
         assert_eq!(recorded(&ops), vec![Op::Clear(expired_slot)]);
-        assert_eq!(cache.lookup("aa", "a"), "miss");
-        assert_eq!(cache.lookup("bb", "a"), "pending");
+        assert_eq!(cache.lookup("aa", "a"), Status::Miss);
+        assert_eq!(cache.lookup("bb", "a"), Status::Pending);
         assert_eq!(cache.stats()["reclaimed"], 1);
         assert_eq!(cache.stats()["pending"], 1);
         assert_eq!(cache.stats()["free_chunks"], 1);
@@ -1302,7 +1366,7 @@ mod tests {
         cache.store(&stored, "r").unwrap();
         cache.store(&keys(&["cc"]), "r").unwrap();
         cache.commit(&keys(&["aa"]), "r", true).unwrap();
-        assert_eq!(cache.lookup("aa", "r"), "hit");
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         // A lease and a pending reservation both keep the ordinary reset out.
         assert!(cache.reset(false).is_err());
         cache.reset(true).unwrap();
@@ -1311,7 +1375,7 @@ mod tests {
         assert_eq!(cache.stats()["leased"], 0);
         assert_eq!(cache.stats()["free_chunks"], 3);
         assert_eq!(cache.stats()["requests"], 0);
-        assert_eq!(cache.lookup("aa", "r"), "miss");
+        assert_eq!(cache.lookup("aa", "r"), Status::Miss);
         assert!(cache.load(&keys(&["aa"]), "r").is_err());
         cache.assert_slot_accounting();
         assert!(cache.store(&stored, "r").is_some());
@@ -1327,7 +1391,7 @@ mod tests {
         assert!(cache.commit(&first, "r", true).is_err());
         let second = keys(&["bb"]);
         cache.store(&second, "r").unwrap();
-        assert_eq!(cache.lookup("bb", "r"), "pending");
+        assert_eq!(cache.lookup("bb", "r"), Status::Pending);
         cache.commit(&second, "r", false).unwrap();
         let mut stats = cache.stats();
         assert_eq!(stats["stores"], 2);
@@ -1348,8 +1412,8 @@ mod tests {
         let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
         assert_eq!(evicted, keys(&["aa"]));
         cache.commit(&keys(&["cc"]), "r", true).unwrap();
-        assert_eq!(cache.lookup("cc", "r"), "hit");
-        assert_eq!(cache.lookup("dd", "r"), "miss");
+        assert_eq!(cache.lookup("cc", "r"), Status::Hit);
+        assert_eq!(cache.lookup("dd", "r"), Status::Miss);
         stats = cache.stats();
         assert_eq!(stats["stores"], 4);
         assert_eq!(stats["commits"], 3);
@@ -1374,7 +1438,7 @@ mod tests {
         let stored = keys(&["aa", "bb"]);
         cache.store(&stored, "r").unwrap();
         cache.commit(&stored, "r", true).unwrap();
-        assert_eq!(cache.lookup("aa", "r"), "hit");
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         assert_eq!(
             cache.release(&keys(&["aa", "bb", "cc"]), "r"),
             Released {
@@ -1389,7 +1453,7 @@ mod tests {
                 unknown: 1,
             }
         );
-        assert_eq!(cache.lookup("bb", "r"), "hit");
+        assert_eq!(cache.lookup("bb", "r"), Status::Hit);
         assert_eq!(
             cache.release_request("r"),
             Released {

@@ -72,6 +72,21 @@ def _spec(path, rank=0):
     )
 
 
+def _wide_spec(path, num_chunks):
+    return RustServiceOffloadingSpec(
+        replace(
+            make_offloading_config(
+                cpu_bytes_to_use=num_chunks * PAGE,
+                worker_kv_bytes_per_block=64,
+                world_size=2,
+                rank=0,
+                extra_config={"service_socket": path},
+            ),
+            engine_id="test-service",
+        )
+    )
+
+
 def _attach(spec):
     client = CacheServiceClient(spec.path)
     geometry = client.call(
@@ -184,6 +199,45 @@ def test_lookup_lease_prevents_eviction_and_failed_store_is_removed(service):
         manager.on_request_finished(request)
         manager.reset_cache()
         manager.on_reset_flushed()
+    finally:
+        manager.shutdown()
+
+
+def test_lookup_many_costs_one_rpc_and_leases_the_hits(service, monkeypatch):
+    """A batched scan replaces one lookup RPC per chunk with one per batch."""
+    manager = _wide_spec(service, num_chunks=64).get_manager()
+    request = ReqContext("first")
+    ops: list[str] = []
+    call = manager.client.call
+
+    def counting_call(op, retry=False, **fields):
+        ops.append(op)
+        return call(op, retry=retry, **fields)
+
+    monkeypatch.setattr(manager.client, "call", counting_call)
+    keys = [OffloadKey(index.to_bytes(4, "big")) for index in range(64)]
+    try:
+        output = manager.prepare_store(keys, request)
+        assert output is not None
+        manager.complete_store(keys, request)
+
+        ops.clear()
+        assert manager.lookup_many(keys, request) == [LookupResult.HIT] * len(keys)
+        assert ops == ["lookup_many"]
+
+        # One call per key was the cost this replaces.
+        ops.clear()
+        for key in keys:
+            assert manager.lookup(key, request) is LookupResult.HIT
+        assert ops == ["lookup"] * len(keys)
+
+        # The lease a batch takes is enough to load what it reported.
+        load = manager.prepare_load(keys, request)
+        assert [int(slot) for slot in load.block_ids] == [
+            int(slot) for slot in output.store_spec.block_ids
+        ]
+        manager.on_request_finished(request)
+        manager.complete_load(keys, request)
     finally:
         manager.shutdown()
 

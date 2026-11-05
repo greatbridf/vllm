@@ -327,6 +327,11 @@ fn handle(
                     check_request(&request).map_err(reject)?;
                     json!({"ok": true, "status": cache.lookup(&key, &request)})
                 }
+                Request::LookupMany { keys, request } => {
+                    check_keys(&keys).map_err(reject)?;
+                    check_request(&request).map_err(reject)?;
+                    json!({"ok": true, "statuses": cache.lookup_many(&keys, &request)})
+                }
                 Request::Load { keys, request } => {
                     check_keys(&keys).map_err(reject)?;
                     check_request(&request).map_err(reject)?;

@@ -40,6 +40,8 @@ class FakeClient:
     def __init__(self):
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.status = "hit"
+        # Statuses a batched lookup reports, when they differ from `status`.
+        self.statuses: list[str] | None = None
         # Store calls that reserve before the cache reports itself full.
         self.full_after: int | None = None
         # Slots to answer a load with, when they differ from one per key.
@@ -70,6 +72,12 @@ class FakeClient:
 
     def _lookup(self, key: str, request: str) -> dict[str, Any]:
         return {"ok": True, "status": self.status}
+
+    def _lookup_many(self, keys: list[str], request: str) -> dict[str, Any]:
+        statuses = self.statuses
+        if statuses is None:
+            statuses = [self.status] * len(keys)
+        return {"ok": True, "statuses": list(statuses)}
 
     def _load(self, keys: list[str], request: str) -> dict[str, Any]:
         slots = self.load_slots if self.load_slots is not None else range(len(keys))
@@ -181,6 +189,91 @@ def test_completion_for_unknown_request_is_ignored_without_negative_counters():
     manager.on_request_finished(request)
     manager.complete_load([key], request)
     assert len(client.ops("release_request")) == 1
+
+
+def test_lookup_many_answers_every_key_with_one_rpc_per_batch():
+    """A scan must cost one RPC per MAX_KEYS keys, not one per key."""
+    client = FakeClient()
+    client.statuses = ["hit", "pending", "miss"]
+    manager = make_manager(client)
+    request = ReqContext("request")
+
+    assert manager.lookup_many([make_key(0), make_key(1), make_key(2)], request) == [
+        LookupResult.HIT,
+        LookupResult.HIT_PENDING,
+        LookupResult.MISS,
+    ]
+    assert len(client.ops("lookup_many")) == 1
+    assert client.ops("lookup") == []
+
+    # A request longer than one batch is split, and keeps the key order.
+    client.calls.clear()
+    client.statuses = None
+    keys = [make_key(index) for index in range(MAX_KEYS + 2)]
+    assert manager.lookup_many(keys, request) == [LookupResult.HIT] * len(keys)
+    assert [len(fields["keys"]) for fields in client.ops("lookup_many")] == [
+        MAX_KEYS,
+        2,
+    ]
+
+
+def test_lookup_many_maps_unknown_statuses_to_retry():
+    client = FakeClient()
+    client.statuses = ["evicted", "hit"]
+    manager = make_manager(client)
+    request = ReqContext("request")
+
+    assert manager.lookup_many([make_key(0), make_key(1)], request) == [
+        LookupResult.RETRY,
+        LookupResult.HIT,
+    ]
+
+
+def test_lookup_many_rejects_a_status_count_mismatch():
+    client = FakeClient()
+    client.statuses = ["hit"]
+    manager = make_manager(client)
+    request = ReqContext("request")
+
+    with pytest.raises(CacheServiceError, match="for 2 keys"):
+        manager.lookup_many([make_key(0), make_key(1)], request)
+
+
+def test_lookup_many_takes_a_lease_the_request_releases_once():
+    """A hit taken by a batch is released like a per-key hit."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+
+    assert manager.lookup_many([make_key(0), make_key(1)], request) == [
+        LookupResult.HIT,
+        LookupResult.HIT,
+    ]
+    manager.on_request_finished(request)
+    assert len(client.ops("release_request")) == 1
+
+    # A batch of misses takes no lease, so finishing sends no release.
+    client.calls.clear()
+    client.status = "miss"
+    misses = ReqContext("misses")
+    assert manager.lookup_many([make_key(0)], misses) == [LookupResult.MISS]
+    manager.on_request_finished(misses)
+    assert client.ops("release_request") == []
+
+
+def test_lookup_many_degrades_to_misses():
+    client = FakeClient()
+    client.unavailable = True
+    manager = make_manager(client)
+    request = ReqContext("request")
+
+    assert manager.lookup_many([make_key(0), make_key(1)], request) == [
+        LookupResult.MISS,
+        LookupResult.MISS,
+    ]
+    # One failure disables offloading instead of retrying inside every step.
+    assert manager.lookup_many([make_key(0)], request) == [LookupResult.MISS]
+    assert len(client.calls) == 1
 
 
 def test_prepare_load_rejects_slot_count_mismatch():

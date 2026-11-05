@@ -8,6 +8,8 @@ Read this before changing the Rust CPU cache service or its native offloading sp
   boundary. The service owns allocation; workers retain GPU DMA execution.
 - Lookup hits hold a lease before returning. Keep leases through all dependent
   loads; publish stores only after every participating worker reports completion.
+  A batched lookup is one frame of per-key lookups, so it takes the same lease
+  and may name keys past the miss that ends the scan.
 - A reservation belongs to the request that made it: reject a `commit` from any
   other request and keep the reservation pending. Bound how long a reservation may
   stay pending, because the connector reports a pending key as a hit that is not

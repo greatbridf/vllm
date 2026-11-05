@@ -36,6 +36,13 @@ pub enum Request {
         key: String,
         request: String,
     },
+    /// One `lookup` per key of `keys`, answered with one status per key. The
+    /// reply never echoes a key, so a batch bounded by `MAX_KEYS` always fits
+    /// one frame.
+    LookupMany {
+        keys: Vec<String>,
+        request: String,
+    },
     Load {
         keys: Vec<String>,
         request: String,
@@ -77,6 +84,7 @@ impl Request {
             Request::Open { .. } => "open",
             Request::Attach { .. } => "attach",
             Request::Lookup { .. } => "lookup",
+            Request::LookupMany { .. } => "lookup_many",
             Request::Load { .. } => "load",
             Request::Release { .. } => "release",
             Request::ReleaseAll { .. } => "release_request",
@@ -224,5 +232,13 @@ mod tests {
         let request = serde_json::json!({"op": "store", "keys": long_keys});
         assert!(serde_json::to_vec(&request).unwrap().len() <= MAX_FRAME);
         assert!(!store_reply_fits(&long_keys));
+    }
+
+    #[test]
+    fn lookup_many_reply_at_max_keys_fits_one_frame() {
+        let statuses = vec![crate::cache::Status::Pending; MAX_KEYS];
+        let reply = serde_json::json!({"ok": true, "statuses": statuses});
+
+        assert!(encode_response(&reply).unwrap().len() <= 4 + MAX_FRAME);
     }
 }

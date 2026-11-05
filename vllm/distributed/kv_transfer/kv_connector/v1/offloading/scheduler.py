@@ -69,6 +69,11 @@ logger = init_logger(__name__)
 # A cache reset fence held this long is reported once.
 _RESET_FENCE_WARN_S = 60
 
+# Keys one batched prefix lookup asks the manager about. A scan stops at the
+# first miss it finds, so a batch may take leases on keys past that miss; they
+# end with the request like every other lookup lease.
+_LOOKUP_BATCH_KEYS = 4096
+
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
@@ -835,26 +840,30 @@ class OffloadingConnectorScheduler:
     ) -> int | None:
         """Return the number of consecutive offloaded chunks from the start,
         or None if the backend deferred a lookup."""
+        keys = list(keys)
         hit_count = 0
         defer_lookup = False
-        for local_idx, key in enumerate(keys):
-            result = self.manager.lookup(key, req_context)
-            match result:
-                case LookupResult.HIT | LookupResult.HIT_PENDING:
-                    self._events_tracker.record_lookup(
-                        req,
-                        group_config,
-                        start_chunk_idx + local_idx,
-                        key,
-                    )
-                    hit_count += 1
-                    defer_lookup |= result is LookupResult.HIT_PENDING
-                case LookupResult.RETRY:
-                    # Don't break: keep scanning to let manager kick off
-                    # async lookups (until a miss is detected).
-                    defer_lookup = True
-                case LookupResult.MISS:
-                    break
+        for start in range(0, len(keys), _LOOKUP_BATCH_KEYS):
+            batch = keys[start : start + _LOOKUP_BATCH_KEYS]
+            for local_idx, result in enumerate(
+                self.manager.lookup_many(batch, req_context), start
+            ):
+                match result:
+                    case LookupResult.HIT | LookupResult.HIT_PENDING:
+                        self._events_tracker.record_lookup(
+                            req,
+                            group_config,
+                            start_chunk_idx + local_idx,
+                            keys[local_idx],
+                        )
+                        hit_count += 1
+                        defer_lookup |= result is LookupResult.HIT_PENDING
+                    case LookupResult.RETRY:
+                        # Don't break: keep scanning to let manager kick off
+                        # async lookups (until a miss is detected).
+                        defer_lookup = True
+                    case LookupResult.MISS:
+                        return hit_count if not defer_lookup else None
         return hit_count if not defer_lookup else None
 
     def _sliding_window_lookup(
@@ -872,33 +881,43 @@ class OffloadingConnectorScheduler:
         pending_in_window = False
         consecutive_hits = 0
         required_window = initial_window_size or sliding_window_size
-        for idx in range(len(keys) - 1, -1, -1):
-            match self.manager.lookup(keys[idx], req_context):
-                case LookupResult.HIT:
-                    consecutive_hits += 1
-                case LookupResult.HIT_PENDING:
-                    # Block is in cache, just not readable yet — counts
-                    # as hit for the consecutive streak. Don't break:
-                    # keep scanning to let manager kick off async lookups.
-                    pending_in_window = True
-                    consecutive_hits += 1
-                case LookupResult.RETRY:
-                    # Block location uncertain — does not count as hit.
-                    # Don't break: keep scanning to let manager kick off
-                    # async lookups.
-                    defer_lookup = True
-                    consecutive_hits = 0
-                    pending_in_window = False
-                    required_window = sliding_window_size
-                case LookupResult.MISS:
-                    consecutive_hits = 0
-                    # This gap rules out the incomplete window to its right.
-                    pending_in_window = False
-                    required_window = sliding_window_size
-            if consecutive_hits == required_window:
-                return (
-                    None if defer_lookup or pending_in_window else idx + required_window
-                )
+        batch_end = len(keys)
+        while batch_end > 0:
+            # One window per call, and at least one key: a wider batch would ask
+            # about chunks below the run it finds, which the store path prunes as
+            # unreachable.
+            batch_start = max(batch_end - max(required_window, 1), 0)
+            results = self.manager.lookup_many(keys[batch_start:batch_end], req_context)
+            for offset in range(len(results) - 1, -1, -1):
+                match results[offset]:
+                    case LookupResult.HIT:
+                        consecutive_hits += 1
+                    case LookupResult.HIT_PENDING:
+                        # Block is in cache, just not readable yet — counts
+                        # as hit for the consecutive streak. Don't break:
+                        # keep scanning to let manager kick off async lookups.
+                        pending_in_window = True
+                        consecutive_hits += 1
+                    case LookupResult.RETRY:
+                        # Block location uncertain — does not count as hit.
+                        # Don't break: keep scanning to let manager kick off
+                        # async lookups.
+                        defer_lookup = True
+                        consecutive_hits = 0
+                        pending_in_window = False
+                        required_window = sliding_window_size
+                    case LookupResult.MISS:
+                        consecutive_hits = 0
+                        # This gap rules out the incomplete window to its right.
+                        pending_in_window = False
+                        required_window = sliding_window_size
+                if consecutive_hits == required_window:
+                    return (
+                        None
+                        if defer_lookup or pending_in_window
+                        else batch_start + offset + required_window
+                    )
+            batch_end = batch_start
         return None if defer_lookup or pending_in_window else consecutive_hits
 
     def _lookup_complete_chunks(

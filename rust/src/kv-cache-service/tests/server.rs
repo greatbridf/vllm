@@ -337,6 +337,58 @@ fn attach_reply_carries_exactly_one_descriptor() {
 }
 
 #[test]
+fn lookup_many_reports_one_status_per_key_and_leases_the_hits() {
+    let service = Service::start();
+    let mut client = service.connect();
+    let opened = client.call(json!({
+        "op": "open",
+        "version": 1,
+        "namespace": "engine-batch",
+        "fingerprint": "a".repeat(64),
+        "worker_bytes": 64,
+        "world_size": 2,
+        "num_chunks": 4,
+    }));
+    assert_eq!(opened["ok"], true);
+
+    // `aa` is published, `bb` is still reserved, and `dd` was never stored.
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": ["aa", "bb", "cc"], "request": "a"}))["ok"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
+        true
+    );
+
+    let reply = client.call(json!({
+        "op": "lookup_many",
+        "keys": ["aa", "bb", "dd", "cc"],
+        "request": "b",
+    }));
+    assert_eq!(reply["ok"], true);
+    assert_eq!(
+        reply["statuses"],
+        json!(["hit", "pending", "miss", "pending"])
+    );
+
+    // The batch took the lease a per-key hit takes, for the request that asked.
+    let loaded = client.call(json!({"op": "load", "keys": ["aa"], "request": "b"}));
+    assert_eq!(loaded["ok"], true);
+    assert_eq!(loaded["slots"].as_array().unwrap().len(), 1);
+    let foreign = client.call(json!({"op": "load", "keys": ["aa"], "request": "c"}));
+    assert_eq!(foreign["ok"], false);
+    assert!(foreign["error"].as_str().unwrap().contains("ready leased entry"));
+
+    // One key per counter, not one per request.
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    assert_eq!(stats["hits"], 1);
+    assert_eq!(stats["pending_hits"], 2);
+    assert_eq!(stats["misses"], 1);
+    assert_eq!(stats["leased"], 1);
+}
+
+#[test]
 fn store_from_one_request_cannot_be_published_by_another() {
     let service = Service::start();
     let mut client = service.connect();
