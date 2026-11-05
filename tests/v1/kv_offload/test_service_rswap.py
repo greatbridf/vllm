@@ -196,14 +196,27 @@ def _page_digest(key, page):
     return (canonical + struct.pack("<I", len(key)) + struct.pack("<Q", page)).hex()
 
 
-def _redis_get(keys):
-    """Reads `keys` from the rswap Redis backend; None if it is not one."""
+def _redis_params():
+    """Backend parameters; the AUTH secret is not exported through sysfs."""
     params = {}
-    for name in ("backend", "host", "port", "redis_user", "redis_password"):
+    for name in ("backend", "host", "port", "redis_user", "redis_db"):
         path = MODULE / name
         if path.is_file():
             params[name] = path.read_text().strip()
     if params.get("backend") != "redis":
+        return None
+    password = os.environ.get("VLLM_TEST_RSWAP_REDIS_PASSWORD", "")
+    for item in Path("/proc/cmdline").read_text().split():
+        if item.startswith("rswap.redis_password="):
+            password = item.split("=", 1)[1]
+    params["password"] = password
+    return params
+
+
+def _redis_get(keys):
+    """Reads `keys` from the rswap Redis backend; None if it is not readable."""
+    params = _redis_params()
+    if params is None:
         return None
     try:
         connection = socket.create_connection(
@@ -218,8 +231,10 @@ def _redis_get(keys):
             frame += b"$%d\r\n%s\r\n" % (len(arg), arg)
         connection.sendall(frame)
         head, _, rest = connection.recv(64).partition(b"\r\n")
-        if head.startswith((b"+", b"-", b":")):
-            return head
+        if head.startswith(b"-"):
+            raise RuntimeError(head[1:].decode(errors="replace"))
+        if head.startswith((b"+", b":")):
+            return head[1:]
         if head.startswith(b"$-1"):
             return None
         payload = rest
@@ -231,9 +246,11 @@ def _redis_get(keys):
         command(
             b"AUTH",
             params.get("redis_user", "default").encode(),
-            params.get("redis_password", "").encode(),
+            params["password"].encode(),
         )
         return {key: command(b"GET", key.encode()) for key in keys}
+    except (OSError, RuntimeError):
+        return None
     finally:
         connection.close()
 
@@ -285,10 +302,15 @@ def test_reclaimed_pages_round_trip_through_rswap(device, service):
     if stored is None:
         print(f"no readable rswap backend: {len(pages)} pages stored unaudited")
     else:
+        if stored.get("0" * 96) is not None:
+            print("the all-zero digest holds a page: the kernel dropped the digests")
         missing = [
             offset for offset, digest in digests.items() if stored[digest] is None
         ]
-        assert not missing, f"pages {missing} are not under their published digest"
+        assert not missing, (
+            f"{len(missing)} of {len(pages)} reclaimed pages are not stored under "
+            "the digest the service published"
+        )
         assert len(set(digests.values())) == len(pages)
         wrong = [
             offset
