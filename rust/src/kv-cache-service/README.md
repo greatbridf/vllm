@@ -57,10 +57,21 @@ Lookup acquires a request lease before reporting a hit, so a later allocation
 cannot evict the load source. Request leases are released after finish and all
 pending transfers. Active leases and pending stores cannot be reset or evicted.
 
-Disconnecting any attached client invalidates the namespace. Old mappings are
-never reused by a new namespace, and remain charged to capacity while attached
-clients retain their sessions. Service errors fail the connector closed; this
-version does not reconnect or silently treat a failed receive as a hit.
+A rejection (`{"ok": false, "error": ...}`) keeps the session and its namespace
+alive: an invalid key or request id, an unknown namespace, a commit without a
+matching reservation, a `store` batch too large for one control frame, and an
+unknown handshake field all leave the caller free to retry or give up without
+losing the cache. Only frame-level failures (bad length, non-JSON, unknown op)
+and I/O errors close a connection. Attached workers may read `stats`; every
+other command mutates scheduler-owned metadata and is rejected for them.
+No reply is written while the namespace registry is locked, so a client that
+stops reading blocks only its own connection, for at most the 5 s write timeout.
+
+Disconnecting an attached client still invalidates its namespace. Old mappings
+are never reused by a new namespace, and remain charged to capacity while
+attached clients retain their sessions. Service errors fail the connector
+closed; this version does not reconnect or silently treat a failed receive as a
+hit.
 
 ## Hash reporting
 
@@ -118,6 +129,8 @@ when enabled, and model output is unaffected.
   context parallelism, pipeline parallelism, or shared-copy TP deduplication.
 - Bounded synchronous control RPCs are a correctness-first MVP. Batch/pipelined
   lookups, background liveness checks and CUDA-IPC service-side DMA are future work.
+- A `store` batch whose reply cannot fit in one 1 MiB frame is rejected with
+  `batch too large for one control frame` before any slot is reserved.
 
 ## Tests
 

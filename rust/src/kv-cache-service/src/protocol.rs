@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use serde::Deserialize;
@@ -9,6 +9,11 @@ use serde_json::Value;
 
 pub const MAX_FRAME: usize = 1024 * 1024;
 pub const MAX_KEYS: usize = 4096;
+
+/// Longest decimal slot id (20 digits) plus its separating comma.
+const SLOT_BYTES: usize = 21;
+/// A reply envelope with empty key, slot, and eviction arrays.
+const ENVELOPE_BYTES: usize = 45;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -57,25 +62,72 @@ pub enum Request {
     Stats,
 }
 
+/// Whether a `store` reply that echoes every reserved and evicted key plus one
+/// slot id per reserved key still fits in a single frame.
+///
+/// `keys` must already be validated by `cache::check_keys`, so JSON escaping
+/// never expands a hex key. A reply that cannot fit is rejected before the
+/// cache mutates, so the caller can retry with a smaller batch.
+pub fn store_reply_fits(keys: &[String]) -> bool {
+    let echoed: usize = keys.iter().map(|key| key.len() + 3).sum();
+    // Every key is echoed at most twice: once as reserved, once as evicted.
+    2 * echoed + keys.len() * SLOT_BYTES + ENVELOPE_BYTES <= MAX_FRAME
+}
+
 pub fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
     let mut header = [0; 4];
-    stream.read_exact(&mut header)?;
+    read_into(stream, &mut header)?;
     let length = u32::from_be_bytes(header) as usize;
     if length == 0 || length > MAX_FRAME {
         return Err(io::Error::other("invalid frame length"));
     }
     let mut payload = vec![0; length];
-    stream.read_exact(&mut payload)?;
+    read_into(stream, &mut payload)?;
     serde_json::from_slice(&payload).map_err(io::Error::other)
 }
 
-pub fn write_response(stream: &mut UnixStream, response: &Value) -> io::Result<()> {
+/// Fills `buffer`, reporting an expired receive timeout as `TimedOut` so the
+/// caller can tell an idle peer from a malformed frame.
+fn read_into(stream: &mut UnixStream, buffer: &mut [u8]) -> io::Result<()> {
+    match stream.read_exact(buffer) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(io::Error::new(io::ErrorKind::TimedOut, error))
+        }
+        result => result,
+    }
+}
+
+/// Encodes `response` as one length-prefixed frame.
+pub fn encode_response(response: &Value) -> io::Result<Vec<u8>> {
     let payload = serde_json::to_vec(response)?;
     if payload.len() > MAX_FRAME {
         return Err(io::Error::other("response exceeds frame limit"));
     }
-    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
-    stream.write_all(&payload)
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// Writes one encoded frame without splitting the header from its payload.
+pub fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<()> {
+    stream.write_all(frame)
+}
+
+/// Duplicates `fd` so it stays valid after the cache lock is released.
+pub fn duplicate_fd(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    // SAFETY: fcntl duplicates a live borrowed descriptor into a new one.
+    let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a descriptor owned only here.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
 pub fn send_fd(stream: &UnixStream, fd: BorrowedFd<'_>) -> io::Result<()> {
@@ -99,10 +151,50 @@ pub fn send_fd(stream: &UnixStream, fd: BorrowedFd<'_>) -> io::Result<()> {
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as usize;
         std::ptr::write(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), fd.as_raw_fd());
-        let sent = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
-        if sent != 1 {
-            return Err(io::Error::last_os_error());
+        loop {
+            let sent = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
+            if sent == 1 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // A zero-length sendmsg leaves errno untouched; the peer is gone.
+            return Err(if sent == 0 {
+                io::Error::from(io::ErrorKind::BrokenPipe)
+            } else {
+                error
+            });
         }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex_keys(length: usize, count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("{index:0length$x}")).collect()
+    }
+
+    #[test]
+    fn store_reply_bound_covers_every_key_twice() {
+        let digest_keys = hex_keys(64, MAX_KEYS);
+        let reply = serde_json::json!({
+            "ok": true,
+            "keys": digest_keys,
+            "slots": vec![MAX_KEYS - 1; MAX_KEYS],
+            "evicted": digest_keys,
+        });
+        assert!(store_reply_fits(&digest_keys));
+        assert!(encode_response(&reply).unwrap().len() <= 4 + MAX_FRAME);
+
+        // A batch of the longest keys that still fits in one request frame can
+        // need a reply twice that size.
+        let long_keys = hex_keys(250, MAX_KEYS);
+        let request = serde_json::json!({"op": "store", "keys": long_keys});
+        assert!(serde_json::to_vec(&request).unwrap().len() <= MAX_FRAME);
+        assert!(!store_reply_fits(&long_keys));
+    }
 }

@@ -11,6 +11,9 @@ Read this before changing the Rust CPU cache service or its native offloading sp
 - A lost worker may still have DMA in flight. Invalidate its namespace rather
   than reclaiming slots into the same mapping. Do not reconnect old workers to a
   newly created namespace.
+- A rejected request is not a lost worker. Answer it with `{"ok": false, ...}` and
+  keep the session and namespace alive; only frame-level failures and I/O errors
+  end a connection. Never hold a lock across a socket write or a descriptor send.
 - Preserve complete packed physical rows for DeepSeek, including indexer data
   and padding. Follow the model's existing replay behavior for non-cacheable
   scratch and bounded-replay state.

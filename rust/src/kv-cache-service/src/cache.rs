@@ -20,15 +20,12 @@ pub struct Entry {
 
 pub struct Cache {
     pub owner: u64,
-    pub fingerprint: String,
     pub worker_bytes: usize,
     pub world_size: usize,
     pub row_bytes: usize,
     pub num_chunks: usize,
     pub file: File,
     pub mapping: MmapMut,
-    pub attached_ranks: HashSet<usize>,
-    pub sessions: HashSet<u64>,
     entries: IndexMap<String, Entry>,
     free: Vec<usize>,
     hashes: Option<Box<dyn PageHashes>>,
@@ -63,53 +60,62 @@ pub fn check_request(request: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Bytes one namespace with this geometry reserves: one padded row per chunk.
+pub fn namespace_bytes(
+    worker_bytes: usize,
+    world_size: usize,
+    num_chunks: usize,
+) -> io::Result<usize> {
+    if worker_bytes == 0 || world_size == 0 || world_size > 64 || num_chunks == 0 {
+        return Err(invalid("invalid cache geometry"));
+    }
+    padded_row_bytes(worker_bytes, world_size, page_size()?)?
+        .checked_mul(num_chunks)
+        .ok_or_else(|| invalid("cache geometry overflow"))
+}
+
+fn page_size() -> io::Result<usize> {
+    // SAFETY: sysconf has no pointer arguments; the result is validated.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        return Err(invalid("cannot determine page size"));
+    }
+    Ok(page as usize)
+}
+
+fn padded_row_bytes(worker_bytes: usize, world_size: usize, page: usize) -> io::Result<usize> {
+    worker_bytes
+        .checked_mul(world_size)
+        .and_then(|bytes| bytes.checked_add(page - 1))
+        .map(|bytes| bytes / page * page)
+        .ok_or_else(|| invalid("cache geometry overflow"))
+}
+
 impl Cache {
     pub fn new(
         owner: u64,
-        fingerprint: String,
         worker_bytes: usize,
         world_size: usize,
         num_chunks: usize,
         budget: usize,
     ) -> io::Result<Self> {
-        Self::with_hashes(
-            owner,
-            fingerprint,
-            worker_bytes,
-            world_size,
-            num_chunks,
-            budget,
-            None,
-        )
+        Self::with_hashes(owner, worker_bytes, world_size, num_chunks, budget, None)
     }
 
     pub fn with_hashes(
         owner: u64,
-        fingerprint: String,
         worker_bytes: usize,
         world_size: usize,
         num_chunks: usize,
         budget: usize,
         factory: Option<&dyn HashFactory>,
     ) -> io::Result<Self> {
-        if worker_bytes == 0 || world_size == 0 || world_size > 64 || num_chunks == 0 {
-            return Err(invalid("invalid cache geometry"));
+        let size = namespace_bytes(worker_bytes, world_size, num_chunks)?;
+        if size > budget || size > isize::MAX as usize {
+            return Err(invalid("cache exceeds service capacity"));
         }
-        // SAFETY: sysconf has no pointer arguments; the result is validated.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page <= 0 {
-            return Err(invalid("cannot determine page size"));
-        }
-        let page = page as usize;
-        let row_bytes = worker_bytes
-            .checked_mul(world_size)
-            .and_then(|bytes| bytes.checked_add(page - 1))
-            .map(|bytes| bytes / page * page)
-            .ok_or_else(|| invalid("cache geometry overflow"))?;
-        let size = row_bytes
-            .checked_mul(num_chunks)
-            .filter(|size| *size <= budget && *size <= isize::MAX as usize)
-            .ok_or_else(|| invalid("cache exceeds service capacity"))?;
+        let page = page_size()?;
+        let row_bytes = padded_row_bytes(worker_bytes, world_size, page)?;
         let name = CString::new("vllm-kv-cache").expect("literal contains no NUL");
         let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
         // SAFETY: name is NUL-terminated; the returned descriptor is owned below.
@@ -152,15 +158,12 @@ impl Cache {
         };
         Ok(Self {
             owner,
-            fingerprint,
             worker_bytes,
             world_size,
             row_bytes,
             num_chunks,
             file,
             mapping,
-            attached_ranks: HashSet::new(),
-            sessions: HashSet::from([owner]),
             entries: IndexMap::new(),
             free: (0..num_chunks).rev().collect(),
             hashes,
@@ -380,7 +383,7 @@ mod tests {
     }
 
     fn cache() -> Cache {
-        Cache::new(1, "test".into(), 64, 1, 2, 2 * 1024 * 1024).unwrap()
+        Cache::new(1, 64, 1, 2, 2 * 1024 * 1024).unwrap()
     }
 
     fn keys(values: &[&str]) -> Vec<String> {
@@ -395,7 +398,6 @@ mod tests {
         };
         let cache = Cache::with_hashes(
             1,
-            "test".into(),
             64,
             1,
             2,
@@ -449,9 +451,20 @@ mod tests {
 
     #[test]
     fn geometry_and_keys_are_bounded() {
-        assert!(Cache::new(1, "test".into(), usize::MAX, 2, 1, 8192).is_err());
+        assert!(Cache::new(1, usize::MAX, 2, 1, 8192).is_err());
         assert!(check_keys(&keys(&["aa", "aa"])).is_err());
         assert!(check_keys(&keys(&["not-hex"])).is_err());
+    }
+
+    #[test]
+    fn namespace_bytes_pads_every_row_to_a_page() {
+        let page = page_size().unwrap();
+        assert_eq!(namespace_bytes(1, 1, 1).unwrap(), page);
+        assert_eq!(namespace_bytes(page, 2, 3).unwrap(), 6 * page);
+        assert!(namespace_bytes(0, 1, 1).is_err());
+        assert!(namespace_bytes(1, 65, 1).is_err());
+        assert!(namespace_bytes(1, 1, 0).is_err());
+        assert_eq!(namespace_bytes(64, 1, 2).unwrap(), cache().mapping.len());
     }
 
     #[test]
