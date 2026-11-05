@@ -177,7 +177,9 @@ A `store` reservation belongs to the request that made it, so only that request'
 `commit` publishes it. A reservation that is still pending after
 `--pending-timeout-secs` (default 60; 0 disables it) is reclaimed and logged, so a
 request that dies between `store` and `complete_store` cannot leave a key that the
-scheduler keeps retrying as a hit that never becomes readable. A `reset`, which is
+scheduler keeps retrying as a hit that never becomes readable. A `commit` that
+reaches a reclaimed reservation is refused rather than fatal: the connector logs
+one warning and treats that store as one that did not publish. A `reset`, which is
 what `/reset_prefix_cache` reaches, happens in two phases: the connector releases
 its leases, keeps stepping while workers report the transfers the reset flushed,
 and only then sends the forced reset that recycles the slots. The service's

@@ -56,6 +56,11 @@ _UNKNOWN_LEASE = (
     "KV cache service knows no lease for a request reported as finished; the "
     "service and this manager disagree on lease accounting."
 )
+_REFUSED_COMMIT = (
+    "KV cache service refused a commit, which a reservation older than its "
+    "pending timeout leaves behind; the store did not publish, so the key is a "
+    "miss again: %s"
+)
 
 
 @dataclass
@@ -93,8 +98,10 @@ class ServiceOffloadingManager(OffloadingManager):
     the service rejects after a reconnect counts as the same failure, because a
     service that dropped the namespace cannot serve it again. `prepare_load`
     raises instead, since a lookup that could not reach the service missed
-    first. A reply that breaks the slot contract is a service bug rather than a
-    transport failure, so it raises `CacheServiceError` instead of degrading.
+    first. A commit the service refuses, which a reservation older than its
+    pending timeout leaves behind, drops that reservation instead of raising. A
+    reply that breaks the slot contract is a service bug rather than a transport
+    failure, so it raises `CacheServiceError` instead of degrading.
 
     `get_stats()` reports the CPU-tier metrics from one `stats` RPC per
     collection, `config_info()` the chunk geometry the spec negotiated with the
@@ -319,10 +326,7 @@ class ServiceOffloadingManager(OffloadingManager):
             return
         encoded = self._encode(keys)
         for batch in _batches(encoded):
-            committed = self._call_or_degrade(
-                "commit", keys=batch, request=request, success=success
-            )
-            if committed is None:
+            if not self._commit(batch, request, success):
                 return
         state.stores -= 1
         state.reserved.difference_update(encoded)
@@ -348,6 +352,23 @@ class ServiceOffloadingManager(OffloadingManager):
                     )
                 )
         self._maybe_release(request)
+
+    def _commit(self, keys: list[str], request: str, success: bool) -> bool:
+        """Commits one batch without ending the scheduler step for either failure.
+
+        Returns `False` when the service is unreachable, which ends offloading for
+        this engine. A refused commit is not a transport failure: the service has
+        reclaimed a reservation that outlived its pending timeout, so the store
+        did not publish and the key is a miss again.
+        """
+        try:
+            committed = self._call_or_degrade(
+                "commit", keys=keys, request=request, success=success
+            )
+        except CacheServiceError as error:
+            logger.warning_once(_REFUSED_COMMIT, error)
+            return True
+        return committed is not None
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         for batch in _batches(self._encode(keys)):

@@ -249,8 +249,9 @@ the connector reports a pending key as a hit that is not readable yet, so
 `--pending-timeout-secs` (default 60; 0 disables). Each reclaimed request is
 logged as `reservations_reclaimed` with the namespace, key count, and age. A
 `commit` that arrives after its reservation was reclaimed is rejected like any
-other commit without a pending reservation, so keep the timeout above the slowest
-store a worker performs.
+other commit without a pending reservation; the connector logs one warning and
+treats that store as one that did not publish, so keep the timeout above the
+slowest store a worker performs.
 
 `release` and `release_request` still succeed on unknown input, but report what
 they ended: `{"ok": true, "released": N, "unknown": M}` counts the leases

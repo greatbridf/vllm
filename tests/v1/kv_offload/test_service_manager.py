@@ -171,6 +171,24 @@ def test_complete_store_before_on_request_finished_defers_release():
     assert len(client.ops("release_request")) == 1
 
 
+def test_refused_commit_drops_the_reservation_without_raising():
+    """A reservation the service reclaimed must not end the scheduler step."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    key = make_key()
+
+    assert manager.prepare_store([key], request) is not None
+    manager.on_request_finished(request)
+    # The service freed the reservation after its pending timeout.
+    client.reject = True
+    manager.complete_store([key], request)
+
+    assert len(client.ops("commit")) == 1
+    # The store counts as one that did not publish, so the request can finish.
+    assert not manager._requests
+
+
 def test_completion_for_unknown_request_is_ignored_without_negative_counters():
     client = FakeClient()
     manager = make_manager(client)
