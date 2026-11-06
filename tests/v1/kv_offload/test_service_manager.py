@@ -151,7 +151,9 @@ class FakeClient:
             del statuses[statuses.index("miss") + 1 :]
         return {"ok": True, "statuses": statuses}
 
-    def _load(self, keys: list[str], request: str) -> dict[str, Any]:
+    def _load(
+        self, keys: list[str], request: str, prefetch: bool = True
+    ) -> dict[str, Any]:
         slots = self.load_slots if self.load_slots is not None else self._slots(keys)
         return {"ok": True, "slots": list(slots)}
 
@@ -202,6 +204,7 @@ def make_manager(
     info: CPUOffloadingInfo | None = None,
     enable_events: bool = False,
     flush_immediately: bool = False,
+    prefetch: bool = True,
 ) -> ServiceOffloadingManager:
     return ServiceOffloadingManager(
         client or FakeClient(),
@@ -209,6 +212,7 @@ def make_manager(
         info=info,
         enable_events=enable_events,
         flush_immediately=flush_immediately,
+        prefetch=prefetch,
     )
 
 
@@ -456,6 +460,20 @@ def test_lookup_many_degrades_to_misses():
     # One failure disables offloading instead of retrying inside every step.
     assert manager.lookup_many([make_key(0)], request) == [LookupResult.MISS]
     assert len(client.calls) == 1
+
+
+def test_prepare_load_asks_the_service_to_prefetch():
+    """A load is the moment to overlap the remote reads, so the flag is set."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    key = make_key()
+    assert manager.lookup(key, request) is LookupResult.HIT
+    manager.prepare_load([key], request)
+    assert client.ops("load")[0]["prefetch"] is True
+
+    quiet = make_manager(FakeClient(), prefetch=False)
+    assert quiet.prefetch is False
 
 
 def test_prepare_load_rejects_slot_count_mismatch():

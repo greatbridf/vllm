@@ -8,6 +8,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub const MAX_FRAME: usize = 1024 * 1024;
+
+/// Default for a boolean the wire leaved enabled, e.g. prefetching.
+fn enabled() -> bool {
+    true
+}
 pub const MAX_KEYS: usize = 4096;
 
 /// Longest decimal slot id (20 digits) plus its separating comma.
@@ -55,6 +60,9 @@ pub enum Request {
     Load {
         keys: Vec<String>,
         request: String,
+        /// Ask the kernel to read the chunks back in as one range.
+        #[serde(default = "enabled")]
+        prefetch: bool,
     },
     Release {
         keys: Vec<String>,

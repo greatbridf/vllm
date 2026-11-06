@@ -5,6 +5,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use memmap2::{MmapMut, MmapOptions};
@@ -75,7 +76,8 @@ pub struct Cache {
     pub page_size: usize,
     pub num_chunks: usize,
     pub file: File,
-    pub mapping: MmapMut,
+    /// Shared so a prefetch can run after the cache lock is released.
+    pub mapping: Arc<MmapMut>,
     slots: Vec<Slot>,
     /// Key to slot for every reserved or published chunk.
     index: HashMap<Box<str>, u32>,
@@ -380,7 +382,7 @@ impl Cache {
             page_size: page,
             num_chunks,
             file,
-            mapping,
+            mapping: Arc::new(mapping),
             slots: (0..num_chunks).map(|_| Slot::idle()).collect(),
             index: HashMap::new(),
             free: (0..num_chunks as u32).rev().collect(),
@@ -486,6 +488,57 @@ impl Cache {
                 return Err(io::Error::last_os_error());
             }
             pages += self.row_bytes / self.page_size;
+        }
+        Ok(pages)
+    }
+
+    /// Asks the kernel to read the chunks of `slots` back in, in one go.
+    ///
+    /// A swap-in is submitted per fault, and the submitting task blocks on the
+    /// folio until its read finishes, so a task that faults page after page
+    /// keeps exactly one request in flight. `MADV_WILLNEED` over the whole row
+    /// submits the range at once, which is what lets the kernel overlap the
+    /// remote round trips; adjacent chunks share one call.
+    ///
+    /// Args:
+    ///     slots: Slots of the chunks a load is about to read.
+    ///
+    /// Returns:
+    ///     The number of pages handed to the kernel.
+    pub fn prefetch(&self, slots: &[usize]) -> io::Result<usize> {
+        prefetch_rows(&self.mapping, self.row_bytes, self.page_size, slots)
+    }
+
+    /// The mapping and geometry a detached prefetch needs.
+    pub fn prefetch_parts(&self) -> (Arc<MmapMut>, usize, usize) {
+        (Arc::clone(&self.mapping), self.row_bytes, self.page_size)
+    }
+
+    #[allow(dead_code)]
+    fn prefetch_locked(&self, slots: &[usize]) -> io::Result<usize> {
+        let mut sorted = slots.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut pages = 0;
+        let mut index = 0;
+        while index < sorted.len() {
+            let first = sorted[index];
+            let mut last = first;
+            while index + 1 < sorted.len() && sorted[index + 1] == last + 1 {
+                index += 1;
+                last = sorted[index];
+            }
+            let base = self.mapping.as_ptr() as usize + first * self.row_bytes;
+            let len = (last - first + 1) * self.row_bytes;
+            // SAFETY: the slots lie inside the sealed mapping and the range is
+            // whole rows, so it is mapped and page-aligned.
+            let advised =
+                unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+            if advised != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            pages += len / self.page_size;
+            index += 1;
         }
         Ok(pages)
     }
@@ -895,6 +948,39 @@ impl Cache {
     }
 }
 
+/// Asks the kernel to read whole rows back in with one `MADV_WILLNEED` each.
+pub fn prefetch_rows(
+    mapping: &MmapMut,
+    row_bytes: usize,
+    page_size: usize,
+    slots: &[usize],
+) -> io::Result<usize> {
+    let mut sorted = slots.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut pages = 0;
+    let mut index = 0;
+    while index < sorted.len() {
+        let first = sorted[index];
+        let mut last = first;
+        while index + 1 < sorted.len() && sorted[index + 1] == last + 1 {
+            index += 1;
+            last = sorted[index];
+        }
+        let base = mapping.as_ptr() as usize + first * row_bytes;
+        let len = (last - first + 1) * row_bytes;
+        // SAFETY: the slots lie inside the sealed mapping and the range is whole
+        // rows, so it is mapped and page-aligned.
+        let advised = unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+        if advised != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        pages += len / page_size;
+        index += 1;
+    }
+    Ok(pages)
+}
+
 impl Drop for Cache {
     fn drop(&mut self) {
         self.invalidate_hashes();
@@ -991,6 +1077,24 @@ mod tests {
 
     fn recorded(ops: &Arc<Mutex<Vec<Op>>>) -> Vec<Op> {
         ops.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn prefetch_covers_every_page_of_the_given_slots() {
+        let mut cache = cache_with(4);
+        let first = keys(&["aa", "bb", "cc"]);
+        cache.store(&first, "r").unwrap();
+        cache.commit(&first, "r", true).unwrap();
+        let slots: Vec<usize> = first
+            .iter()
+            .map(|key| cache.index.get(key.as_str()).copied().unwrap() as usize)
+            .collect();
+        // Adjacent slots are merged into one call, so two runs here.
+        assert_eq!(
+            cache.prefetch(&slots).unwrap(),
+            3 * cache.row_bytes / cache.page_size
+        );
+        assert_eq!(cache.prefetch(&[]).unwrap(), 0);
     }
 
     #[test]

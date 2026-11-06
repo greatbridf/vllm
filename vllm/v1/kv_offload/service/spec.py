@@ -34,6 +34,7 @@ _SUPPORTED_KEYS = frozenset(
         "offload_prompt_only",
         "offload_region",
         "pin_host_memory",
+        "prefetch_on_load",
         "self_describing_kv_events",
         "service_connect_timeout",
         "service_socket",
@@ -129,6 +130,10 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
         # unevictable; set `pin_host_memory: false` when the pages must stay
         # migratable for kernel-managed offload (rswap).
         self.pin_host_memory: bool = pin_host_memory
+        prefetch = extra.get("prefetch_on_load", True)
+        if not isinstance(prefetch, bool):
+            raise ValueError("prefetch_on_load must be a boolean")
+        self.prefetch_on_load: bool = prefetch
         self.worker_bytes = self.cpu_page_size_per_worker
         world = config.parallel.world_size
         self.kv_bytes_per_chunk = (
@@ -237,6 +242,7 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
                 self.num_chunks,
                 info=self.cpu_info,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
+                prefetch=self.prefetch_on_load,
             )
         return self._manager
 

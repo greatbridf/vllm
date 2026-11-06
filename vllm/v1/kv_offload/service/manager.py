@@ -141,9 +141,14 @@ class ServiceOffloadingManager(OffloadingManager):
         info: CPUOffloadingInfo | None = None,
         enable_events: bool = False,
         flush_immediately: bool = False,
+        prefetch: bool = True,
     ):
         self.client = client
         self.num_chunks = num_chunks
+        # The service asks the kernel to read a load's chunks back in as one
+        # range: a swap-in is submitted per fault and the faulting task blocks
+        # until it completes, so prefetching is what overlaps the remote reads.
+        self.prefetch = prefetch
         # Static labels the connector publishes; empty when the spec gave none.
         self._config_info: ConfigInfoMapping = (
             info.as_config_info() if info is not None else {}
@@ -349,7 +354,10 @@ class ServiceOffloadingManager(OffloadingManager):
         encoded = self._encode(keys)
         batches = list(_batches(encoded))
         replies = self._send_chunks(
-            [("load", {"keys": batch, "request": request}) for batch in batches]
+            [
+                ("load", {"keys": batch, "request": request, "prefetch": self.prefetch})
+                for batch in batches
+            ]
         )
         slots: list[int] = []
         for batch, reply in zip(batches, replies):

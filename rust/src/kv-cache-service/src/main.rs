@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde_json::{Value, json};
 use vllm_kv_cache_service::cache::{
-    Cache, Released, StoreRejection, check_keys, check_request, namespace_bytes,
+    Cache, Released, StoreRejection, check_keys, check_request, namespace_bytes, prefetch_rows,
 };
 use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
 use vllm_kv_cache_service::protocol::{self, Request};
@@ -358,10 +358,30 @@ fn handle(
                     let statuses = cache.lookup_many(&keys, &request, until_miss);
                     json!({"ok": true, "statuses": statuses})
                 }
-                Request::Load { keys, request } => {
+                Request::Load {
+                    keys,
+                    request,
+                    prefetch,
+                } => {
                     check_keys(&keys).map_err(reject)?;
                     check_request(&request).map_err(reject)?;
-                    json!({"ok": true, "slots": cache.load(&keys, &request).map_err(reject)?})
+                    let slots = cache.load(&keys, &request).map_err(reject)?;
+                    // Prefetching must not delay this reply: at a memory limit
+                    // the readahead itself reclaims, which takes longer than a
+                    // client waits. The mapping is shared, so the work runs on
+                    // its own thread with the cache lock released.
+                    let prefetched = if prefetch {
+                        let (mapping, row_bytes, page_size) = cache.prefetch_parts();
+                        let pages = slots.len() * row_bytes / page_size;
+                        let wanted = slots.clone();
+                        std::thread::spawn(move || {
+                            let _ = prefetch_rows(&mapping, row_bytes, page_size, &wanted);
+                        });
+                        pages
+                    } else {
+                        0
+                    };
+                    json!({"ok": true, "slots": slots, "prefetched": prefetched})
                 }
                 Request::Release { keys, request } => {
                     check_keys(&keys).map_err(reject)?;

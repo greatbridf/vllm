@@ -217,7 +217,7 @@ sent only once the burst is collected.
 | `attach` | `version`, `namespace`, `fingerprint`, `rank` | worker | the namespace geometry, then one shared-memory descriptor |
 | `lookup` | `key`, `request` | scheduler | `status` |
 | `lookup_many` | `keys`, `request`, `until_miss` (default `false`) | scheduler | `statuses`, one per key, ending at the first `miss` when `until_miss` is set |
-| `load` | `keys`, `request` | scheduler | `slots`, one per key |
+| `load` | `keys`, `request`, `prefetch` (default `true`) | scheduler | `slots`, one per key, and `prefetched`, the pages the kernel was asked to read ahead |
 | `release` | `keys`, `request` | scheduler | `released`, `unknown` |
 | `release_request` | `request` | scheduler | `released`, `unknown` |
 | `store` | `keys`, `request` | scheduler | `keys`, `slots`, `evicted`, or `full` |
@@ -227,6 +227,13 @@ sent only once the burst is collected.
 | `stats` | none | scheduler or worker | `stats`, `sessions`, `detached` |
 | `close` | none | scheduler | `ok` only |
 | `info` | none | anyone, before any handshake | service state |
+
+`load` prefetches by default: after it resolves the slots it asks the kernel to
+read those chunks back in with one `MADV_WILLNEED` per contiguous row, on its own
+thread so the reply is never delayed. A swap-in is submitted per fault and the
+faulting task then blocks on the folio, so a task that faults page after page
+keeps exactly one request in flight; the prefetch is what lets the kernel overlap
+the remote round trips (measured: `read_peak_inflight` 1 before, 8 after).
 
 `spill` asks the kernel to write committed chunks out through the swap path
 without waiting for memory pressure: it faults each page of the chunk into this
