@@ -80,14 +80,27 @@ def rswap_devices() -> list[str]:
     ]
 
 
-def rswap_stats(device: str) -> dict[str, int]:
-    path = RSWAP_DEBUGFS / f"type{device}" / "stats"
+def rswap_stats() -> dict[str, int]:
+    """Backend-wide counters.
+
+    The per-device `type<N>/stats` page counters stay at zero for writeback
+    driven by `MADV_PAGEOUT` on this kernel (the global file counts it), so the
+    harness reads the backend-wide file and cross-checks the device's `Used`
+    field in `/proc/swaps`.
+    """
     stats: dict[str, int] = {}
-    for line in path.read_text().splitlines():
+    for line in (RSWAP_DEBUGFS / "stats").read_text().splitlines():
         fields = line.split()
         if len(fields) == 2 and fields[1].isdigit():
             stats[fields[0]] = int(fields[1])
     return stats
+
+
+def device_used_kib(device: str) -> int:
+    for row in Path("/proc/swaps").read_text().splitlines()[1:]:
+        if row.startswith(f"xswap{device}"):
+            return int(row.split()[3])
+    return 0
 
 
 class RswapDevice:
@@ -109,19 +122,39 @@ class RswapDevice:
         if len(created) != 1:
             raise RuntimeError("kernel added no rswap device")
         self.device = created[0]
-        self.before = rswap_stats(self.device)
+        self.before = rswap_stats()
+        self.before_used = device_used_kib(self.device)
+
+    def settle(self, timeout_s: float = 10.0) -> None:
+        """Waits until the backend's written-page count stops moving."""
+        deadline = time.monotonic() + timeout_s
+        last = rswap_stats().get("written_pages", 0)
+        quiet = 0
+        while time.monotonic() < deadline and quiet < 4:
+            time.sleep(0.1)
+            current = rswap_stats().get("written_pages", 0)
+            quiet = quiet + 1 if current == last else 0
+            last = current
 
     def stats(self) -> dict[str, int]:
-        after = rswap_stats(self.device)
+        """Backend-wide deltas, plus what this device itself holds."""
+        after = rswap_stats()
         return {
-            "rswap_pages_written": after["pages_written"]
-            - self.before["pages_written"],
-            "rswap_pages_read": after["pages_read"] - self.before["pages_read"],
-            "rswap_errors": after["errors_written"]
-            - self.before["errors_written"]
-            + after["errors_read"]
-            - self.before["errors_read"],
-            "rswap_no_digest": after["no_digest"] - self.before["no_digest"],
+            "rswap_pages_written": after["written_pages"]
+            - self.before["written_pages"],
+            "rswap_pages_read": after["read_pages"] - self.before["read_pages"],
+            "rswap_mib_written": round(
+                (after["written_bytes"] - self.before["written_bytes"]) / 2**20, 1
+            ),
+            "rswap_device_used_kib": device_used_kib(self.device) - self.before_used,
+            "rswap_errors": after["written_errors"]
+            - self.before["written_errors"]
+            + after["read_errors"]
+            - self.before["read_errors"],
+            "rswap_no_digest": after["written_no_digest"]
+            - self.before["written_no_digest"],
+            "rswap_write_batch_ms": round(after["written_avg_ns"] / 1e6, 1),
+            "rswap_read_batch_ms": round(after["read_avg_ns"] / 1e6, 1),
         }
 
     def close(self) -> None:
@@ -158,16 +191,36 @@ class Service:
         self.dir.cleanup()
 
 
+class DeviceBuffer:
+    """A reused per-rank "GPU" chunk, so a copy moves real bytes both ways."""
+
+    def __init__(self, worker_bytes: int) -> None:
+        self.buffer = np.zeros(worker_bytes, dtype=np.int8)
+
+    def read_from(self, view, slot: int) -> None:
+        np.copyto(self.buffer, view[slot], casting="same_kind")
+
+    def write_into(self, view, slot: int) -> None:
+        np.copyto(view[slot], self.buffer, casting="same_kind")
+
+
 class Engine:
     """One engine's scheduler-side manager and worker-side region."""
 
-    def __init__(self, socket_path: str, chunks: int, worker_bytes: int, name: str):
+    def __init__(
+        self,
+        socket_path: str,
+        chunks: int,
+        worker_bytes: int,
+        name: str,
+        world_size: int = 1,
+    ):
         self.spec = RustServiceOffloadingSpec(
             replace(
                 make_offloading_config(
-                    cpu_bytes_to_use=chunks * worker_bytes,
+                    cpu_bytes_to_use=chunks * worker_bytes * world_size,
                     worker_kv_bytes_per_block=worker_bytes,
-                    world_size=1,
+                    world_size=world_size,
                     engine_id=name,
                     extra_config={
                         "service_socket": socket_path,
@@ -178,37 +231,53 @@ class Engine:
             )
         )
         self.manager = self.spec.get_manager()
-        client = CacheServiceClient(socket_path)
-        geometry = client.call(
-            "attach",
-            version=1,
-            namespace=name,
-            fingerprint=self.spec.fingerprint,
-            rank=0,
-        )
-        self.region = ServiceOffloadRegion(
-            client,
-            client.receive_fd(),
-            geometry["num_chunks"],
-            geometry["row_bytes"],
-            geometry["worker_bytes"],
-            geometry["world_size"],
-            0,
-            pin_host_memory=self.spec.pin_host_memory,
-        )
-        self.view = self.region.create_next_worker_view(worker_bytes).numpy()
+        self.regions: list[ServiceOffloadRegion] = []
+        self.views: list[np.ndarray] = []
+        for rank in range(world_size):
+            client = CacheServiceClient(socket_path)
+            geometry = client.call(
+                "attach",
+                version=1,
+                namespace=name,
+                fingerprint=self.spec.fingerprint,
+                rank=rank,
+            )
+            region = ServiceOffloadRegion(
+                client,
+                client.receive_fd(),
+                geometry["num_chunks"],
+                geometry["row_bytes"],
+                geometry["worker_bytes"],
+                geometry["world_size"],
+                rank,
+                pin_host_memory=self.spec.pin_host_memory,
+            )
+            self.regions.append(region)
+            self.views.append(region.create_next_worker_view(worker_bytes).numpy())
 
     def page_out(self) -> float:
+        """Asks the kernel to write the whole mapping out; returns the seconds.
+
+        A non-zero return is a real failure, not a slow path: it means the kernel
+        refused the range, so nothing reached the backend.
+        """
         started = time.perf_counter()
-        LIBC.madvise(
-            ctypes.c_void_p(self.region.base_tensor.data_ptr()),
-            ctypes.c_size_t(self.region.total_size_bytes),
-            ctypes.c_int(MADV_PAGEOUT),
-        )
+        for region in self.regions:
+            ctypes.set_errno(0)
+            advised = LIBC.madvise(
+                ctypes.c_void_p(region.base_tensor.data_ptr()),
+                ctypes.c_size_t(region.total_size_bytes),
+                ctypes.c_int(MADV_PAGEOUT),
+            )
+            if advised != 0:
+                raise RuntimeError(
+                    f"madvise(MADV_PAGEOUT) failed: {os.strerror(ctypes.get_errno())}"
+                )
         return time.perf_counter() - started
 
     def close(self) -> None:
-        self.region.cleanup()
+        for region in self.regions:
+            region.cleanup()
         self.manager.shutdown()
 
 
@@ -246,7 +315,7 @@ def tail_keys(serial: int, count: int) -> list[OffloadKey]:
     ]
 
 
-def warm(manager, view, count: int) -> None:
+def warm(manager, views, device: DeviceBuffer, count: int) -> None:
     """Publishes the shared prefix so the measured rounds are read-heavy."""
     if not count:
         return
@@ -255,14 +324,22 @@ def warm(manager, view, count: int) -> None:
     output = manager.prepare_store(keys, request)
     assert output is not None, "the shared prefix did not fit the cache"
     for slot in output.store_spec.block_ids:
-        view[int(slot)][:] = 0x33
+        for view in views:
+            device.write_into(view, int(slot))
     manager.complete_store(output.keys_to_store, request)
     manager.on_request_finished(request)
     manager.on_schedule_end(None)
 
 
 def step(
-    manager, view, runs: Runs, prefix: int, tail: int, serial: int, copy: bool = True
+    manager,
+    views,
+    device: DeviceBuffer,
+    runs: Runs,
+    prefix: int,
+    tail: int,
+    serial: int,
+    copy: bool = True,
 ) -> None:
     request = ReqContext(f"req-{serial}")
     started = time.perf_counter()
@@ -282,7 +359,8 @@ def step(
                 # Read a byte so the copy is not folded away, and so a remote
                 # page is faulted in exactly as a DMA read would fault it.
                 if copy:
-                    view[int(slot)][0] &= 0x7F
+                    for view in views:
+                        device.read_from(view, int(slot))
             manager.complete_load(hit_keys, request)
             runs.read_chunks += len(hit_keys)
     runs.read.append(time.perf_counter() - started)
@@ -297,7 +375,8 @@ def step(
             slots = [int(slot) for slot in output.store_spec.block_ids]
             if copy:
                 for slot in slots:
-                    view[slot][:] = 0x5A
+                    for view in views:
+                        device.write_into(view, slot)
             manager.complete_store(output.keys_to_store, request)
             runs.write_chunks += len(slots)
             runs.evicted += len(output.evicted_keys)
@@ -307,14 +386,22 @@ def step(
 
 
 def run_rust(args, runs: Runs, index: int) -> None:
-    engine = Engine(args.socket, args.chunks, args.worker_bytes, f"bench-{index}")
+    engine = Engine(
+        args.socket,
+        args.chunks,
+        args.worker_bytes,
+        f"bench-{index}",
+        world_size=args.world_size,
+    )
     try:
-        warm(engine.manager, engine.view, args.prefix_chunks)
+        device = DeviceBuffer(args.worker_bytes)
+        warm(engine.manager, engine.views, device, args.prefix_chunks)
         for round_index in range(args.rounds):
             for request_index in range(args.requests):
                 step(
                     engine.manager,
-                    engine.view,
+                    engine.views,
+                    device,
                     runs,
                     args.prefix_chunks,
                     args.tail_chunks,
@@ -331,13 +418,15 @@ def run_rust(args, runs: Runs, index: int) -> None:
 
 def run_cpu(args, runs: Runs) -> None:
     manager = CPUOffloadingManager(num_chunks=args.chunks)
-    view = np.zeros((args.chunks, args.worker_bytes), dtype=np.uint8)
-    warm(manager, view, args.prefix_chunks)
+    views = [np.zeros((args.chunks, args.worker_bytes), dtype=np.int8)]
+    device = DeviceBuffer(args.worker_bytes)
+    warm(manager, views, device, args.prefix_chunks)
     for round_index in range(args.rounds):
         for request_index in range(args.requests):
             step(
                 manager,
-                view,
+                views,
+                device,
                 runs,
                 args.prefix_chunks,
                 args.tail_chunks,
@@ -396,6 +485,12 @@ def main() -> int:
     parser.add_argument("--prefix-chunks", type=int, default=192)
     parser.add_argument("--tail-chunks", type=int, default=64)
     parser.add_argument("--threads", type=int, default=1, help="engines for rust mode")
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=1,
+        help="tensor-parallel ranks; every rank stores its own copy",
+    )
     parser.add_argument("--rswap", action="store_true", help="attach rswap, unpinned")
     parser.add_argument(
         "--no-copy",
@@ -421,7 +516,12 @@ def main() -> int:
     service = None
     if args.mode in ("rust", "both") and args.socket is None:
         service = Service(
-            args.chunks * args.worker_bytes * max(args.threads, 1) * 2, args.rswap
+            args.chunks
+            * args.worker_bytes
+            * max(args.threads, 1)
+            * args.world_size
+            * 2,
+            args.rswap,
         )
         args.socket = service.path
     device = None
@@ -448,7 +548,12 @@ def main() -> int:
             if args.rswap:
                 label += " rswap"
             results.append(
-                summarise(label, runs, time.perf_counter() - started, args.worker_bytes)
+                summarise(
+                    label,
+                    runs,
+                    time.perf_counter() - started,
+                    args.worker_bytes * args.world_size,
+                )
             )
         if args.mode in ("cpu", "both"):
             runs = Runs()
@@ -461,12 +566,18 @@ def main() -> int:
                 )
             )
     finally:
+        # Read the backend counters while the device still exists: destroying it
+        # discards anything still in flight and loses the evidence.
+        counters = None
+        if device is not None:
+            device.settle()
+            counters = device.stats()
         if service is not None:
             service.close()
+        if device is not None:
+            device.close()
 
-    if device is not None:
-        counters = device.stats()
-        device.close()
+    if counters is not None:
         for result in results:
             result.update(counters)
 
