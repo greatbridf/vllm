@@ -235,12 +235,21 @@ carries the rswap program and the reverse-mapping walk stops as soon as a folio
 is no longer mapped, and then calls `madvise(MADV_PAGEOUT)` on the chunk.
 It is the service's own mapping that both holds those entries and carries the
 attach, so the service has to be the caller; a worker's mapping cannot do it.
-Measured on a 7.3 rswap kernel, `MADV_PAGEOUT` reports success for this shmem
-mapping while nothing is reclaimed (`/proc/swaps` `xswap<N>` `Used` stays 0),
-whereas an anonymous mapping of the same size writes every page out, so the
-response `pages` is what was advised, not what reached the backend. Driving
-reclaim by memory pressure in a bounded cgroup is the reliable trigger; that is
-what `tools/mm/rswap_run_test.py` in the kernel tree does.
+`MADV_PAGEOUT` is not a usable trigger for this mapping: measured on a 7.3 rswap
+kernel it reports success while nothing is reclaimed (`/proc/swaps` `xswap<N>`
+`Used` stays 0) and no digest program run is recorded, whereas an anonymous
+mapping of the same size writes every page out. So the response `pages` is what
+was advised, not what reached the backend.
+
+Cgroup v2 reclaim is the trigger that works: charge the KV pages to a cgroup of
+its own and write `memory.reclaim`. At the DeepSeek-V4.1-Flash geometry
+(4.92 MiB per chunk across TP=8) one run of 7 chunks moved 2 909 pages / 46.5 MiB
+into the backend at ~22.8 ms per 32-page batch. Read back is what fails on that
+kernel: `rswap: kernel_connect ... failed: -4` (EINTR) followed by
+`rswap: read type 1 failed: -4` and `Read-error on swap-device`, which kills the
+task that touched the page, and `read_errors`/`redis_retries` climb. Do not use
+this path in production until the read side retries and reports instead of
+faulting.
 
 `open` and `attach` are the only handshake operations, and a session holds at
 most one namespace. `open` creates a namespace under a caller-chosen name, with
