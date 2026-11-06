@@ -278,6 +278,35 @@ def test_a_truncated_reply_closes_the_socket(serve):
         client.close()
 
 
+def test_a_mid_burst_failure_closes_the_socket(serve):
+    """A burst that breaks off part way leaves no reply owed on a dead stream."""
+    fake = serve([{"ok": True}, struct.pack("!I", 64) + b"{"])
+    client = CacheServiceClient(fake.path, op_timeout=OP_TIMEOUT_S)
+    try:
+        with pytest.raises(CacheServiceUnavailable, match="commit failed"):
+            client.pipeline(
+                [
+                    ("commit", {"keys": ["a"], "request": "r", "success": True}),
+                    ("commit", {"keys": ["b"], "request": "r", "success": True}),
+                    ("release_request", {"request": "r"}),
+                ]
+            )
+        assert client.socket.fileno() == -1
+        # The replies died with the socket, so the next call is not refused as
+        # interleaving with an unread burst: it reconnects and is answered.
+        assert client.call("stats", retry=True) == {"ok": True}
+    finally:
+        client.close()
+
+    # The peer read the first two frames and broke off writing the second reply,
+    # so the rest of the burst went with the connection.
+    assert [request["op"] for request in fake.received] == [
+        "commit",
+        "commit",
+        "stats",
+    ]
+
+
 def test_an_oversized_call_in_a_burst_writes_nothing(serve):
     """Both forms encode the whole burst before the first frame goes out."""
     fake = serve()

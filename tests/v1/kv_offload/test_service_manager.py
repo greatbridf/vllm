@@ -948,6 +948,22 @@ def test_a_failed_flush_is_not_replayed():
     assert len(client.bursts()) == 1
 
 
+def test_a_request_that_finishes_twice_releases_its_leases_once():
+    """The second finish finds no state, so it owes the service nothing."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    assert manager.lookup(make_key(0), request) is LookupResult.HIT
+
+    manager.on_request_finished(request)
+    manager.on_request_finished(request)
+    manager.on_schedule_end(SCHEDULE_END)
+
+    assert client.ops("release_request") == [
+        {"retry": False, "request": wire_id("request")}
+    ]
+
+
 def test_an_immediate_flush_matches_the_step_burst():
     """The queued path reaches the same service calls and bookkeeping."""
     deferred = FakeClient()

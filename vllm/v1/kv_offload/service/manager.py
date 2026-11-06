@@ -117,12 +117,12 @@ class ServiceOffloadingManager(OffloadingManager):
     round trips per request. That delays three things by at most one step, and
     the connector tolerates all three because it never reads their answer: a key
     stored earlier in the same step is published at the end of that step, so a
-    lookup for it in the same step still reports `HIT_PENDING`; a `store` for a
-    key whose commit is still queued sees the key as pending, so it reserves
-    nothing new and cannot double-allocate; and a finished request's leases are
-    held until the end of the same step. `flush()` runs before every call whose
-    answer depends on the queue being applied: `prepare_store()`, `reset_cache()`,
-    `on_reset_flushed()`, `get_stats()`, and `shutdown()`.
+    lookup for it in the same step still reports `HIT_PENDING`; a `store` flushes
+    the queue first, so it never reserves a key a queued commit is about to
+    publish; and a finished request's leases are held until the end of the same
+    step. `flush()` runs before every call whose answer depends on the queue being
+    applied: `prepare_store()`, `reset_cache()`, `on_reset_flushed()`,
+    `get_stats()`, and `shutdown()`.
 
     `get_stats()` reports the CPU-tier metrics from one `stats` RPC per
     collection, `config_info()` the chunk geometry the spec negotiated with the

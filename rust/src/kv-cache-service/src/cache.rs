@@ -1199,6 +1199,25 @@ mod tests {
     }
 
     #[test]
+    fn an_until_miss_scan_reports_the_pending_status_it_walks_past() {
+        // Only a miss ends the scan: a reservation another request is still
+        // writing is reported, and it is not the caller's to hold.
+        let mut cache = cache_with(4);
+        let stored = keys(&["aa", "bb"]);
+        cache.store(&stored, "writer").unwrap();
+        cache.commit(&keys(&["aa"]), "writer", true).unwrap();
+
+        let scan = keys(&["aa", "bb", "zz", "cc"]);
+        assert_eq!(
+            cache.lookup_many(&scan, "r", true),
+            vec![Status::Hit, Status::Pending, Status::Miss]
+        );
+        assert_eq!(cache.stats()["leased"], 1);
+        assert_eq!(cache.stats()["pending_hits"], 1);
+        cache.assert_slot_accounting();
+    }
+
+    #[test]
     fn release_request_uses_the_lease_index() {
         let mut cache = cache_with(3);
         let stored = keys(&["aa", "bb", "cc"]);
