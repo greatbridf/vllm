@@ -250,6 +250,44 @@ def _redis_get(keys):
         connection.close()
 
 
+def _redis_del(keys):
+    """Removes `keys` from the backend; False if it is not writable.
+
+    The digest of a page is deterministic, so an object left by an earlier run
+    makes a read-only audit pass without this run writing anything. Deleting
+    first is what makes the check prove a fresh store.
+    """
+    params = _redis_params()
+    if params is None or not keys:
+        return False
+    try:
+        connection = socket.create_connection(
+            (params["host"], int(params["port"])), timeout=5
+        )
+
+        def command(*args):
+            frame = f"*{len(args)}\r\n".encode()
+            for arg in args:
+                frame += b"$%d\r\n%s\r\n" % (len(arg), arg)
+            connection.sendall(frame)
+            head, _, _ = connection.recv(64).partition(b"\r\n")
+            return head
+
+        try:
+            command(
+                b"AUTH",
+                params.get("redis_user", "default").encode(),
+                params["password"].encode(),
+            )
+            for key in keys:
+                command(b"DEL", key.encode())
+        finally:
+            connection.close()
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
 def test_reclaimed_pages_round_trip_through_rswap(device, service):
     spec = _spec(service)
     manager = spec.get_manager()
@@ -271,6 +309,7 @@ def test_reclaimed_pages_round_trip_through_rswap(device, service):
         manager.complete_store([key], request)
         assert manager.lookup(key, request) is LookupResult.HIT
 
+    fresh = _redis_del([_page_digest(key, page) for key, page, _ in pages.values()])
     before = read_stats(device)
     advised = LIBC.madvise(
         ctypes.c_void_p(region.base_tensor.data_ptr()),
@@ -303,6 +342,9 @@ def test_reclaimed_pages_round_trip_through_rswap(device, service):
         offset: _page_digest(key, page) for offset, (key, page, _) in pages.items()
     }
     stored = _redis_get(list(digests.values()))
+    assert fresh or stored is None, (
+        "the digest audit needs a writable backend to prove a fresh store"
+    )
     if stored is None:
         print(f"no readable rswap backend: {len(pages)} pages stored unaudited")
     else:
