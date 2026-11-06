@@ -22,6 +22,7 @@ from vllm.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    ScheduleEndContext,
 )
 from vllm.v1.kv_offload.cpu.common import (
     CPULoadStoreSpec,
@@ -61,6 +62,10 @@ _REFUSED_COMMIT = (
     "KV cache service refused a commit, which a reservation older than its "
     "pending timeout leaves behind; the store did not publish, so the key is a "
     "miss again: %s"
+)
+_REFUSED_DEFERRED = (
+    "KV cache service refused a deferred call, so state this client already "
+    "dropped may still stand in the service: %s"
 )
 
 
@@ -104,6 +109,21 @@ class ServiceOffloadingManager(OffloadingManager):
     contract is a service bug rather than a transport failure, so it raises
     `CacheServiceError` instead of degrading.
 
+    The calls whose answer nothing in the step depends on -- the `commit` of a
+    completed store, the `release_request` of a finished request, and `touch()` --
+    are queued in enqueue order and written together by `flush()`, which the
+    connector reaches once per step through `on_schedule_end()`. A step therefore
+    costs one write burst and one read burst for them instead of two or three
+    round trips per request. That delays three things by at most one step, and
+    the connector tolerates all three because it never reads their answer: a key
+    stored earlier in the same step is published at the end of that step, so a
+    lookup for it in the same step still reports `HIT_PENDING`; a `store` for a
+    key whose commit is still queued sees the key as pending, so it reserves
+    nothing new and cannot double-allocate; and a finished request's leases are
+    held until the end of the same step. `flush()` runs before every call whose
+    answer depends on the queue being applied: `prepare_store()`, `reset_cache()`,
+    `on_reset_flushed()`, `get_stats()`, and `shutdown()`.
+
     `get_stats()` reports the CPU-tier metrics from one `stats` RPC per
     collection, `config_info()` the chunk geometry the spec negotiated with the
     service, and `take_events()` the store and eviction events its own store
@@ -120,6 +140,7 @@ class ServiceOffloadingManager(OffloadingManager):
         num_chunks: int,
         info: CPUOffloadingInfo | None = None,
         enable_events: bool = False,
+        flush_immediately: bool = False,
     ):
         self.client = client
         self.num_chunks = num_chunks
@@ -131,6 +152,10 @@ class ServiceOffloadingManager(OffloadingManager):
         self._requests: dict[str, _RequestLeases] = {}
         self._reset_pending = False
         self._degraded = False
+        # Deferrable calls waiting for the step's burst. Only the tests write
+        # them one at a time, which is the reference this pipeline must match.
+        self._deferred = not flush_immediately
+        self._queue: list[tuple[str, dict[str, Any]]] = []
         # Chunks each store call asked the service for since the last drain.
         self._allocation_sizes: list[int] = []
         self._events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -172,6 +197,17 @@ class ServiceOffloadingManager(OffloadingManager):
         except CacheServiceUnavailable as error:
             self._degrade(op, error)
             return None
+
+    def _send_chunks(
+        self, calls: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Sends one operation's chunk split, as one burst when it split."""
+        if not calls:
+            return []
+        if len(calls) == 1:
+            op, fields = calls[0]
+            return [self.client.call(op, **fields)]
+        return self.client.pipeline(calls)
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -296,9 +332,12 @@ class ServiceOffloadingManager(OffloadingManager):
     ) -> CPULoadStoreSpec:
         request = self._wire_id(req_context.req_id)
         encoded = self._encode(keys)
+        batches = list(_batches(encoded))
+        replies = self._send_chunks(
+            [("load", {"keys": batch, "request": request}) for batch in batches]
+        )
         slots: list[int] = []
-        for batch in _batches(encoded):
-            reply = self.client.call("load", keys=batch, request=request)
+        for batch, reply in zip(batches, replies):
             slots += self._chunk_slots(reply, len(batch))
         state = self._request_state(request)
         state.loads += 1
@@ -323,10 +362,15 @@ class ServiceOffloadingManager(OffloadingManager):
     def prepare_store(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> PrepareStoreOutput | None:
+        # A commit still queued would make the service report this key as
+        # pending, so the store would reserve nothing for it.
+        self.flush()
         request = self._wire_id(req_context.req_id)
         stored: list[OffloadKey] = []
         slots: list[int] = []
         evicted_keys: list[OffloadKey] = []
+        # One batch at a time: a chunk that comes back full ends the store, so
+        # the reservations behind it must never be asked for.
         for batch in _batches(self._encode(keys)):
             self._allocation_sizes.append(len(batch))
             try:
@@ -380,9 +424,8 @@ class ServiceOffloadingManager(OffloadingManager):
             logger.warning_once(_UNMATCHED_COMPLETION)
             return
         encoded = self._encode(keys)
-        for batch in _batches(encoded):
-            if not self._commit(batch, request, success):
-                return
+        if not self._commit(list(_batches(encoded)), request, success):
+            return
         state.stores -= 1
         state.reserved.difference_update(encoded)
         if self._events is not None and keys:
@@ -408,27 +451,43 @@ class ServiceOffloadingManager(OffloadingManager):
                 )
         self._maybe_release(request)
 
-    def _commit(self, keys: list[str], request: str, success: bool) -> bool:
-        """Commits one batch without ending the scheduler step for either failure.
+    def _commit(self, batches: list[list[str]], request: str, success: bool) -> bool:
+        """Commits one store's batches without ending the step for either failure.
 
         Returns `False` when the service is unreachable, which ends offloading for
         this engine. A refused commit is not a transport failure: the service has
         reclaimed a reservation that outlived its pending timeout, so the store
         did not publish and the key is a miss again.
         """
+        calls = [
+            ("commit", {"keys": batch, "request": request, "success": success})
+            for batch in batches
+        ]
+        if self._deferred:
+            self._queue.extend(calls)
+            return True
+        if self._degraded:
+            return False
         try:
-            committed = self._call_or_degrade(
-                "commit", keys=keys, request=request, success=success
-            )
+            self._send_chunks(calls)
+        except CacheServiceUnavailable as error:
+            self._degrade("commit", error)
+            return False
         except CacheServiceError as error:
             logger.warning_once(_REFUSED_COMMIT, error)
-            return True
-        return committed is not None
+        return True
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
-        for batch in _batches(self._encode(keys)):
-            if self._call_or_degrade("touch", keys=batch) is None:
-                return
+        calls = [("touch", {"keys": batch}) for batch in _batches(self._encode(keys))]
+        if self._deferred:
+            self._queue.extend(calls)
+            return
+        if self._degraded:
+            return
+        try:
+            self._send_chunks(calls)
+        except CacheServiceUnavailable as error:
+            self._degrade("touch", error)
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         request = self._wire_id(req_context.req_id)
@@ -437,6 +496,39 @@ class ServiceOffloadingManager(OffloadingManager):
             return
         state.finished = True
         self._maybe_release(request)
+
+    def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        """Writes the step's deferred completions, touches, and releases."""
+        self.flush()
+
+    def flush(self) -> None:
+        """Writes every queued deferrable call as one burst.
+
+        The queue is detached before the burst is written, so a failed burst is
+        never replayed: a repeated `commit` or `release_request` would report
+        state the service already changed. A rejection is not a lost connection,
+        and the client drains the rest of the burst before it raises, so every
+        queued call was applied as its own reply reported.
+        """
+        calls, self._queue = self._queue, []
+        if not calls or self._degraded:
+            return
+        try:
+            replies = self.client.pipeline(calls)
+        except CacheServiceUnavailable as error:
+            self._degrade("flush", error)
+            return
+        except CacheServiceError as error:
+            if any(op == "commit" for op, _ in calls):
+                # Only a commit is refusable here, and its reservation outlived
+                # the service's pending timeout, so that store did not publish.
+                logger.warning_once(_REFUSED_COMMIT, error)
+            else:
+                logger.warning_once(_REFUSED_DEFERRED, error)
+            return
+        for (op, _), reply in zip(calls, replies):
+            if op == "release_request" and reply.get("unknown"):
+                logger.warning_once(_UNKNOWN_LEASE)
 
     def _maybe_release(self, request: str) -> None:
         state = self._requests.get(request)
@@ -451,14 +543,23 @@ class ServiceOffloadingManager(OffloadingManager):
         del self._requests[request]
         if not state.leased:
             return
+        self._release(request)
+
+    def _release(self, request: str) -> None:
+        """Releases one request's lookup leases, or queues the release."""
+        if self._deferred:
+            self._queue.append(("release_request", {"request": request}))
+            return
         response = self._call_or_degrade("release_request", request=request)
         if response is not None and response.get("unknown"):
             logger.warning_once(_UNKNOWN_LEASE)
 
     def reset_cache(self) -> None:
+        # Writes the queue first, so no queued call lands after the fence.
+        self.flush()
         for request, state in self._requests.items():
             if state.leased:
-                self._call_or_degrade("release_request", request=request)
+                self._release(request)
                 state.leased = False
         self._reset_pending = True
 
@@ -469,6 +570,7 @@ class ServiceOffloadingManager(OffloadingManager):
         """Ends the reset now that every flushed transfer has been reported."""
         if not self._reset_pending:
             return
+        self.flush()
         for request, state in list(self._requests.items()):
             for batch in _batches(sorted(state.reserved)):
                 self._reset_call("commit", keys=batch, request=request, success=False)
@@ -494,6 +596,9 @@ class ServiceOffloadingManager(OffloadingManager):
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         """Reports the CPU-tier metrics from one `stats` RPC per collection."""
+        # Report the counters of a step whose completions and releases have
+        # landed, not those of one that still owes them.
+        self.flush()
         allocation_sizes, self._allocation_sizes = self._allocation_sizes, []
         try:
             response = self._call_or_degrade("stats", retry=True)
@@ -546,8 +651,11 @@ class ServiceOffloadingManager(OffloadingManager):
         """Retires the namespace, then closes the connection.
 
         A service that is already gone, or one that dropped this namespace,
-        needs no close, and shutdown must not raise either way.
+        needs no close, and shutdown must not raise either way. Whatever the
+        step queued is written first, so the namespace the service retires holds
+        the keys that step published.
         """
+        self.flush()
         with contextlib.suppress(CacheServiceError):
             self.client.call("close")
         self.client.close()

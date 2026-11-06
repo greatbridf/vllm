@@ -175,8 +175,21 @@ failures. Requests carry no ids, so replies are ordered: the service answers one
 connection's requests in arrival order, exactly one reply per request. A client
 may therefore write a burst of frames before reading any reply and then read one
 reply per request in the same order; `CacheServiceClient.pipeline` does exactly
-that, and a burst costs one round trip instead of one per request. The connector
-still sends one request at a time.
+that, and a burst costs one round trip instead of one per request.
+
+The connector batches the calls whose reply nothing in its step depends on: a
+completed store queues one `commit` per 4096-key batch, a finished request queues
+its `release_request`, and `touch` queues its batches, and the manager writes that
+queue as one burst from `on_schedule_end`, once per scheduler step. A step therefore
+costs one write burst and one read burst for its completions and releases instead
+of two or three round trips per request. The calls whose answer the step needs --
+`lookup`, `lookup_many`, `load`, `store` -- stay one request each, so a key stored
+earlier in a step is published at the end of that step and a `lookup` for it in the
+same step still reports `pending`. The manager flushes the queue before a `store`,
+a `stats`, a `reset`, and a `close`, so a call that depends on what the queue still
+owes never overtakes it. An operation whose chunks split above 4096 keys is written
+as one burst for that operation, except `store`, which stops at the first batch the
+cache cannot fit.
 
 A burst holds no handshake. An `attach` reply is a frame followed by one
 descriptor message, which must be received with its marker byte, so the handshake

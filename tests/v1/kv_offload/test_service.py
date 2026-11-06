@@ -16,7 +16,12 @@ import pytest
 import torch
 
 from tests.v1.kv_offload.conftest import make_offloading_config
-from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadKey,
+    ReqContext,
+    ScheduleEndContext,
+)
 from vllm.v1.kv_offload.service.client import (
     CacheServiceClient,
     CacheServiceUnavailable,
@@ -25,6 +30,7 @@ from vllm.v1.kv_offload.service.region import ServiceOffloadRegion
 from vllm.v1.kv_offload.service.spec import RustServiceOffloadingSpec
 
 PAGE = mmap.PAGESIZE
+SCHEDULE_END = ScheduleEndContext((), ())
 BINARY = Path(
     os.environ.get(
         "VLLM_KV_CACHE_SERVICE_BINARY", "rust/target/debug/vllm-kv-cache-service"
@@ -126,12 +132,14 @@ def test_rust_service_shares_rank_slices_and_publishes_only_completed_stores(ser
             regions[0].base_tensor[slot * PAGE + 64 : slot * PAGE + 128] == 29
         )
         manager.complete_store([key], request)
+        manager.on_schedule_end(SCHEDULE_END)
         assert manager.lookup(key, request) is LookupResult.HIT
         load = manager.prepare_load([key], request)
         assert int(load.block_ids[0]) == slot
         manager.on_request_finished(request)
         assert manager.client.call("stats")["stats"]["leased"] == 1
         manager.complete_load([key], request)
+        manager.on_schedule_end(SCHEDULE_END)
         assert manager.client.call("stats")["stats"]["leased"] == 0
         manager.reset_cache()
         # The connector flushes in-flight transfers, then reports the flush.
@@ -152,6 +160,7 @@ def test_store_commit_round_trip_publishes_the_leased_slot(service):
         assert output is not None
         assert manager.lookup(key, request) is LookupResult.HIT_PENDING
         manager.complete_store([key], request)
+        manager.on_schedule_end(SCHEDULE_END)
         assert manager.lookup(key, request) is LookupResult.HIT
         load = manager.prepare_load([key], request)
         assert load.block_ids == output.store_spec.block_ids
@@ -190,11 +199,13 @@ def test_lookup_lease_prevents_eviction_and_failed_store_is_removed(service):
         keys = [OffloadKey(b"aa"), OffloadKey(b"bb")]
         assert manager.prepare_store(keys, request) is not None
         manager.complete_store(keys, request)
+        manager.on_schedule_end(SCHEDULE_END)
         assert manager.lookup(keys[0], request) is LookupResult.HIT
         third = OffloadKey(b"cc")
         output = manager.prepare_store([third], request)
         assert output is not None and output.evicted_keys == [keys[1]]
         manager.complete_store([third], request, success=False)
+        manager.on_schedule_end(SCHEDULE_END)
         assert manager.lookup(third, request) is LookupResult.MISS
         manager.on_request_finished(request)
         manager.reset_cache()
@@ -220,6 +231,8 @@ def test_lookup_many_costs_one_rpc_and_leases_the_hits(service, monkeypatch):
         output = manager.prepare_store(keys, request)
         assert output is not None
         manager.complete_store(keys, request)
+        # The step's burst publishes the keys, and the scan reads them back.
+        manager.on_schedule_end(SCHEDULE_END)
 
         ops.clear()
         assert manager.lookup_many(keys, request) == [LookupResult.HIT] * len(keys)
@@ -251,6 +264,7 @@ def test_until_miss_scan_leases_only_the_prefix_it_consumed(service):
         output = manager.prepare_store(keys, request)
         assert output is not None
         manager.complete_store(keys, request)
+        manager.on_schedule_end(SCHEDULE_END)
         # Key 4 is absent and key 7 is present, so a full scan would lease it.
         scan = keys[:4] + [OffloadKey(b"absent")] + keys[5:]
 
@@ -410,6 +424,7 @@ def test_manager_reconnects_and_adopts_the_namespace_it_opened(service):
     try:
         assert manager.prepare_store([key], request) is not None
         manager.complete_store([key], request)
+        manager.on_schedule_end(SCHEDULE_END)
         assert manager.lookup(key, request) is LookupResult.HIT
 
         # The scheduler's connection dies; the service keeps the namespace.
@@ -457,6 +472,7 @@ def test_reconnect_never_recreates_a_namespace_the_service_dropped(service):
     try:
         assert manager.prepare_store([key], request) is not None
         manager.complete_store([key], request)
+        manager.on_schedule_end(SCHEDULE_END)
         # The scheduler's connection dies, and the worker restart retires the
         # namespace the workers still map.
         manager.client.close()
@@ -477,4 +493,68 @@ def test_reconnect_never_recreates_a_namespace_the_service_dropped(service):
     finally:
         probe.close()
         region.cleanup()
+        manager.shutdown()
+
+
+def test_deferred_commit_publishes_at_step_end(service):
+    """A store of the step is published by the step's burst, not by its commit."""
+    manager = _spec(service).get_manager()
+    request = ReqContext("first")
+    try:
+        key = OffloadKey(b"deferred")
+        assert manager.prepare_store([key], request) is not None
+        manager.complete_store([key], request)
+
+        # The commit is still queued, so the reservation is all the service has.
+        assert manager.lookup(key, ReqContext("second")) is LookupResult.HIT_PENDING
+        manager.on_schedule_end(SCHEDULE_END)
+        assert manager.lookup(key, ReqContext("third")) is LookupResult.HIT
+        assert manager.client.call("stats")["stats"]["commits"] == 1
+    finally:
+        manager.shutdown()
+
+
+def test_a_step_of_completions_costs_one_burst(service, monkeypatch):
+    """A step's deferrable calls are one round trip, and its lease is released."""
+    manager = _wide_spec(service, num_chunks=8).get_manager()
+    earlier = ReqContext("earlier")
+    stored = OffloadKey(b"published")
+    bursts: list[list[str]] = []
+    singles: list[str] = []
+    call, pipeline = manager.client.call, manager.client.pipeline
+
+    def counting_call(op, retry=False, **fields):
+        singles.append(op)
+        return call(op, retry=retry, **fields)
+
+    def counting_pipeline(calls, retry=False):
+        bursts.append([op for op, _ in calls])
+        return pipeline(calls, retry=retry)
+
+    try:
+        assert manager.prepare_store([stored], earlier) is not None
+        manager.complete_store([stored], earlier)
+        manager.on_schedule_end(SCHEDULE_END)
+
+        monkeypatch.setattr(manager.client, "call", counting_call)
+        monkeypatch.setattr(manager.client, "pipeline", counting_pipeline)
+
+        # One request that hits, stores a new chunk, and finishes, which is the
+        # deferrable mix a real step offers.
+        request = ReqContext("step")
+        fresh = OffloadKey(b"fresh")
+        assert manager.lookup(stored, request) is LookupResult.HIT
+        assert manager.prepare_store([fresh], request) is not None
+        manager.complete_store([fresh], request)
+        manager.on_request_finished(request)
+        assert bursts == []
+
+        manager.on_schedule_end(SCHEDULE_END)
+
+        # The commit and the release of the lookup lease share one burst, and
+        # the two calls whose answer the step needed went out on their own.
+        assert bursts == [["commit", "release_request"]]
+        assert singles == ["lookup", "store"]
+        assert manager.client.call("stats")["stats"]["leased"] == 0
+    finally:
         manager.shutdown()

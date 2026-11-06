@@ -207,6 +207,16 @@ leases until the request finishes. A sliding-window scan needs the misses and th
 hits behind them, so it takes the whole window, and those leases end with the
 request like every other lookup lease.
 
+Completions and releases cost one round trip per scheduler step instead of one per
+request: the connector queues the `commit` of every completed store and the
+`release_request` of every finished request, and writes them as one burst at the
+end of the step. What that costs is one step of publication delay -- a key stored
+earlier in a step becomes readable at the end of it, so a lookup for that key in
+the same step reports `HIT_PENDING` and is retried after the step, and `stats` can
+report a non-zero `pending` at a step boundary. A `store`, a `stats` collection, a
+`reset`, and the engine shutdown write whatever is still queued first, so none of
+them reads a state the queue had not reached yet.
+
 The connector reports the CPU tier's metrics from that namespace state, with one
 `stats` RPC per collection and none per lookup:
 `vllm:kv_offload_cpu_cache_usage_perc` from the chunks in use,

@@ -125,6 +125,17 @@ that pins it:
   (`test_service_client.py::test_call_refuses_to_interleave_with_an_unread_burst`,
   `::test_a_handshake_cannot_join_a_burst`,
   `::test_collect_raises_a_rejection_after_reading_the_rest_of_the_burst`).
+- **Deferrable calls land at the step boundary.** The manager queues the RPCs
+  whose reply nothing in the step needs -- `commit` from `complete_store`,
+  `release_request` from a finished request, and `touch` -- and writes them as one
+  burst from `on_schedule_end`. So such a call must be flushed there, must be
+  flushed before the `reset`, `stats`, `store`, and shutdown that depend on it,
+  and must never overtake an immediate call that depends on it. A burst that
+  failed is dropped, never replayed
+  (`test_completions_are_flushed_once_per_step_in_order`,
+  `test_flush_before_reset_and_shutdown`,
+  `test_a_failed_flush_is_not_replayed`,
+  `test_deferred_commit_publishes_at_step_end`).
 
 ## Validating a change
 

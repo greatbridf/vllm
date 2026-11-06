@@ -13,6 +13,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadKey,
     ReqContext,
+    ScheduleEndContext,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec, CPUOffloadingInfo
 from vllm.v1.kv_offload.service.client import (
@@ -24,6 +25,7 @@ from vllm.v1.kv_offload.service.manager import ServiceOffloadingManager
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 NUM_CHUNKS = 8
+SCHEDULE_END = ScheduleEndContext((), ())
 
 
 def make_key(index: int = 0) -> OffloadKey:
@@ -65,17 +67,74 @@ class FakeClient:
 
     def call(self, op: str, retry: bool = False, **fields: Any) -> dict[str, Any]:
         self.calls.append((op, {"retry": retry, **fields}))
+        self._fail(op)
+        return getattr(self, f"_{op}")(**fields)
+
+    def pipeline(
+        self, calls: list[tuple[str, dict[str, Any]]], retry: bool = False
+    ) -> list[dict[str, Any]]:
+        """Records a whole burst as one entry, as one round trip would.
+
+        Each recorded call carries the burst's `retry`, which the manager never
+        sets. Like the client, this applies the rest of the burst and then
+        raises the first rejection, so the manager sees what it would on the
+        wire.
+        """
+        self.calls.append(
+            (
+                "pipeline",
+                {
+                    "retry": retry,
+                    "calls": [(op, {"retry": retry, **fields}) for op, fields in calls],
+                },
+            )
+        )
+        if self.unavailable:
+            raise CacheServiceUnavailable("KV cache service flush failed: peer gone")
+        replies: list[dict[str, Any]] = []
+        rejection: CacheServiceError | None = None
+        for op, fields in calls:
+            try:
+                self._fail(op)
+                replies.append(getattr(self, f"_{op}")(**fields))
+            except CacheServiceError as error:
+                if rejection is None:
+                    rejection = error
+        if rejection is not None:
+            raise rejection
+        return replies
+
+    def submit(self, op: str, **fields: Any) -> None:
+        """Unused: the manager writes one burst per step and never a part of it."""
+
+    def collect(self, count: int) -> list[dict[str, Any]]:
+        """Unused, for the same reason."""
+        return []
+
+    def _fail(self, op: str) -> None:
         if self.unavailable:
             raise CacheServiceUnavailable(f"KV cache service {op} failed: peer gone")
         if self.reject:
             raise CacheServiceError(f"KV cache service rejected {op}: namespace gone")
-        return getattr(self, f"_{op}")(**fields)
 
     def close(self) -> None:
         self.closed = True
 
+    def all_calls(self) -> list[tuple[str, dict[str, Any]]]:
+        """Returns every call in arrival order, a burst expanded in place."""
+        return [
+            pair
+            for name, entry in self.calls
+            for pair in (entry["calls"] if name == "pipeline" else [(name, entry)])
+        ]
+
     def ops(self, op: str) -> list[dict[str, Any]]:
-        return [fields for name, fields in self.calls if name == op]
+        """Returns the fields of every call of one operation, in arrival order."""
+        return [fields for name, fields in self.all_calls() if name == op]
+
+    def bursts(self) -> list[list[tuple[str, dict[str, Any]]]]:
+        """Returns the calls of every burst, in arrival order."""
+        return [entry["calls"] for name, entry in self.calls if name == "pipeline"]
 
     def _lookup(self, key: str, request: str) -> dict[str, Any]:
         return {"ok": True, "status": self.status}
@@ -142,12 +201,14 @@ def make_manager(
     client: FakeClient | None = None,
     info: CPUOffloadingInfo | None = None,
     enable_events: bool = False,
+    flush_immediately: bool = False,
 ) -> ServiceOffloadingManager:
     return ServiceOffloadingManager(
         client or FakeClient(),
         NUM_CHUNKS,
         info=info,
         enable_events=enable_events,
+        flush_immediately=flush_immediately,
     )
 
 
@@ -163,6 +224,9 @@ def test_lookup_lease_released_only_after_finish_and_all_jobs():
     assert client.ops("release_request") == []
 
     manager.complete_load([key], request)
+    # The release is part of the burst the step ends with.
+    assert client.ops("release_request") == []
+    manager.on_schedule_end(SCHEDULE_END)
     assert client.ops("release_request") == [
         {"retry": False, "request": wire_id("request")}
     ]
@@ -178,9 +242,11 @@ def test_two_loads_in_one_request_issue_one_release_request():
     manager.prepare_load(keys[1:], request)
     manager.on_request_finished(request)
     manager.complete_load(keys, request)
+    manager.on_schedule_end(SCHEDULE_END)
     assert client.ops("release_request") == []
 
     manager.complete_load(keys[1:], request)
+    manager.on_schedule_end(SCHEDULE_END)
     assert len(client.ops("release_request")) == 1
 
 
@@ -196,6 +262,7 @@ def test_complete_store_before_on_request_finished_defers_release():
     assert client.ops("release_request") == []
 
     manager.on_request_finished(request)
+    manager.on_schedule_end(SCHEDULE_END)
     assert len(client.ops("release_request")) == 1
 
 
@@ -211,8 +278,24 @@ def test_refused_commit_drops_the_reservation_without_raising():
     # The service freed the reservation after its pending timeout.
     client.reject = True
     manager.complete_store([key], request)
+    manager.on_schedule_end(SCHEDULE_END)
 
-    assert len(client.ops("commit")) == 1
+    # One commit reached the service in the step's burst, and its refusal only
+    # cost the store it belonged to: offloading stays on.
+    assert client.bursts() == [
+        [
+            (
+                "commit",
+                {
+                    "retry": False,
+                    "keys": [key.hex()],
+                    "request": wire_id("request"),
+                    "success": True,
+                },
+            )
+        ]
+    ]
+    assert not manager._degraded
     # The store counts as one that did not publish, so the request can finish.
     assert not manager._requests
 
@@ -234,6 +317,7 @@ def test_completion_for_unknown_request_is_ignored_without_negative_counters():
     manager.prepare_load([key], request)
     manager.on_request_finished(request)
     manager.complete_load([key], request)
+    manager.on_schedule_end(SCHEDULE_END)
     assert len(client.ops("release_request")) == 1
 
 
@@ -316,6 +400,7 @@ def test_lookup_many_until_miss_accepts_the_prefix_the_service_stops_at():
     ]
     # The hits it kept took the lease, so finishing the request releases it once.
     manager.on_request_finished(request)
+    manager.on_schedule_end(SCHEDULE_END)
     assert client.ops("release_request") == [
         {"retry": False, "request": wire_id("request")}
     ]
@@ -345,6 +430,7 @@ def test_lookup_many_takes_a_lease_the_request_releases_once():
         LookupResult.HIT,
     ]
     manager.on_request_finished(request)
+    manager.on_schedule_end(SCHEDULE_END)
     assert len(client.ops("release_request")) == 1
 
     # A batch of misses takes no lease, so finishing sends no release.
@@ -353,6 +439,7 @@ def test_lookup_many_takes_a_lease_the_request_releases_once():
     misses = ReqContext("misses")
     assert manager.lookup_many([make_key(0)], misses) == [LookupResult.MISS]
     manager.on_request_finished(misses)
+    manager.on_schedule_end(SCHEDULE_END)
     assert client.ops("release_request") == []
 
 
@@ -455,8 +542,11 @@ def test_request_id_is_digested_for_the_wire():
     assert manager.prepare_store([key], request) is not None
     manager.complete_store([key], request)
     manager.on_request_finished(request)
+    manager.flush()
 
-    requests = {fields["request"] for _, fields in client.calls if "request" in fields}
+    requests = {
+        fields["request"] for _, fields in client.all_calls() if "request" in fields
+    }
     assert requests == {wire_id(request.req_id)}
     assert len(requests.pop()) == 32
 
@@ -473,8 +563,9 @@ def test_reset_is_two_phase_and_aborts_pending_reservations():
     reserved = [output.keys_to_store[0].hex()]
 
     manager.reset_cache()
-    # The lease ends now, but a worker may still be writing the reserved slot.
-    assert len(client.ops("release_request")) == 1
+    # The lease ends now, but its release rides the flush of the reset step and
+    # a worker may still be writing the reserved slot.
+    assert client.ops("release_request") == []
     assert client.ops("reset") == []
     assert manager.has_pending_work()
 
@@ -488,8 +579,13 @@ def test_reset_is_two_phase_and_aborts_pending_reservations():
         }
     ]
     assert client.ops("reset") == [{"retry": False, "force": True}]
-    # Aborting the reservation precedes the reset that recycles its slot.
-    assert [op for op, _ in client.calls][-2:] == ["commit", "reset"]
+    # Releasing the lease and aborting the reservation precede the reset that
+    # recycles the slot.
+    assert [op for op, _ in client.all_calls()][-3:] == [
+        "release_request",
+        "commit",
+        "reset",
+    ]
     assert not manager.has_pending_work()
     assert not manager._requests
 
@@ -704,3 +800,195 @@ def test_shutdown_swallows_a_failed_close():
 
     assert len(client.ops("close")) == 1
     assert client.closed
+
+
+def test_completions_are_flushed_once_per_step_in_order():
+    """A step's commits and release ride one burst, in enqueue order."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    other = ReqContext("other")
+    looked_up = make_key(0)
+    first = make_key(1)
+    second = make_key(2)
+
+    # Two stores, and a lease the finishing request has to release last.
+    assert manager.lookup(looked_up, request) is LookupResult.HIT
+    assert manager.prepare_store([first], request) is not None
+    assert manager.prepare_store([second], other) is not None
+    manager.complete_store([first], request)
+    manager.complete_store([second], other)
+    manager.on_request_finished(request)
+    assert client.bursts() == []
+
+    manager.on_schedule_end(SCHEDULE_END)
+
+    assert client.bursts() == [
+        [
+            (
+                "commit",
+                {
+                    "retry": False,
+                    "keys": [first.hex()],
+                    "request": wire_id("request"),
+                    "success": True,
+                },
+            ),
+            (
+                "commit",
+                {
+                    "retry": False,
+                    "keys": [second.hex()],
+                    "request": wire_id("other"),
+                    "success": True,
+                },
+            ),
+            ("release_request", {"retry": False, "request": wire_id("request")}),
+        ]
+    ]
+    # Nothing of the step is still owed, and the finished request is gone.
+    assert manager._queue == []
+    assert not manager._requests.get(wire_id("request"))
+
+    # The immediate path reaches the same calls and bookkeeping, one round trip
+    # each, which is the state this burst has to reproduce.
+    immediate = FakeClient()
+    step_by_step = make_manager(immediate, flush_immediately=True)
+    assert step_by_step.lookup(looked_up, request) is LookupResult.HIT
+    assert step_by_step.prepare_store([first], request) is not None
+    assert step_by_step.prepare_store([second], other) is not None
+    step_by_step.complete_store([first], request)
+    step_by_step.complete_store([second], other)
+    step_by_step.on_request_finished(request)
+    assert [op for op, _ in immediate.all_calls()] == [
+        op for op, _ in client.all_calls()
+    ]
+    assert immediate.ops("commit") == client.ops("commit")
+    assert immediate.ops("release_request") == client.ops("release_request")
+    assert step_by_step._requests == manager._requests
+
+
+def test_chunk_splits_above_max_keys_are_one_burst():
+    """A commit and a load that split cost one round trip, not one per chunk."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    keys = [make_key(index) for index in range(MAX_KEYS + 2)]
+
+    assert manager.prepare_store(keys, request) is not None
+    manager.complete_store(keys, request)
+    manager.flush()
+    load = manager.prepare_load(keys, request)
+
+    assert len(load.block_ids) == len(keys)
+    assert [op for op, _ in client.bursts()[0]] == ["commit", "commit"]
+    assert [op for op, _ in client.bursts()[1]] == ["load", "load"]
+    assert [len(fields["keys"]) for _, fields in client.bursts()[1]] == [MAX_KEYS, 2]
+    # The store split stays one request at a time: a chunk that comes back full
+    # ends it, so the reservations behind it may never be asked for.
+    assert [len(fields["keys"]) for fields in client.ops("store")] == [MAX_KEYS, 2]
+
+
+def test_flush_before_reset_and_shutdown():
+    """A queued commit lands before the reset fence and before the close."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    key = make_key()
+
+    assert manager.prepare_store([key], request) is not None
+    manager.complete_store([key], request)
+    manager.reset_cache()
+    assert [op for op, _ in client.all_calls()] == ["store", "commit"]
+    manager.on_reset_flushed()
+    assert [op for op, _ in client.all_calls()] == ["store", "commit", "reset"]
+
+    closing = FakeClient()
+    closing_manager = make_manager(closing)
+    assert closing_manager.prepare_store([key], request) is not None
+    closing_manager.complete_store([key], request)
+    closing_manager.shutdown()
+    assert [op for op, _ in closing.all_calls()] == ["store", "commit", "close"]
+
+
+def test_flush_is_a_noop_on_an_empty_queue():
+    client = FakeClient()
+    manager = make_manager(client)
+
+    manager.flush()
+    assert client.calls == []
+
+    # A degraded manager drops the queue instead of writing it.
+    request = ReqContext("request")
+    key = make_key()
+    assert manager.prepare_store([key], request) is not None
+    manager.complete_store([key], request)
+    client.unavailable = True
+    assert manager.lookup(key, request) is LookupResult.MISS
+    manager.flush()
+    assert client.bursts() == []
+    assert manager._queue == []
+
+
+def test_a_failed_flush_is_not_replayed():
+    """A burst whose write failed is dropped, so no commit is applied twice."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    key = make_key()
+
+    assert manager.prepare_store([key], request) is not None
+    manager.complete_store([key], request)
+    client.unavailable = True
+    manager.on_schedule_end(SCHEDULE_END)
+
+    assert manager._degraded
+    assert len(client.bursts()) == 1
+    manager.flush()
+    assert len(client.bursts()) == 1
+
+
+def test_an_immediate_flush_matches_the_step_burst():
+    """The queued path reaches the same service calls and bookkeeping."""
+    deferred = FakeClient()
+    immediate = FakeClient()
+    state = {}
+    for name, client, flush_immediately in (
+        ("deferred", deferred, False),
+        ("immediate", immediate, True),
+    ):
+        manager = make_manager(
+            client, enable_events=True, flush_immediately=flush_immediately
+        )
+        request = ReqContext("request")
+        kept = make_key(0)
+        stored = make_key(1)
+        client.evicted = [make_key(2).hex()]
+        assert manager.lookup(kept, request) is LookupResult.HIT
+        assert manager.prepare_store([stored], request) is not None
+        manager.touch([kept], request)
+        manager.complete_store([stored], request)
+        manager.prepare_load([kept], request)
+        manager.on_request_finished(request)
+        manager.complete_load([kept], request)
+        manager.on_schedule_end(SCHEDULE_END)
+        state[name] = (
+            # Per operation, because only the deferrable calls move: theirs land
+            # at the end of the step instead of where they were made.
+            {
+                op: client.ops(op)
+                for op in ("lookup", "store", "load", "touch", "commit")
+            },
+            client.ops("release_request"),
+            list(manager.take_events()),
+            manager._requests,
+            manager._allocation_sizes,
+            manager.get_stats() is None,
+        )
+
+    assert state["deferred"] == state["immediate"]
+    assert len(state["immediate"][1]) == 1
+    # The step reached the service as one burst, and the immediate path as one
+    # round trip per call.
+    assert [len(burst) for burst in deferred.bursts()] == [3]
+    assert immediate.bursts() == []
