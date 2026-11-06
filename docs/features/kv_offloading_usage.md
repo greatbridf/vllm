@@ -127,11 +127,18 @@ cannot serve, naming the key: `cache_policy_module_path`, `max_tracker_size`, an
 as unsupported. It honours `service_socket`, `service_timeout`,
 `service_connect_timeout`, `cpu_bytes_to_use`, `blocks_per_chunk`/`block_size`,
 `spec_name`, `offload_region: "shared"`, `eviction_policy: "lru"`,
-`store_threshold` below 2, and the generic `offload_prompt_only`,
+`store_threshold` below 2, `pin_host_memory`, and the generic `offload_prompt_only`,
 `self_describing_kv_events`, and `sync_load_budget_bytes` settings. A
 `canonical_layout` request is refused. `service_timeout` (default 5 s) bounds each
 control RPC, and `service_connect_timeout` (default 5 s) bounds connecting,
 including the bounded retry that lets an engine start race the service.
+
+`pin_host_memory` defaults to `true` and decides whether kernel-managed offload
+can run at all: registering the region with the accelerator page-locks it, and
+the kernel excludes locked ranges from reclaim, so `MADV_PAGEOUT` answers
+`EINVAL` and rswap never stores those pages. Set it to `false` when the cache
+must stay migratable for rswap (the copies become pageable, which is slower but
+correct).
 
 In plain terms, the unsupported combinations are:
 
@@ -362,6 +369,7 @@ Each region's address and size are available as `base_tensor.data_ptr()` and `to
 | `service_socket` | no | — | `RustServiceOffloadingSpec` | Path of the Rust cache service's Unix socket. Required by that spec; the directory must be `0700` and owned by the calling UID. |
 | `service_timeout` | no | `5.0` | `RustServiceOffloadingSpec` | Seconds allowed for each control RPC. A timeout stops offloading for the engine instead of failing the scheduler step. |
 | `service_connect_timeout` | no | `5.0` | `RustServiceOffloadingSpec` | Seconds allowed for one connect attempt, including the bounded retry that covers a service still starting. |
+| `pin_host_memory` | no | `true` | `RustServiceOffloadingSpec` | Register the service-owned region with the accelerator for pinned DMA. A registered range is page-locked and therefore unevictable, so set it to `false` when cold pages must reach an rswap remote tier; the copies then run pageable. |
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). `RustServiceOffloadingSpec` reserves it inside the service's aggregate `--capacity-bytes`, rounded down to whole chunks, and caps it to what that budget holds; see [Sizing](../../rust/src/kv-cache-service/README.md#sizing). |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |
 | `blocks_per_chunk` | no | `1` | both | Offloaded chunk size in GPU blocks; must be > 0. Alternative to `block_size` for models whose KV cache groups have different block sizes. |

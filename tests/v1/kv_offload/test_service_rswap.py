@@ -91,18 +91,12 @@ def device():
     ).stdout
     if "--rswap-attach" not in help_text:
         pytest.skip("service was built without clang, so it has no --rswap-attach")
-    # Per-CPU swap clusters outlive the allocation that cached them, so pages
-    # can land on a previously used rswap device regardless of priority.
-    busy = [
-        row.split()[0]
-        for row in Path("/proc/swaps").read_text().splitlines()[1:]
-        if row.split()[3] != "0"
-    ]
-    if busy:
-        pytest.skip(
-            "swap devices are in use, so allocation may bypass the test device: "
-            + ", ".join(busy)
-        )
+    # A per-CPU swap cluster caches the device it last allocated from, so pages
+    # can land on an unrelated swap device regardless of priority. That is not a
+    # reason to skip: the `pages_written` assertion below is what proves the
+    # pages reached this device, and its message names the other devices so a
+    # short count is diagnosable. Only an existing rswap device is fatal, because
+    # its cluster would shadow the one this test creates.
     existing = rswap_types()
     if existing:
         pytest.skip(
@@ -287,7 +281,16 @@ def test_reclaimed_pages_round_trip_through_rswap(device, service):
     stats = {
         name: value - before.get(name, 0) for name, value in read_stats(device).items()
     }
-    assert stats["pages_written"] >= len(pages), stats
+    others = [
+        row.split()[0]
+        for row in Path("/proc/swaps").read_text().splitlines()[1:]
+        if row.startswith("xswap") is False and row.split()[3] != "0"
+    ]
+    assert stats["pages_written"] >= len(pages), (
+        f"only {stats['pages_written']} of {len(pages)} pages reached device "
+        f"{device}; other swap devices with a cached cluster: "
+        f"{', '.join(others) or 'none'}"
+    )
     assert stats["errors_written"] == 0, stats
     # A page without a digest cannot be stored at all: the service's arena
     # program has to resolve one for every cache page.

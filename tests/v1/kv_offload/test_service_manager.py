@@ -911,6 +911,35 @@ def test_flush_before_reset_and_shutdown():
     assert [op for op, _ in closing.all_calls()] == ["store", "commit", "close"]
 
 
+def test_a_queued_commit_is_flushed_before_an_observing_call():
+    """Deferring a commit must never change what a later call observes.
+
+    `test_service_rswap.py` caught the alternative: a `complete_store` followed by
+    a `lookup` reported `HIT_PENDING` because the commit was still queued.
+    """
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+    key = make_key()
+
+    assert manager.prepare_store([key], request) is not None
+    manager.complete_store([key], request)
+    assert manager.lookup(key, request) is LookupResult.HIT
+    assert [op for op, _ in client.all_calls()] == ["store", "commit", "lookup"]
+
+    # The same holds for a batched lookup and for a load.
+    assert manager.prepare_store([key], request) is not None
+    manager.complete_store([key], request)
+    assert len(manager.lookup_many([key], request)) == 1
+    assert [op for op, _ in client.all_calls()][-2:] == ["commit", "lookup_many"]
+
+    assert manager.prepare_store([key], request) is not None
+    manager.complete_store([key], request)
+    manager.prepare_load([key], request)
+    assert [op for op, _ in client.all_calls()][-2:] == ["commit", "load"]
+    assert manager._queue == []
+
+
 def test_flush_is_a_noop_on_an_empty_queue():
     client = FakeClient()
     manager = make_manager(client)
@@ -925,8 +954,10 @@ def test_flush_is_a_noop_on_an_empty_queue():
     manager.complete_store([key], request)
     client.unavailable = True
     assert manager.lookup(key, request) is LookupResult.MISS
+    # The lookup flushed first, which is what degraded the manager.
+    assert [len(burst) for burst in client.bursts()] == [1]
     manager.flush()
-    assert client.bursts() == []
+    assert [len(burst) for burst in client.bursts()] == [1]
     assert manager._queue == []
 
 
@@ -1004,7 +1035,8 @@ def test_an_immediate_flush_matches_the_step_burst():
 
     assert state["deferred"] == state["immediate"]
     assert len(state["immediate"][1]) == 1
-    # The step reached the service as one burst, and the immediate path as one
-    # round trip per call.
-    assert [len(burst) for burst in deferred.bursts()] == [3]
+    # An observing call flushes what is queued before it, so `touch` and the
+    # `commit` share the burst that `prepare_load` triggers, and the release
+    # rides the step-end burst: two round trips for four deferrable calls.
+    assert [len(burst) for burst in deferred.bursts()] == [2, 1]
     assert immediate.bursts() == []

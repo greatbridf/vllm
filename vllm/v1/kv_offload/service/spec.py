@@ -33,6 +33,7 @@ _SUPPORTED_KEYS = frozenset(
         "eviction_policy",
         "offload_prompt_only",
         "offload_region",
+        "pin_host_memory",
         "self_describing_kv_events",
         "service_connect_timeout",
         "service_socket",
@@ -121,6 +122,13 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
         self.connect_timeout = float(extra.get("service_connect_timeout", 5.0))
         if self.connect_timeout <= 0:
             raise ValueError("service_connect_timeout must be positive")
+        pin_host_memory = extra.get("pin_host_memory", True)
+        if not isinstance(pin_host_memory, bool):
+            raise ValueError("pin_host_memory must be a boolean")
+        # Registering the region page-locks it, which makes the cache
+        # unevictable; set `pin_host_memory: false` when the pages must stay
+        # migratable for kernel-managed offload (rswap).
+        self.pin_host_memory: bool = pin_host_memory
         self.worker_bytes = self.cpu_page_size_per_worker
         world = config.parallel.world_size
         self.kv_bytes_per_chunk = (
@@ -260,6 +268,7 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
                 self.worker_bytes,
                 self.config.parallel.world_size,
                 rank,
+                pin_host_memory=self.pin_host_memory,
             )
             return CPUOffloadingWorker(
                 kv_caches,

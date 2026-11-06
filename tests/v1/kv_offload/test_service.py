@@ -496,8 +496,12 @@ def test_reconnect_never_recreates_a_namespace_the_service_dropped(service):
         manager.shutdown()
 
 
-def test_deferred_commit_publishes_at_step_end(service):
-    """A store of the step is published by the step's burst, not by its commit."""
+def test_deferred_commit_publishes_before_the_next_observation(service):
+    """A queued commit is flushed by the next call that could observe it.
+
+    Deferring the commit to `on_schedule_end` batches a step's completions into
+    one round trip, but it must never change what a later call sees.
+    """
     manager = _spec(service).get_manager()
     request = ReqContext("first")
     try:
@@ -505,8 +509,8 @@ def test_deferred_commit_publishes_at_step_end(service):
         assert manager.prepare_store([key], request) is not None
         manager.complete_store([key], request)
 
-        # The commit is still queued, so the reservation is all the service has.
-        assert manager.lookup(key, ReqContext("second")) is LookupResult.HIT_PENDING
+        # The commit is queued, and this lookup publishes it first.
+        assert manager.lookup(key, ReqContext("second")) is LookupResult.HIT
         manager.on_schedule_end(SCHEDULE_END)
         assert manager.lookup(key, ReqContext("third")) is LookupResult.HIT
         assert manager.client.call("stats")["stats"]["commits"] == 1

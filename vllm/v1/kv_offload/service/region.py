@@ -27,8 +27,14 @@ class ServiceOffloadRegion(MmapOffloadRegion):
         worker_bytes: int,
         world_size: int,
         rank: int,
+        pin_host_memory: bool = True,
     ):
         self.client = client
+        # `pin_mmap_region` reads this off the region. Registering the range with
+        # the accelerator page-locks it, which makes those pages unevictable, so
+        # a cache that relies on kernel-managed offload (rswap) has to leave them
+        # migratable and take the pageable copy instead.
+        self.PIN_HOST_MEMORY = pin_host_memory
         self.is_pinned = False
         self.pinned_addresses: list[int] = []
         self._views: list[torch.Tensor] = []

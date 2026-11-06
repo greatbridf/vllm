@@ -55,6 +55,17 @@ instead of the whole multi-rank region; pageable fallback does not guarantee
 that Linux keeps all pages resident in DRAM. Sizing has the arithmetic behind
 `cpu_bytes_to_use`.
 
+Pinning is the one setting that decides whether kernel-managed offload can run.
+`cudaHostRegister` page-locks the range, and the kernel excludes locked ranges
+from reclaim: `MADV_PAGEOUT` answers `EINVAL` and the rswap digest program never
+sees those pages, so the remote tier stays empty. Set
+`"pin_host_memory": false` in `kv_connector_extra_config` when the cache must
+stay migratable for rswap; transfers become pageable, which is slower but
+correct, and `pin_host_memory` defaults to `true`, preserving the faster pinned
+copy. The two behaviours are pinned by `test_service_rswap_offload.py`
+(`test_locked_region_is_not_reclaimable`, `test_released_pinning_skips_host_registration`,
+and a store/swap-out/load round trip through a mock engine).
+
 ## Deployment
 
 Run the service under a supervisor. A `systemd` unit:

@@ -133,13 +133,23 @@ that pins it:
   whose reply nothing in the step needs -- `commit` from `complete_store`,
   `release_request` from a finished request, and `touch` -- and writes them as one
   burst from `on_schedule_end`. So such a call must be flushed there, must be
-  flushed before the `reset`, `stats`, `store`, and shutdown that depend on it,
-  and must never overtake an immediate call that depends on it. A burst that
-  failed is dropped, never replayed
+  flushed before any call that can observe it -- a lookups, a load, the `reset`,
+  `stats`, `store`, and shutdown -- and must never overtake an immediate call
+  that depends on it. Deferring is a wire optimization, never an observable
+  change: `complete_store` followed by a `lookup` still reports a hit. A burst
+  that failed is dropped, never replayed
   (`test_completions_are_flushed_once_per_step_in_order`,
   `test_flush_before_reset_and_shutdown`,
   `test_a_failed_flush_is_not_replayed`,
-  `test_deferred_commit_publishes_at_step_end`).
+  `test_a_queued_commit_is_flushed_before_an_observing_call`).
+- **Pinned memory is not migratable.** Registering the service region with the
+  accelerator page-locks it; the kernel excludes `VM_LOCKED` ranges from reclaim,
+  so `MADV_PAGEOUT` answers `EINVAL` and rswap never stores those pages. The region
+  therefore takes `pin_host_memory` and defaults to pinned; a deployment that wants
+  kernel-managed offload sets it to `false` and accepts pageable copies
+  (`test_service_rswap_offload.py::test_locked_region_is_not_reclaimable`,
+  `::test_released_pinning_skips_host_registration`,
+  `::test_mock_engine_store_load_round_trip`).
 
 ## Validating a change
 
@@ -177,10 +187,19 @@ while skipping what they cover, so a report says which happened:
 The opt-in suites need hardware or privileges and stay out of CI:
 
 ```bash
-# Kernel digest path: root, CONFIG_RSWAP, an idle swap setup, and a readable
-# rswap backend for the digest audit.
+# Kernel digest path: root, CONFIG_RSWAP, and a readable rswap backend for the
+# digest audit. Creates and destroys its own swap device, so it needs no idle
+# swap setup and does not touch any other device.
 sudo VLLM_TEST_KV_SERVICE_RSWAP=1 .venv/bin/python -m pytest \
   --confcutdir=tests/v1/kv_offload tests/v1/kv_offload/test_service_rswap.py -v
+
+# The same, for the store/load path: a mock engine drives the real spec,
+# manager, and region, then swaps the pages out and loads them back, and the
+# pinning contract is checked both ways.
+sudo VLLM_TEST_KV_SERVICE_RSWAP=1 .venv/bin/python -m pytest \
+  --confcutdir=tests/v1/kv_offload \
+  tests/v1/kv_offload/test_service_rswap_offload.py -v
+# Raise VLLM_TEST_KV_SERVICE_RSWAP_CHUNKS for a larger footprint.
 
 # GPU DMA and model output, against a service you started yourself.
 VLLM_TEST_DEEPSEEK_V41_MODEL=/path/to/DeepSeek-V4.1-Flash \

@@ -209,10 +209,21 @@ class ServiceOffloadingManager(OffloadingManager):
             return [self.client.call(op, **fields)]
         return self.client.pipeline(calls)
 
+    def _flush_pending(self) -> None:
+        """Publishes queued completions before a call that can observe them.
+
+        A `commit` waits for `on_schedule_end` so a step's completions share one
+        burst, but a lookup or a load issued before that must see the entry it
+        published; deferring is a wire optimization, never an observable change.
+        """
+        if self._queue:
+            self.flush()
+
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        self._flush_pending()
         request = self._wire_id(req_context.req_id)
         try:
             response = self._call_or_degrade(
@@ -257,6 +268,7 @@ class ServiceOffloadingManager(OffloadingManager):
         With `until_miss` the service stops at the first key that missed and
         leases only the hits before it, so the reply, and this result, end there.
         """
+        self._flush_pending()
         request = self._wire_id(req_context.req_id)
         encoded = self._encode(keys)
         results: list[LookupResult] = []
@@ -330,6 +342,9 @@ class ServiceOffloadingManager(OffloadingManager):
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> CPULoadStoreSpec:
+        # A queued commit must publish first, or the load would find the entry
+        # pending and the service would refuse the lease.
+        self._flush_pending()
         request = self._wire_id(req_context.req_id)
         encoded = self._encode(keys)
         batches = list(_batches(encoded))
