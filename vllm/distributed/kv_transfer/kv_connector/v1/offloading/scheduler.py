@@ -845,9 +845,10 @@ class OffloadingConnectorScheduler:
         defer_lookup = False
         for start in range(0, len(keys), _LOOKUP_BATCH_KEYS):
             batch = keys[start : start + _LOOKUP_BATCH_KEYS]
-            for local_idx, result in enumerate(
-                self.manager.lookup_many(batch, req_context), start
-            ):
+            # The service stops at the first miss and leases only the hits before
+            # it, so the reply may end before `batch` does.
+            results = self.manager.lookup_many(batch, req_context, until_miss=True)
+            for local_idx, result in enumerate(results, start):
                 match result:
                     case LookupResult.HIT | LookupResult.HIT_PENDING:
                         self._events_tracker.record_lookup(

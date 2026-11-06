@@ -181,7 +181,7 @@ them; the connector does not.
 | `open` | `version`, `namespace`, `fingerprint`, `worker_bytes`, `world_size`, `num_chunks`, `adopt` (default `false`) | scheduler | the namespace geometry |
 | `attach` | `version`, `namespace`, `fingerprint`, `rank` | worker | the namespace geometry, then one shared-memory descriptor |
 | `lookup` | `key`, `request` | scheduler | `status` |
-| `lookup_many` | `keys`, `request` | scheduler | `statuses`, one per key in order |
+| `lookup_many` | `keys`, `request`, `until_miss` (default `false`) | scheduler | `statuses`, one per key, ending at the first `miss` when `until_miss` is set |
 | `load` | `keys`, `request` | scheduler | `slots`, one per key |
 | `release` | `keys`, `request` | scheduler | `released`, `unknown` |
 | `release_request` | `request` | scheduler | `released`, `unknown` |
@@ -248,10 +248,13 @@ pending transfers. Active leases and pending stores cannot be reset or evicted.
 `lookup` reports the status of one key. `lookup_many` reports the same for a
 batch of up to 4096 keys, as `{"ok": true, "statuses": [...]}` with one status
 per key in the order they were sent, and takes the same lease and LRU promotion
-per hit. It saves round trips, not work: the connector asks a full-attention
-prefix in batches of 4096 keys and a sliding-window tail one window at a time,
-so a batch may hold leases for hits below the miss that ends its scan until the
-request finishes.
+per hit. With `until_miss` the scan ends at the first `miss`: the reply is then a
+prefix of the batch whose last status is that `miss`, and only the hits before it
+hold a lease, so a chunk behind the gap stays evictable and is not carried as a
+lease until the request finishes. The connector asks a full-attention prefix that
+way, in batches of 4096 keys, so a prefix scan leases exactly the chunks it
+consumes. A sliding-window tail scan asks without the flag, because it needs the
+misses and the hits behind them, and holds those leases until the request ends.
 
 A reservation belongs to the request that made it: `store` records the owner, and
 `commit` rejects a batch reserved by another request with

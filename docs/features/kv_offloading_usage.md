@@ -200,9 +200,12 @@ starts cold instead of adopting a cache its workers no longer map.
 
 A lookup scan costs one RPC per batch instead of one per chunk: `lookup_many`
 answers up to 4096 keys at once, so a 4096-chunk full-attention prefix costs one
-RPC and a sliding-window tail costs one per window it has to widen. A batch may
-lease hits below the miss that ends its scan; those leases end with the request
-like every other lookup lease.
+RPC and a sliding-window tail costs one per window it has to widen. A prefix scan
+leases only the chunks it consumes: it asks the service to stop at the first miss
+it finds, so the hits behind the gap stay evictable instead of being carried as
+leases until the request finishes. A sliding-window scan needs the misses and the
+hits behind them, so it takes the whole window, and those leases end with the
+request like every other lookup lease.
 
 The connector reports the CPU tier's metrics from that namespace state, with one
 `stats` RPC per collection and none per lookup:

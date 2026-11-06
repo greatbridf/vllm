@@ -433,6 +433,58 @@ fn lookup_many_reports_one_status_per_key_and_leases_the_hits() {
 }
 
 #[test]
+fn until_miss_scan_ends_at_the_miss_and_leases_nothing_past_it() {
+    let service = Service::start();
+    let mut client = service.connect();
+    let opened = client.call(json!({
+        "op": "open",
+        "version": 1,
+        "namespace": "engine-prefix",
+        "fingerprint": "a".repeat(64),
+        "worker_bytes": 64,
+        "world_size": 2,
+        "num_chunks": 4,
+    }));
+    assert_eq!(opened["ok"], true);
+
+    let stored = client.call(json!({
+        "op": "store",
+        "keys": ["aa", "bb", "cc"],
+        "request": "a",
+    }));
+    assert_eq!(stored["ok"], true);
+    let committed = client.call(json!({
+        "op": "commit",
+        "keys": ["aa", "bb", "cc"],
+        "request": "a",
+        "success": true,
+    }));
+    assert_eq!(committed["ok"], true);
+
+    // `dd` is missing, so the scan stops there and `cc` is never looked up.
+    let reply = client.call(json!({
+        "op": "lookup_many",
+        "keys": ["aa", "dd", "cc"],
+        "request": "b",
+        "until_miss": true,
+    }));
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["statuses"], json!(["hit", "miss"]));
+
+    // `cc` is published but was not leased, so the scan cannot load it.
+    let past_miss = client.call(json!({"op": "load", "keys": ["cc"], "request": "b"}));
+    assert_eq!(past_miss["ok"], false);
+    assert!(past_miss["error"].as_str().unwrap().contains("ready leased entry"));
+    let hit = client.call(json!({"op": "load", "keys": ["aa"], "request": "b"}));
+    assert_eq!(hit["ok"], true);
+
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    assert_eq!(stats["hits"], 1);
+    assert_eq!(stats["misses"], 1);
+    assert_eq!(stats["leased"], 1);
+}
+
+#[test]
 fn store_from_one_request_cannot_be_published_by_another() {
     let service = Service::start();
     let mut client = service.connect();

@@ -144,9 +144,11 @@ class MockOffloadingSpec(OffloadingSpec):
         self.manager = MagicMock(spec=OffloadingManager)
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = LookupResult.MISS
-        self.manager.lookup_many.side_effect = lambda keys, req_context: [
-            self.manager.lookup(key, req_context) for key in keys
-        ]
+        self.manager.lookup_many.side_effect = (
+            lambda keys, req_context, until_miss=False: [
+                self.manager.lookup(key, req_context) for key in keys
+            ]
+        )
         self.manager.get_load_source.return_value = CacheHitSource.EXTERNAL_UNSPECIFIED
         self.manager.get_stats.return_value = None
         self.manager.config_info.return_value = [{}]

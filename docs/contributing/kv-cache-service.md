@@ -80,7 +80,11 @@ that pins it:
   reporting a hit, and `load` refuses a key this request does not lease
   (`lookup_lease_prevents_eviction_before_load`). A lease is released only when
   the request finished and every job it issued completed
-  (`test_lookup_lease_released_only_after_finish_and_all_jobs`).
+  (`test_lookup_lease_released_only_after_finish_and_all_jobs`). A prefix scan
+  sets `until_miss`, so `lookup_many` leases exactly the hits it consumed: its
+  reply ends at the first `miss`, and a chunk behind that gap is never leased
+  (`an_until_miss_scan_leases_only_the_hits_before_the_miss`,
+  `until_miss_scan_ends_at_the_miss_and_leases_nothing_past_it`).
 - **Namespace retirement.** A disconnected worker never hands its mapping to a
   new namespace: the namespace is retired and stays charged to capacity until its
   last session leaves (`main.rs::Registry::retire`,

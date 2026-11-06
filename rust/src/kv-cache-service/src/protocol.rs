@@ -40,12 +40,17 @@ pub enum Request {
         key: String,
         request: String,
     },
-    /// One `lookup` per key of `keys`, answered with one status per key. The
-    /// reply never echoes a key, so a batch bounded by `MAX_KEYS` always fits
-    /// one frame.
+    /// One `lookup` per key of `keys`, answered with one status per key.
+    ///
+    /// With `until_miss` the scan ends at the first `miss`, so the reply may be
+    /// shorter than `keys`: its last status is then that `miss`, and only the
+    /// hits before it hold a lease. The reply never echoes a key, so a batch
+    /// bounded by `MAX_KEYS` always fits one frame.
     LookupMany {
         keys: Vec<String>,
         request: String,
+        #[serde(default)]
+        until_miss: bool,
     },
     Load {
         keys: Vec<String>,

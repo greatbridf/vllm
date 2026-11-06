@@ -420,8 +420,20 @@ impl Cache {
 
     /// Looks up one request's keys in order, with the status `lookup` reports
     /// for each and the same lease and LRU effect.
-    pub fn lookup_many(&mut self, keys: &[String], request: &str) -> Vec<Status> {
-        keys.iter().map(|key| self.lookup(key, request)).collect()
+    ///
+    /// With `until_miss` the scan ends at the first key that is not a hit, so it
+    /// leases only the chunks it consumes and reports one status per key up to
+    /// and including that miss.
+    pub fn lookup_many(&mut self, keys: &[String], request: &str, until_miss: bool) -> Vec<Status> {
+        let mut statuses = Vec::with_capacity(keys.len());
+        for key in keys {
+            let status = self.lookup(key, request);
+            statuses.push(status);
+            if until_miss && status == Status::Miss {
+                break;
+            }
+        }
+        statuses
     }
 
     pub fn load(&self, keys: &[String], request: &str) -> io::Result<Vec<usize>> {
@@ -1125,7 +1137,7 @@ mod tests {
             cache.store(&keys(&["bb"]), "r").unwrap();
         }
 
-        let statuses = batched.lookup_many(&mixed, "r");
+        let statuses = batched.lookup_many(&mixed, "r", false);
         let expected: Vec<Status> = mixed.iter().map(|key| per_key.lookup(key, "r")).collect();
 
         assert_eq!(statuses, expected);
@@ -1147,6 +1159,43 @@ mod tests {
         assert_eq!(batched.stats()["misses"], 1);
         assert_eq!(batched.stats()["pending_hits"], 1);
         batched.assert_slot_accounting();
+    }
+
+    #[test]
+    fn an_until_miss_scan_leases_only_the_hits_before_the_miss() {
+        // `aa`, `bb`, `cc` and `dd` are published; `zz` was never stored.
+        let stored = keys(&["aa", "bb", "cc", "dd"]);
+        let scan = keys(&["aa", "bb", "zz", "cc"]);
+        let mut truncated = cache_with(4);
+        let mut whole = cache_with(4);
+        for cache in [&mut truncated, &mut whole] {
+            cache.store(&stored, "r").unwrap();
+            cache.commit(&stored, "r", true).unwrap();
+        }
+
+        assert_eq!(
+            truncated.lookup_many(&scan, "r", true),
+            vec![Status::Hit, Status::Hit, Status::Miss]
+        );
+        assert_eq!(truncated.stats()["leased"], 2);
+        assert_eq!(
+            whole.lookup_many(&scan, "r", false),
+            vec![Status::Hit, Status::Hit, Status::Miss, Status::Hit]
+        );
+        assert_eq!(whole.stats()["leased"], 3);
+        // One miss and one hit per key either way.
+        assert_eq!(truncated.stats()["misses"], whole.stats()["misses"]);
+        assert_eq!(truncated.stats()["hits"], 2);
+
+        // `cc`, past the miss, is the least recently used entry of both caches
+        // and only the full scan leased it, so only the full scan walks past it.
+        assert_eq!(
+            truncated.store(&keys(&["ee"]), "r").unwrap().2,
+            keys(&["cc"])
+        );
+        assert_eq!(whole.store(&keys(&["ee"]), "r").unwrap().2, keys(&["dd"]));
+        truncated.assert_slot_accounting();
+        whole.assert_slot_accounting();
     }
 
     #[test]
@@ -1310,7 +1359,9 @@ mod tests {
                     }
                 }
                 4 => {
-                    assert_eq!(cache.lookup_many(&batch, request).len(), batch.len());
+                    assert_eq!(cache.lookup_many(&batch, request, false).len(), batch.len());
+                    // A truncated scan only reports a prefix of the batch.
+                    assert!(cache.lookup_many(&batch, request, true).len() <= batch.len());
                 }
                 5 => {
                     if let Ok(slots) = cache.load(&batch, request) {

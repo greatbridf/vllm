@@ -346,10 +346,17 @@ fn handle(
                     check_request(&request).map_err(reject)?;
                     json!({"ok": true, "status": cache.lookup(&key, &request)})
                 }
-                Request::LookupMany { keys, request } => {
+                Request::LookupMany {
+                    keys,
+                    request,
+                    until_miss,
+                } => {
                     check_keys(&keys).map_err(reject)?;
                     check_request(&request).map_err(reject)?;
-                    json!({"ok": true, "statuses": cache.lookup_many(&keys, &request)})
+                    // A truncated scan reports fewer statuses than keys, which
+                    // is smaller than the batch and so still fits one frame.
+                    let statuses = cache.lookup_many(&keys, &request, until_miss);
+                    json!({"ok": true, "statuses": statuses})
                 }
                 Request::Load { keys, request } => {
                     check_keys(&keys).map_err(reject)?;

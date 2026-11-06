@@ -80,11 +80,17 @@ class FakeClient:
     def _lookup(self, key: str, request: str) -> dict[str, Any]:
         return {"ok": True, "status": self.status}
 
-    def _lookup_many(self, keys: list[str], request: str) -> dict[str, Any]:
+    def _lookup_many(
+        self, keys: list[str], request: str, until_miss: bool = False
+    ) -> dict[str, Any]:
         statuses = self.statuses
         if statuses is None:
             statuses = [self.status] * len(keys)
-        return {"ok": True, "statuses": list(statuses)}
+        statuses = list(statuses)
+        if until_miss and "miss" in statuses:
+            # As the service does: stop after the first miss.
+            del statuses[statuses.index("miss") + 1 :]
+        return {"ok": True, "statuses": statuses}
 
     def _load(self, keys: list[str], request: str) -> dict[str, Any]:
         slots = self.load_slots if self.load_slots is not None else self._slots(keys)
@@ -277,6 +283,55 @@ def test_lookup_many_rejects_a_status_count_mismatch():
 
     with pytest.raises(CacheServiceError, match="for 2 keys"):
         manager.lookup_many([make_key(0), make_key(1)], request)
+    # Short is only what a scan stopped at a miss looks like, and this reply
+    # does not end at one.
+    with pytest.raises(CacheServiceError, match="for 2 keys"):
+        manager.lookup_many([make_key(0), make_key(1)], request, until_miss=True)
+    # A truncated scan may not answer with more statuses than keys either.
+    client.statuses = ["hit", "hit", "hit"]
+    with pytest.raises(CacheServiceError, match="for 2 keys"):
+        manager.lookup_many([make_key(0), make_key(1)], request, until_miss=True)
+
+
+def test_lookup_many_until_miss_accepts_the_prefix_the_service_stops_at():
+    """A prefix scan sends the flag and leases only the hits before the miss."""
+    client = FakeClient()
+    client.statuses = ["hit", "hit", "miss"]
+    manager = make_manager(client)
+    request = ReqContext("request")
+    keys = [make_key(index) for index in range(4)]
+
+    assert manager.lookup_many(keys, request, until_miss=True) == [
+        LookupResult.HIT,
+        LookupResult.HIT,
+        LookupResult.MISS,
+    ]
+    assert client.ops("lookup_many") == [
+        {
+            "retry": True,
+            "keys": [key.hex() for key in keys],
+            "request": wire_id("request"),
+            "until_miss": True,
+        }
+    ]
+    # The hits it kept took the lease, so finishing the request releases it once.
+    manager.on_request_finished(request)
+    assert client.ops("release_request") == [
+        {"retry": False, "request": wire_id("request")}
+    ]
+
+
+def test_lookup_many_until_miss_asks_no_batch_behind_the_miss():
+    """The scan ends where the reply ends, so a later batch is never asked."""
+    client = FakeClient()
+    client.statuses = ["miss", "hit"]
+    manager = make_manager(client)
+    keys = [make_key(index) for index in range(MAX_KEYS + 2)]
+
+    assert manager.lookup_many(keys, ReqContext("request"), until_miss=True) == [
+        LookupResult.MISS
+    ]
+    assert len(client.ops("lookup_many")) == 1
 
 
 def test_lookup_many_takes_a_lease_the_request_releases_once():

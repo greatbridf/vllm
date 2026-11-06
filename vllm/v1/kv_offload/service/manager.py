@@ -109,8 +109,9 @@ class ServiceOffloadingManager(OffloadingManager):
     service, and `take_events()` the store and eviction events its own store
     calls produced once KV cache events are enabled. `lookup_many()` answers a
     whole batch of a scan with one RPC per `MAX_KEYS` keys instead of one per
-    key. `shutdown()` closes the namespace before the connection, so the service
-    retires it instead of keeping it adoptable.
+    key, and stops at the first miss when the caller asks it to, so a prefix scan
+    leases only the chunks it consumes. `shutdown()` closes the namespace before
+    the connection, so the service retires it instead of keeping it adoptable.
     """
 
     def __init__(
@@ -210,16 +211,27 @@ class ServiceOffloadingManager(OffloadingManager):
         return result
 
     def lookup_many(
-        self, keys: Sequence[OffloadKey], req_context: ReqContext
+        self,
+        keys: Sequence[OffloadKey],
+        req_context: ReqContext,
+        until_miss: bool = False,
     ) -> list[LookupResult]:
-        """Answers one `lookup_many` RPC per batch instead of one per key."""
+        """Answers one `lookup_many` RPC per batch instead of one per key.
+
+        With `until_miss` the service stops at the first key that missed and
+        leases only the hits before it, so the reply, and this result, end there.
+        """
         request = self._wire_id(req_context.req_id)
         encoded = self._encode(keys)
         results: list[LookupResult] = []
         for batch in _batches(encoded):
             try:
                 response = self._call_or_degrade(
-                    "lookup_many", retry=True, keys=batch, request=request
+                    "lookup_many",
+                    retry=True,
+                    keys=batch,
+                    request=request,
+                    until_miss=until_miss,
                 )
             except CacheServiceError as error:
                 # Same reasoning as `lookup`: a request the service cannot
@@ -227,17 +239,42 @@ class ServiceOffloadingManager(OffloadingManager):
                 self._degrade("lookup_many", error)
                 response = None
             if response is None:
+                # A degraded manager reports every key as a miss, so a scan still
+                # sees the gap where offloading stopped.
                 return [LookupResult.MISS] * len(encoded)
-            statuses = response.get("statuses")
-            if not isinstance(statuses, list) or len(statuses) != len(batch):
-                raise CacheServiceError(
-                    f"KV cache service returned {statuses!r} for {len(batch)} keys"
-                )
+            statuses = self._lookup_statuses(response, len(batch), until_miss)
             results += [self._lookup_result(status) for status in statuses]
+            if len(statuses) < len(batch):
+                break
         if LookupResult.HIT in results:
             # The service took the leases itself and reports a hit only then.
             self._request_state(request).leased = True
         return results
+
+    @staticmethod
+    def _lookup_statuses(
+        reply: dict[str, Any], expected: int, until_miss: bool
+    ) -> list[Any]:
+        """Returns the statuses a batch reply carries, or raises.
+
+        A truncated scan reports fewer statuses than keys, which only a request
+        that asked for it may accept, and only when the reply ends at the miss
+        that stopped it.
+        """
+        statuses = reply.get("statuses")
+        truncated = (
+            until_miss
+            and isinstance(statuses, list)
+            and 0 < len(statuses) < expected
+            and statuses[-1] == "miss"
+        )
+        if not isinstance(statuses, list) or (
+            len(statuses) != expected and not truncated
+        ):
+            raise CacheServiceError(
+                f"KV cache service returned {statuses!r} for {expected} keys"
+            )
+        return statuses
 
     def _chunk_slots(self, reply: dict[str, Any], expected: int) -> list[int]:
         """Returns the one chunk slot per key a reply carries, or raises."""

@@ -242,6 +242,38 @@ def test_lookup_many_costs_one_rpc_and_leases_the_hits(service, monkeypatch):
         manager.shutdown()
 
 
+def test_until_miss_scan_leases_only_the_prefix_it_consumed(service):
+    """A prefix scan must not pin the hits behind the miss that ends it."""
+    manager = _wide_spec(service, num_chunks=8).get_manager()
+    request = ReqContext("prefix")
+    try:
+        keys = [OffloadKey(index.to_bytes(4, "big")) for index in range(8)]
+        output = manager.prepare_store(keys, request)
+        assert output is not None
+        manager.complete_store(keys, request)
+        # Key 4 is absent and key 7 is present, so a full scan would lease it.
+        scan = keys[:4] + [OffloadKey(b"absent")] + keys[5:]
+
+        assert manager.lookup_many(scan, request, until_miss=True) == [
+            LookupResult.HIT
+        ] * 4 + [LookupResult.MISS]
+        assert manager.client.call("stats")["stats"]["leased"] == 4
+
+        # Without the flag every hit in the window is leased, the ones behind
+        # the miss included, which is what the sliding-window scan needs.
+        assert (
+            manager.lookup_many(scan, request)
+            == [LookupResult.HIT] * 4 + [LookupResult.MISS] + [LookupResult.HIT] * 3
+        )
+        assert manager.client.call("stats")["stats"]["leased"] == 7
+
+        manager.on_request_finished(request)
+        manager.reset_cache()
+        manager.on_reset_flushed()
+    finally:
+        manager.shutdown()
+
+
 def test_worker_disconnect_invalidates_namespace_without_recycling_old_mapping(service):
     spec = _spec(service)
     manager = spec.get_manager()

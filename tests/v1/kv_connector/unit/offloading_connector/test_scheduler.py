@@ -3310,6 +3310,13 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
 # ---------------------------------------------------------------------------
 
 
+def _until_miss(results: list[LookupResult], until_miss: bool) -> list[LookupResult]:
+    """Answers as the service does: a scan asked to stop ends at the first miss."""
+    if until_miss and LookupResult.MISS in results:
+        return results[: results.index(LookupResult.MISS) + 1]
+    return results
+
+
 def _make_scheduler_with_lookup(
     lookup_results: dict[int, LookupResult],
     default: LookupResult = LookupResult.MISS,
@@ -3328,9 +3335,9 @@ def _make_scheduler_with_lookup(
         return lookup_results.get(int(block_hash.decode()), default)
 
     manager.lookup.side_effect = lookup
-    manager.lookup_many.side_effect = lambda keys, req_context: [
-        manager.lookup(key, req_context) for key in keys
-    ]
+    manager.lookup_many.side_effect = lambda keys, req_context, until_miss=False: (
+        _until_miss([manager.lookup(key, req_context) for key in keys], until_miss)
+    )
 
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
@@ -3439,6 +3446,23 @@ class TestMaximalPrefixLookup:
         sched = _make_scheduler_with_lookup({2: LookupResult.HIT})
         assert _maximal_lookup(sched, to_keys([1, 2])) == 0
 
+    def test_scan_leases_only_the_prefix_it_consumed(self):
+        """The batch is asked to end at the miss, so the hit behind it is not leased."""
+        keys = to_keys([1, 2, 3, 4])
+        sched = _make_scheduler_with_lookup(
+            {1: LookupResult.HIT, 2: LookupResult.HIT, 4: LookupResult.HIT}
+        )
+
+        assert _maximal_lookup(sched, keys) == 2
+        _as_mock(sched.manager.lookup_many).assert_called_once_with(
+            keys, _EMPTY_REQ_CTX, until_miss=True
+        )
+        # The same hits as an untruncated reply: `keys[3]` is past the miss.
+        assert _as_mock(sched._events_tracker.record_lookup).call_args_list == [
+            call(_LOOKUP_REQ, _LOOKUP_GROUP_CONFIG, index, keys[index])
+            for index in range(2)
+        ]
+
     def test_single_hit(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT})
         assert _maximal_lookup(sched, to_keys([1])) == 1
@@ -3545,6 +3569,13 @@ class TestSlidingWindowLookup:
     def test_all_miss(self):
         sched = _make_scheduler_with_lookup({})
         assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 1, _EMPTY_REQ_CTX) == 0
+
+    def test_scan_is_not_truncated_at_a_miss(self):
+        """A gap does not end a tail scan: the run behind it may still be there."""
+        sched = _make_scheduler_with_lookup({2: LookupResult.HIT, 3: LookupResult.HIT})
+
+        assert sched._sliding_window_lookup(to_keys([1, 2, 3]), 2, _EMPTY_REQ_CTX) == 3
+        assert _as_mock(sched.manager.lookup_many).call_args.kwargs == {}
 
     def test_window_at_end(self):
         sched = _make_scheduler_with_lookup({2: LookupResult.HIT, 3: LookupResult.HIT})
@@ -3664,13 +3695,13 @@ def _status_manager(
 
     manager.lookup.side_effect = lookup
     if batched:
-        manager.lookup_many.side_effect = lambda keys, req_context: [
-            lookup(key, req_context) for key in keys
-        ]
+        manager.lookup_many.side_effect = lambda keys, req_context, until_miss=False: (
+            _until_miss([manager.lookup(key, req_context) for key in keys], until_miss)
+        )
     else:
         # The `OffloadingManager` default: one `lookup` per key.
-        manager.lookup_many.side_effect = lambda keys, req_context: (
-            OffloadingManager.lookup_many(manager, keys, req_context)
+        manager.lookup_many.side_effect = lambda keys, req_context, until_miss=False: (
+            OffloadingManager.lookup_many(manager, keys, req_context, until_miss)
         )
     return manager
 
@@ -3696,7 +3727,7 @@ def test_a_long_prefix_costs_one_manager_call_per_batch():
     batches: list[list[OffloadKey]] = []
     manager = MagicMock(spec=OffloadingManager)
 
-    def lookup_many(keys, req_context):
+    def lookup_many(keys, req_context, until_miss=False):
         batches.append(list(keys))
         return [LookupResult.HIT] * len(keys)
 
@@ -3714,7 +3745,7 @@ def test_a_sliding_window_scan_costs_one_manager_call_per_window():
     batches: list[list[OffloadKey]] = []
     manager = MagicMock(spec=OffloadingManager)
 
-    def lookup_many(keys, req_context):
+    def lookup_many(keys, req_context, until_miss=False):
         batches.append(list(keys))
         return [LookupResult.HIT] * len(keys)
 

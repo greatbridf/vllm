@@ -349,7 +349,10 @@ class OffloadingManager(ABC):
         pass
 
     def lookup_many(
-        self, keys: Sequence[OffloadKey], req_context: ReqContext
+        self,
+        keys: Sequence[OffloadKey],
+        req_context: ReqContext,
+        until_miss: bool = False,
     ) -> list[LookupResult]:
         """Checks whether each block of ``keys`` is offloaded and ready.
 
@@ -361,12 +364,24 @@ class OffloadingManager(ABC):
         Args:
             keys: the keys identifying the blocks to lookup, in order.
             req_context: per-request context (e.g. kv_transfer_params).
+            until_miss: stop at the first ``MISS`` instead of asking about the
+                rest of ``keys``, which is what a prefix scan wants: it cannot
+                use a key behind the gap, and a hit it does not take leaves the
+                block evictable.
 
         Returns:
-            One result per key, in the order of ``keys``.
+            One result per key looked up, in the order of ``keys``. The list ends
+            at the first ``MISS`` and is therefore shorter than ``keys`` when
+            ``until_miss`` is set and a lookup missed.
 
         """
-        return [self.lookup(key, req_context) for key in keys]
+        results: list[LookupResult] = []
+        for key in keys:
+            result = self.lookup(key, req_context)
+            results.append(result)
+            if until_miss and result is LookupResult.MISS:
+                break
+        return results
 
     def get_load_source(
         self, key: OffloadKey, req_context: ReqContext
