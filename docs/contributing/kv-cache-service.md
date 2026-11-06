@@ -84,7 +84,10 @@ that pins it:
   sets `until_miss`, so `lookup_many` leases exactly the hits it consumed: its
   reply ends at the first `miss`, and a chunk behind that gap is never leased
   (`an_until_miss_scan_leases_only_the_hits_before_the_miss`,
-  `until_miss_scan_ends_at_the_miss_and_leases_nothing_past_it`).
+  `until_miss_scan_ends_at_the_miss_and_leases_nothing_past_it`). Only a `miss`
+  ends the scan, so a `pending` reservation it walks past is still reported, and
+  it takes no lease of its own
+  (`an_until_miss_scan_reports_the_pending_status_it_walks_past`).
 - **Namespace retirement.** A disconnected worker never hands its mapping to a
   new namespace: the namespace is retired and stays charged to capacity until its
   last session leaves (`main.rs::Registry::retire`,
@@ -124,7 +127,8 @@ that pins it:
   read-only and none of it was answered
   (`test_service_client.py::test_call_refuses_to_interleave_with_an_unread_burst`,
   `::test_a_handshake_cannot_join_a_burst`,
-  `::test_collect_raises_a_rejection_after_reading_the_rest_of_the_burst`).
+  `::test_collect_raises_a_rejection_after_reading_the_rest_of_the_burst`,
+  `::test_a_mid_burst_failure_closes_the_socket`).
 - **Deferrable calls land at the step boundary.** The manager queues the RPCs
   whose reply nothing in the step needs -- `commit` from `complete_store`,
   `release_request` from a finished request, and `touch` -- and writes them as one
@@ -214,7 +218,10 @@ cargo run --release --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
 `cargo bench` covers the cache metadata alone: promotion from the LRU tail, victim
 selection, lease release, and key validation. The `bench` subcommand runs the real
 dispatch loop in-process and reports one JSON object per case, so it also covers
-frame encoding, decoding, and the per-step RPC mix. A change that affects a lookup,
+frame encoding, decoding, and the per-step RPC mix. `--requests N` and
+`--flush-immediately` measure a step of N requests with the deferrable calls
+written as one burst or one round trip each, which is how a change to the
+control-plane batching reports its delta. A change that affects a lookup,
 eviction, lease, or validation path must state the measured delta in its PR, and
 the numbers in
 [`rust/src/kv-cache-service/README.md`](../../rust/src/kv-cache-service/README.md)

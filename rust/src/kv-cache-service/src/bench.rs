@@ -6,7 +6,9 @@
 //! The cases cover what the connector does per schedule step, so an accidental
 //! O(n) regression in the cache or a dropped batch shows up as a per-op cost
 //! that `--assert-max` can gate on. Every number is per operation, and with more
-//! than one connection it is the aggregate over them.
+//! than one connection it is the aggregate over them. The step cases also report
+//! the requests and the round trips of one step, so writing their deferrable
+//! calls as one burst can be compared with writing each of them on its own.
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -36,6 +38,7 @@ const PIPELINE_WINDOW: u64 = 256;
 /// Keys one synthetic schedule step stores: the width of one 64-chunk store.
 const STEP_STORE_KEYS: usize = 64;
 const DEFAULT_KEYS: usize = MAX_KEYS;
+const DEFAULT_REQUESTS: usize = 1;
 const DEFAULT_ITERATIONS: u64 = 500;
 const DEFAULT_CACHE_BYTES: usize = 4 << 30;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,12 +60,22 @@ pub struct BenchArgs {
     /// Operations per case and connection.
     #[arg(long, default_value_t = DEFAULT_ITERATIONS)]
     iterations: u64,
+    /// Concurrent requests per synthetic step: each scans the prefix, loads its
+    /// hits, and stores one batch, then the step's commits and releases go out
+    /// as one burst.
+    #[arg(long, default_value_t = DEFAULT_REQUESTS)]
+    requests: usize,
     /// Aggregate cache budget the bench namespaces must fit.
     #[arg(long, default_value_t = DEFAULT_CACHE_BYTES)]
     cache_bytes: usize,
     /// Print one JSON object per case instead of an aligned table.
     #[arg(long)]
     json: bool,
+    /// Send each request's commit and release as its own round trip instead of
+    /// one burst per step, which is the shape the connector had before the
+    /// burst, and what the step cases are compared against.
+    #[arg(long)]
+    flush_immediately: bool,
     /// Fail the run when a case exceeds this many microseconds per operation,
     /// as `<case>=<us>`.
     #[arg(long = "assert-max", value_name = "CASE=US", value_parser = bound)]
@@ -101,6 +114,16 @@ struct Measured {
     p50_us: f64,
     p99_us: f64,
     us_per_op: f64,
+    /// Set on the cases that model a whole schedule step.
+    step: Option<StepShape>,
+}
+
+/// What one iteration of a step case models.
+#[derive(Clone, Copy)]
+struct StepShape {
+    requests: usize,
+    /// Transport round trips one step costs, one per burst it writes.
+    round_trips: usize,
 }
 
 impl Measured {
@@ -123,11 +146,22 @@ impl Measured {
             p50_us: micros(samples[rank(&samples, 50)] as f64),
             p99_us: micros(samples[rank(&samples, 99)] as f64),
             us_per_op: micros(total as f64 / samples.len() as f64),
+            step: None,
         })
     }
 
+    /// Reports the request count and the round trips one step of the case costs,
+    /// so a burst's saving is visible without deriving it from the op count.
+    fn step(mut self, requests: usize, round_trips: usize) -> Measured {
+        self.step = Some(StepShape {
+            requests,
+            round_trips,
+        });
+        self
+    }
+
     fn json(&self) -> Value {
-        json!({
+        let mut object = json!({
             "case": self.case,
             "keys": self.keys,
             "conns": self.conns,
@@ -135,13 +169,29 @@ impl Measured {
             "p50_us": round(self.p50_us),
             "p99_us": round(self.p99_us),
             "us_per_op": round(self.us_per_op),
-        })
+        });
+        if let Some(step) = self.step {
+            object["requests"] = json!(step.requests);
+            object["round_trips"] = json!(step.round_trips);
+        }
+        object
     }
 
     fn line(&self) -> String {
+        let round_trips = match self.step {
+            Some(step) => step.round_trips.to_string(),
+            None => "-".to_owned(),
+        };
         format!(
-            "{:<22}{:>6}{:>6}{:>10}{:>10.2}{:>10.2}{:>11.2}",
-            self.case, self.keys, self.conns, self.ops, self.p50_us, self.p99_us, self.us_per_op
+            "{:<22}{:>6}{:>6}{:>10}{:>10.2}{:>10.2}{:>11.2}{:>13}",
+            self.case,
+            self.keys,
+            self.conns,
+            self.ops,
+            self.p50_us,
+            self.p99_us,
+            self.us_per_op,
+            round_trips
         )
     }
 }
@@ -165,9 +215,9 @@ fn nanos(start: Instant) -> u64 {
 }
 
 pub fn run(args: BenchArgs) -> io::Result<()> {
-    if args.keys == 0 || args.conns == 0 || args.iterations == 0 {
+    if args.keys == 0 || args.conns == 0 || args.iterations == 0 || args.requests == 0 {
         return Err(invalid(
-            "--keys, --conns, and --iterations must be positive",
+            "--keys, --conns, --iterations, and --requests must be positive",
         ));
     }
     let chunks = args
@@ -181,6 +231,8 @@ pub fn run(args: BenchArgs) -> io::Result<()> {
         keys: (0..args.keys).map(|index| hex_key('a', index)).collect(),
         conns: args.conns,
         iterations: args.iterations,
+        requests: args.requests,
+        immediate: args.flush_immediately,
         worker_bytes,
         chunks,
         opened: 0,
@@ -190,6 +242,7 @@ pub fn run(args: BenchArgs) -> io::Result<()> {
         bench.pipelined_lookup()?,
         bench.lookup_many()?,
         bench.mixed_schedule_step()?,
+        bench.deferred_flush()?,
         bench.stats()?,
     ];
     if args.json {
@@ -198,8 +251,8 @@ pub fn run(args: BenchArgs) -> io::Result<()> {
         }
     } else {
         println!(
-            "{:<22}{:>6}{:>6}{:>10}{:>10}{:>10}{:>11}",
-            "case", "keys", "conns", "ops", "p50_us", "p99_us", "us_per_op"
+            "{:<22}{:>6}{:>6}{:>10}{:>10}{:>10}{:>11}{:>13}",
+            "case", "keys", "conns", "ops", "p50_us", "p99_us", "us_per_op", "round_trips"
         );
         for case in &cases {
             println!("{}", case.line());
@@ -354,6 +407,16 @@ impl Client {
         self.send(request)?;
         self.receive()
     }
+
+    /// Writes a whole burst in one write before reading any reply, which is what
+    /// a pipelining client does.
+    fn send_burst(&mut self, requests: &[Value]) -> io::Result<()> {
+        let mut frames = Vec::new();
+        for request in requests {
+            frames.extend_from_slice(&protocol::encode_response(request)?);
+        }
+        self.stream.write_all(&frames)
+    }
 }
 
 /// Reports the service's rejection instead of counting it as a measurement.
@@ -440,11 +503,81 @@ where
     Ok(recorded.into_iter().flatten().collect())
 }
 
+/// Sends one request and records its round trip; the reply must be accepted.
+fn timed(client: &mut Client, samples: &mut Vec<u64>, request: &Value) -> io::Result<Value> {
+    let start = Instant::now();
+    let reply = client.call(request)?;
+    samples.push(nanos(start));
+    accepted(&reply)?;
+    Ok(reply)
+}
+
+/// Round trips a step's deferrable calls cost: the one burst, or one per call
+/// when they are written as the caller makes them.
+fn flush_round_trips(requests: usize, immediate: bool) -> usize {
+    if immediate { requests * 2 } else { 1 }
+}
+
+/// Writes a step's deferrable calls, as one burst or one round trip each, and
+/// records one sample per reply either way.
+fn deferred(
+    client: &mut Client,
+    samples: &mut Vec<u64>,
+    requests: &[Value],
+    immediate: bool,
+) -> io::Result<()> {
+    if immediate {
+        for request in requests {
+            timed(client, samples, request)?;
+        }
+        return Ok(());
+    }
+    burst(client, samples, requests)
+}
+
+/// Writes a whole burst, then charges each reply the time since the previous
+/// one, so the burst's samples add up to its one round trip.
+fn burst(client: &mut Client, samples: &mut Vec<u64>, requests: &[Value]) -> io::Result<()> {
+    let mut start = Instant::now();
+    client.send_burst(requests)?;
+    for _ in requests {
+        let reply = client.receive()?;
+        samples.push(nanos(start));
+        start = Instant::now();
+        accepted(&reply)?;
+    }
+    Ok(())
+}
+
+/// The step's stored keys, one batch per request, taken from a pool of their own.
+fn step_keys(base: usize, request: usize, store_keys: usize) -> Vec<String> {
+    (0..store_keys)
+        .map(|offset| hex_key('c', base + request * store_keys + offset))
+        .collect()
+}
+
+/// The commit and the release of one request, in the order the manager enqueues
+/// them: a commit is queued when the store completes, the release when the
+/// request finishes or its last job does.
+fn deferred_calls(request: String, fresh: &[String]) -> [Value; 2] {
+    [
+        json!({
+            "op": "commit",
+            "keys": fresh,
+            "request": request,
+            "success": true,
+        }),
+        json!({"op": "release_request", "request": request}),
+    ]
+}
+
 struct Bench {
     socket: PathBuf,
     keys: Vec<String>,
     conns: usize,
     iterations: u64,
+    requests: usize,
+    immediate: bool,
     worker_bytes: usize,
     chunks: usize,
     opened: u64,
@@ -573,74 +706,111 @@ impl Bench {
         Measured::new("rpc_lookup_many", self.keys.len(), self.conns, samples)
     }
 
-    /// A synthetic schedule step: the prefix scan, a load of its hits, a store of
-    /// one 64-chunk batch and its commit, then the release of the step's leases.
+    /// A synthetic schedule step of `--requests` requests: each scans the
+    /// prefix, loads its hits, and stores one 64-chunk batch, then the commits
+    /// and releases of the whole step go out as one burst, as the manager writes
+    /// them at the end of the step.
     fn mixed_schedule_step(&mut self) -> io::Result<Measured> {
         let mut sessions = self.sessions("step")?;
         let keys = &self.keys;
         let iterations = self.iterations;
-        let step_keys = STEP_STORE_KEYS.min(keys.len()).max(1);
+        let requests = self.requests;
+        let immediate = self.immediate;
+        let store_keys = STEP_STORE_KEYS.min(keys.len()).max(1);
+        let batches = keys.chunks(MAX_KEYS).count();
         let samples = measure(&mut sessions, |session, samples| {
             for iteration in 0..iterations {
-                let mut hits: Vec<&String> = Vec::new();
-                for batch in keys.chunks(MAX_KEYS) {
-                    let request = json!({
-                        "op": "lookup_many",
-                        "keys": batch,
-                        "request": STEP_REQUEST,
-                    });
-                    let start = Instant::now();
-                    let reply = session.client.call(&request)?;
-                    samples.push(nanos(start));
-                    let statuses = accepted(&reply)?["statuses"]
-                        .as_array()
-                        .ok_or_else(|| invalid("lookup_many reply without statuses"))?;
-                    for (key, status) in batch.iter().zip(statuses) {
-                        if status == "hit" {
-                            hits.push(key);
+                let base = iteration as usize * store_keys * requests;
+                let mut queued = Vec::with_capacity(requests * 2);
+                for index in 0..requests {
+                    let request = format!("{STEP_REQUEST}-{index}");
+                    let mut hits: Vec<&String> = Vec::new();
+                    for batch in keys.chunks(MAX_KEYS) {
+                        let reply = timed(
+                            &mut session.client,
+                            samples,
+                            &json!({
+                                "op": "lookup_many",
+                                "keys": batch,
+                                "request": request,
+                            }),
+                        )?;
+                        let statuses = reply["statuses"]
+                            .as_array()
+                            .ok_or_else(|| invalid("lookup_many reply without statuses"))?;
+                        for (key, status) in batch.iter().zip(statuses) {
+                            if status == "hit" {
+                                hits.push(key);
+                            }
                         }
                     }
-                }
-                if !hits.is_empty() {
-                    for batch in hits.chunks(MAX_KEYS) {
-                        let request = json!({"op": "load", "keys": batch, "request": STEP_REQUEST});
-                        let start = Instant::now();
-                        let reply = session.client.call(&request)?;
-                        samples.push(nanos(start));
-                        accepted(&reply)?;
+                    if hits.len() != keys.len() {
+                        return Err(invalid("a step scan missed the prefix it populated"));
                     }
+                    for batch in hits.chunks(MAX_KEYS) {
+                        timed(
+                            &mut session.client,
+                            samples,
+                            &json!({"op": "load", "keys": batch, "request": request}),
+                        )?;
+                    }
+                    let fresh = step_keys(base, index, store_keys);
+                    let reply = timed(
+                        &mut session.client,
+                        samples,
+                        &json!({"op": "store", "keys": fresh, "request": request}),
+                    )?;
+                    if reply["full"] == true {
+                        return Err(invalid("a step store found no evictable slot"));
+                    }
+                    queued.extend(deferred_calls(request, &fresh));
                 }
-                let base = iteration as usize * step_keys;
-                let fresh: Vec<String> =
-                    (0..step_keys).map(|index| hex_key('c', base + index)).collect();
-                let start = Instant::now();
-                let reply = session
-                    .client
-                    .call(&json!({"op": "store", "keys": fresh, "request": STEP_REQUEST}))?;
-                samples.push(nanos(start));
-                if accepted(&reply)?["full"] == true {
-                    return Err(invalid("a step store found no evictable slot"));
-                }
-                let start = Instant::now();
-                let reply = session.client.call(&json!({
-                    "op": "commit",
-                    "keys": fresh,
-                    "request": STEP_REQUEST,
-                    "success": true,
-                }))?;
-                samples.push(nanos(start));
-                accepted(&reply)?;
-                let start = Instant::now();
-                let reply = session
-                    .client
-                    .call(&json!({"op": "release_request", "request": STEP_REQUEST}))?;
-                samples.push(nanos(start));
-                accepted(&reply)?;
+                deferred(&mut session.client, samples, &queued, immediate)?;
             }
             Ok(())
         })?;
         self.finish(sessions)?;
-        Measured::new("mixed_schedule_step", self.keys.len(), self.conns, samples)
+        // One scan and one load batch per request, then its store, and every
+        // request's commits and releases in one burst instead of two each.
+        let round_trips = requests * (2 * batches + 1) + flush_round_trips(requests, immediate);
+        let measured = Measured::new("mixed_schedule_step", self.keys.len(), self.conns, samples)?;
+        Ok(measured.step(requests, round_trips))
+    }
+
+    /// The deferrable tail of a step on its own: each request's store round trip,
+    /// then one burst carrying every request's commit and release.
+    fn deferred_flush(&mut self) -> io::Result<Measured> {
+        let mut sessions = self.sessions("flush")?;
+        let keys = &self.keys;
+        let iterations = self.iterations;
+        let requests = self.requests;
+        let immediate = self.immediate;
+        let store_keys = STEP_STORE_KEYS.min(keys.len()).max(1);
+        let samples = measure(&mut sessions, |session, samples| {
+            for iteration in 0..iterations {
+                let base = iteration as usize * store_keys * requests;
+                let mut queued = Vec::with_capacity(requests * 2);
+                for index in 0..requests {
+                    let request = format!("{STEP_REQUEST}-{index}");
+                    let fresh = step_keys(base, index, store_keys);
+                    let reply = timed(
+                        &mut session.client,
+                        samples,
+                        &json!({"op": "store", "keys": fresh, "request": request}),
+                    )?;
+                    if reply["full"] == true {
+                        return Err(invalid("a flush store found no evictable slot"));
+                    }
+                    queued.extend(deferred_calls(request, &fresh));
+                }
+                deferred(&mut session.client, samples, &queued, immediate)?;
+            }
+            Ok(())
+        })?;
+        self.finish(sessions)?;
+        let round_trips = requests + flush_round_trips(requests, immediate);
+        let measured = Measured::new("deferred_flush", self.keys.len(), self.conns, samples)?;
+        Ok(measured.step(requests, round_trips))
     }
 
     /// A namespace poll, which walks the metadata of a populated cache.

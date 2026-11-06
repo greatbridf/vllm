@@ -187,9 +187,10 @@ of two or three round trips per request. The calls whose answer the step needs -
 earlier in a step is published at the end of that step and a `lookup` for it in the
 same step still reports `pending`. The manager flushes the queue before a `store`,
 a `stats`, a `reset`, and a `close`, so a call that depends on what the queue still
-owes never overtakes it. An operation whose chunks split above 4096 keys is written
-as one burst for that operation, except `store`, which stops at the first batch the
-cache cannot fit.
+owes never overtakes it. A `load`, a `commit`, and a `touch` whose chunks split
+above 4096 keys write one burst for that operation; a `lookup_many` asks one batch
+at a time, because a scan that stopped at a miss decides whether the next batch is
+asked for at all, and a `store` stops at the first batch the cache cannot fit.
 
 A burst holds no handshake. An `attach` reply is a frame followed by one
 descriptor message, which must be received with its marker byte, so the handshake
@@ -637,16 +638,40 @@ Control plane (`bench` subcommand, 4096 keys, 1 connection):
 | `rpc_serial_lookup` | 26.9 µs | 31.5 µs | 27.1 µs |
 | `rpc_pipelined_lookup` | 0.63 µs | 0.79 µs | 0.67 µs |
 | `rpc_lookup_many` | 888 µs | 962 µs | 891 µs (0.22 µs per key) |
-| `mixed_schedule_step` | 75 µs | 926 µs | 349 µs |
+| `mixed_schedule_step` | 74 µs | 897 µs | 338 µs |
+| `deferred_flush` | 43 µs | 82 µs | 39 µs |
 | `stats` | 34 µs | 44 µs | 34 µs |
 
 One lookup round trip costs 27 µs, so a per-chunk lookup costs the scheduler
 27 µs per chunk of the prefix. Pipelining the same lookups costs 0.67 µs per op,
 and one 4096-key `lookup_many` covers a 64 k-token prefix in 0.9 ms. Pipelined
 ops are charged the time since the previous reply, so the first op of a window
-also pays for the window to drain. `mixed_schedule_step` is a synthetic schedule
-step: the prefix scan, the load of its hits, a 64-chunk store and commit, and the
-release of the step's leases, so its mean is dominated by the scan.
+also pays for the window to drain.
+
+`mixed_schedule_step` is a synthetic schedule step of `--requests` requests: each
+one scans the prefix, loads its hits, and stores one 64-chunk batch, then the
+step's commits and releases are written as one burst, as the manager writes them
+at the end of a step. `deferred_flush` is that deferrable tail on its own: one
+store per request, then the step's commits and releases. `--flush-immediately`
+writes each of those calls as its own round trip instead, which is the shape the
+connector had before the burst. Both cases report the `requests` of a step and
+the `round_trips` it costs, so the control plane's shape is in the output rather
+than in the reader's head:
+
+| requests per step | round trips, one call at a time | round trips, one burst | step cost, one at a time | step cost, burst |
+| --- | --- | --- | --- | --- |
+| 1 | 5 | 4 | 1.74 ms | 1.73 ms |
+| 8 | 40 | 25 | 14.4 ms | 13.9 ms |
+| 32 | 160 | 97 | 58.6 ms | 56.6 ms |
+
+The two columns are the same binary on the same cache, so only the wire shape
+differs, and a step cost is `us_per_op` times the ops of one step. The deferrable
+tail is about 35 % cheaper (`deferred_flush`: 1.12 ms → 0.74 ms for 8 requests,
+4.5 ms → 2.85 ms for 32), but a step that also scans a 4096-key prefix is
+scan-bound, so the whole step only moves about 3 %. What falls everywhere is the
+round trips, by `2N - 1` per step: one write and one read per step instead of two
+more round trips per request. Per-round-trip cost on this host drifts by up to
+2x between runs, so compare the columns of one table instead of two tables.
 
 ```bash
 cargo bench --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
@@ -656,7 +681,8 @@ cargo run --release --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
   --assert-max rpc_serial_lookup=200
 ```
 
-`bench --keys`, `--conns`, `--iterations`, and `--cache-bytes` shape the run.
+`bench --keys`, `--conns`, `--iterations`, `--requests`, and `--cache-bytes` shape
+the run.
 It serves real protocol frames from the real dispatch loop on a private socket in
 the same process, one namespace per connection, and prints one JSON object per
 case (an aligned table without `--json`). Every `--assert-max <case>=<us>` bound
