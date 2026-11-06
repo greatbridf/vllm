@@ -76,6 +76,10 @@ pub enum Request {
     Touch {
         keys: Vec<String>,
     },
+    /// Test/diagnostic: page committed chunks out through the kernel's swap path.
+    Spill {
+        keys: Vec<String>,
+    },
     Reset {
         /// Drop leases and pending reservations instead of refusing the reset.
         #[serde(default)]
@@ -102,6 +106,7 @@ impl Request {
             Request::Store { .. } => "store",
             Request::Commit { .. } => "commit",
             Request::Touch { .. } => "touch",
+            Request::Spill { .. } => "spill",
             Request::Reset { .. } => "reset",
             Request::Stats => "stats",
             Request::Close => "close",

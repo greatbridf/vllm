@@ -408,6 +408,10 @@ fn handle(
                     cache.touch(&keys);
                     json!({"ok": true})
                 }
+                Request::Spill { keys } => {
+                    check_keys(&keys).map_err(reject)?;
+                    json!({"ok": true, "pages": cache.spill(&keys)?})
+                }
                 Request::Reset { force } => {
                     reclaim_expired(&mut cache, name, pending_timeout);
                     cache.reset(force).map_err(reject)?;

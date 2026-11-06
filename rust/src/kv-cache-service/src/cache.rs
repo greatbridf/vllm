@@ -72,6 +72,7 @@ pub struct Cache {
     pub worker_bytes: usize,
     pub world_size: usize,
     pub row_bytes: usize,
+    pub page_size: usize,
     pub num_chunks: usize,
     pub file: File,
     pub mapping: MmapMut,
@@ -376,6 +377,7 @@ impl Cache {
             worker_bytes,
             world_size,
             row_bytes,
+            page_size: page,
             num_chunks,
             file,
             mapping,
@@ -434,6 +436,58 @@ impl Cache {
             }
         }
         statuses
+    }
+
+    /// Writes committed chunks out through the kernel's swap path.
+    ///
+    /// The digest is resolved from the VMA that carries the rswap program, and
+    /// the reverse-mapping walk stops as soon as the folio is no longer mapped
+    /// (`try_to_unmap()` uses `rwc.done = folio_not_mapped`), so an attached VMA
+    /// without a page table entry of its own is never visited. Faulting each
+    /// page in first keeps the folio mapped until this VMA is walked, which is
+    /// what lets the kernel store the page under the digest the service
+    /// published. Only a committed chunk may be spilled, because a page with no
+    /// published digest cannot be written out at all.
+    ///
+    /// Args:
+    ///     keys: Cache keys of committed chunks.
+    ///
+    /// Returns:
+    ///     The number of base pages handed to the kernel.
+    pub fn spill(&self, keys: &[String]) -> io::Result<usize> {
+        let mut pages = 0;
+        for key in keys {
+            let slot = *self
+                .index
+                .get(key.as_str())
+                .ok_or_else(|| invalid("spill requires a stored chunk"))?;
+            if !self.slots[slot as usize].ready {
+                return Err(invalid("spill requires a committed chunk"));
+            }
+            let base = self.mapping.as_ptr() as usize + slot as usize * self.row_bytes;
+            for offset in (0..self.row_bytes).step_by(self.page_size) {
+                // SAFETY: the slot lies inside the sealed mapping and the offset
+                // is page-aligned within its row; a volatile read installs a
+                // page table entry and changes no data.
+                unsafe {
+                    let page = std::ptr::with_exposed_provenance::<u8>(base + offset);
+                    let _ = std::ptr::read_volatile(page);
+                }
+            }
+            // SAFETY: the range is the slot's whole row inside the live mapping.
+            let advised = unsafe {
+                libc::madvise(
+                    base as *mut libc::c_void,
+                    self.row_bytes,
+                    libc::MADV_PAGEOUT,
+                )
+            };
+            if advised != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            pages += self.row_bytes / self.page_size;
+        }
+        Ok(pages)
     }
 
     pub fn load(&self, keys: &[String], request: &str) -> io::Result<Vec<usize>> {
@@ -937,6 +991,22 @@ mod tests {
 
     fn recorded(ops: &Arc<Mutex<Vec<Op>>>) -> Vec<Op> {
         ops.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn spill_requires_a_committed_chunk() {
+        let mut cache = cache();
+        let first = keys(&["aa"]);
+        cache.store(&first, "r").unwrap();
+        // Reserved but not published: a page with no digest cannot be written out.
+        assert!(cache.spill(&first).is_err());
+        cache.commit(&first, "r", true).unwrap();
+        // One page per row of this geometry, and a missing key is refused.
+        assert_eq!(
+            cache.spill(&first).unwrap(),
+            cache.row_bytes / cache.page_size
+        );
+        assert!(cache.spill(&keys(&["bb"])).is_err());
     }
 
     #[test]

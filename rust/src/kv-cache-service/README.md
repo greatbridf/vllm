@@ -222,11 +222,25 @@ sent only once the burst is collected.
 | `release_request` | `request` | scheduler | `released`, `unknown` |
 | `store` | `keys`, `request` | scheduler | `keys`, `slots`, `evicted`, or `full` |
 | `commit` | `keys`, `request`, `success` | scheduler | `ok` only |
-| `touch` | `keys` | scheduler | `ok` only |
+| `spill` | `keys` | scheduler | `pages` written out |
 | `reset` | `force`, default `false` | scheduler | `ok` only |
 | `stats` | none | scheduler or worker | `stats`, `sessions`, `detached` |
 | `close` | none | scheduler | `ok` only |
 | `info` | none | anyone, before any handshake | service state |
+
+`spill` asks the kernel to write committed chunks out through the swap path
+without waiting for memory pressure: it faults each page of the chunk into this
+process's page tables first, because the digest is resolved from the VMA that
+carries the rswap program and the reverse-mapping walk stops as soon as a folio
+is no longer mapped, and then calls `madvise(MADV_PAGEOUT)` on the chunk.
+It is the service's own mapping that both holds those entries and carries the
+attach, so the service has to be the caller; a worker's mapping cannot do it.
+Measured on a 7.3 rswap kernel, `MADV_PAGEOUT` reports success for this shmem
+mapping while nothing is reclaimed (`/proc/swaps` `xswap<N>` `Used` stays 0),
+whereas an anonymous mapping of the same size writes every page out, so the
+response `pages` is what was advised, not what reached the backend. Driving
+reclaim by memory pressure in a bounded cgroup is the reliable trigger; that is
+what `tools/mm/rswap_run_test.py` in the kernel tree does.
 
 `open` and `attach` are the only handshake operations, and a session holds at
 most one namespace. `open` creates a namespace under a caller-chosen name, with
