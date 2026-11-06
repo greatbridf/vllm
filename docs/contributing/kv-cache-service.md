@@ -115,6 +115,16 @@ that pins it:
   descriptor are written after `handle` returns, so a client that stops reading
   blocks only its own connection
   (`slow_reader_does_not_block_another_namespace`).
+- **Pipelined bursts.** A burst is written before any of its replies is read, and
+  the service answers in order with one reply per request, so a single request
+  may not be sent while a burst is unread and neither `open`, `attach`, nor
+  `close` may join one: an `attach` reply carries a descriptor that must be
+  received with its marker byte. A rejected reply is drained with the rest of its
+  burst before the client raises, and a burst is repeated only when all of it is
+  read-only and none of it was answered
+  (`test_service_client.py::test_call_refuses_to_interleave_with_an_unread_burst`,
+  `::test_a_handshake_cannot_join_a_burst`,
+  `::test_collect_raises_a_rejection_after_reading_the_rest_of_the_burst`).
 
 ## Validating a change
 
@@ -131,7 +141,8 @@ cargo fmt --manifest-path rust/Cargo.toml -p vllm-kv-cache-service -- --check
 cargo build --manifest-path rust/Cargo.toml -p vllm-kv-cache-service
 .venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
   tests/v1/kv_offload/test_service.py tests/v1/kv_offload/test_service_manager.py \
-  tests/v1/kv_offload/test_service_region.py -q
+  tests/v1/kv_offload/test_service_region.py \
+  tests/v1/kv_offload/test_service_client.py -q
 .venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
   tests/v1/kv_offload/test_factory.py -k rust -q
 ```
@@ -145,7 +156,8 @@ while skipping what they cover, so a report says which happened:
 - `test_service.py` skips when the binary is missing (`Build
   vllm-kv-cache-service or set VLLM_KV_CACHE_SERVICE_BINARY`).
   `test_service_manager.py` and `test_service_region.py` need neither the binary
-  nor a GPU; `test_service.py` needs only the binary.
+  nor a GPU; `test_service.py` needs only the binary, and `test_service_client.py`
+  needs it for one case and runs the rest against a fake peer.
 
 The opt-in suites need hardware or privileges and stay out of CI:
 

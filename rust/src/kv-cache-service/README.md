@@ -171,10 +171,20 @@ Every message is one frame: a 4-byte big-endian length and that many bytes of
 JSON. Both directions are bounded by 1 MiB. A request is an object whose `op`
 field names one of the operations below; an unknown operation, an unknown field,
 a non-JSON payload, a length of 0, and a length above the limit are frame-level
-failures. Requests carry no ids, so a reply belongs to the request in flight,
-and the service answers one connection's requests in arrival order, one at a
-time. A client that writes several frames before reading their replies pipelines
-them; the connector does not.
+failures. Requests carry no ids, so replies are ordered: the service answers one
+connection's requests in arrival order, exactly one reply per request. A client
+may therefore write a burst of frames before reading any reply and then read one
+reply per request in the same order; `CacheServiceClient.pipeline` does exactly
+that, and a burst costs one round trip instead of one per request. The connector
+still sends one request at a time.
+
+A burst holds no handshake. An `attach` reply is a frame followed by one
+descriptor message, which must be received with its marker byte, so the handshake
+cannot be followed by other requests on that stream; `open` and `close` are
+excluded with it, because a burst is a set of operations on the namespace the
+session already holds. A client that sends one more request while a burst is
+unread would read the next reply as that request's, so a single request may be
+sent only once the burst is collected.
 
 | `op` | Fields | Sent by | Reply |
 | --- | --- | --- | --- |
@@ -650,7 +660,8 @@ cargo clippy --manifest-path rust/Cargo.toml -p vllm-kv-cache-service \
 cargo fmt --manifest-path rust/Cargo.toml -p vllm-kv-cache-service -- --check
 .venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
   tests/v1/kv_offload/test_service.py tests/v1/kv_offload/test_service_manager.py \
-  tests/v1/kv_offload/test_service_region.py -q
+  tests/v1/kv_offload/test_service_region.py \
+  tests/v1/kv_offload/test_service_client.py -q
 .venv/bin/python -m pytest --confcutdir=tests/v1/kv_offload \
   tests/v1/kv_offload/test_factory.py -k rust -q
 ```
@@ -662,7 +673,8 @@ lacks BPF privileges or `BPF_MAP_TYPE_ARENA`, so a green `cargo test` does not b
 itself prove the BPF path ran. The Python suites need
 `rust/target/debug/vllm-kv-cache-service` (or `VLLM_KV_CACHE_SERVICE_BINARY`) and
 skip when it is missing; `test_service_manager.py` and `test_service_region.py`
-need neither the binary nor a GPU.
+need neither the binary nor a GPU, and `test_service_client.py` needs it for its
+one real-service case and runs the rest of the client against a fake peer.
 
 On a machine booted into an rswap-capable kernel (`CONFIG_RSWAP`) with an rswap
 backend configured, `test_service_rswap.py` also covers the kernel side: it
