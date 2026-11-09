@@ -538,7 +538,13 @@ impl Cache {
     /// Returns:
     ///     The number of pages handed to the kernel.
     pub fn prefetch(&self, slots: &[usize]) -> io::Result<usize> {
-        prefetch_rows(&self.mapping, self.row_bytes, self.page_size, slots)
+        prefetch_rows_parallel(
+            &self.mapping,
+            self.row_bytes,
+            self.page_size,
+            slots,
+            PREFETCH_STREAMS,
+        )
     }
 
     /// The mapping and geometry a detached prefetch needs.
@@ -1137,30 +1143,121 @@ pub fn prefetch_rows(
     page_size: usize,
     slots: &[usize],
 ) -> io::Result<usize> {
+    prefetch_rows_parallel(mapping, row_bytes, page_size, slots, 1)
+}
+
+/// How many `MADV_WILLNEED` streams one prefetch drives at once.
+///
+/// `madvise(MADV_WILLNEED)` on a shmem mapping ends in `shmem_swapin_range()`,
+/// which stages the whole range into one `swap_io_ctx` and submits it once
+/// ("do not wait for completion"). One call is therefore one stream, and a
+/// thread that issues the row ranges one after another keeps a single stream in
+/// flight however many batches the kernel would allow; measured against a bound
+/// Redis peer that is one 120 KiB request per 20-35 ms, about 7 MB/s. Driving
+/// several rows from several threads is what fills the kernel's read slots.
+pub const PREFETCH_STREAMS: usize = 4;
+
+/// Same as [`prefetch_rows`], with `streams` rows in flight at once.
+pub fn prefetch_rows_parallel(
+    mapping: &MmapMut,
+    row_bytes: usize,
+    page_size: usize,
+    slots: &[usize],
+    streams: usize,
+) -> io::Result<usize> {
     let mut sorted = slots.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    // Merge adjacent slots: one call covers a contiguous run of rows.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for slot in sorted {
+        match runs.last_mut() {
+            Some((_, last)) if *last + 1 == slot => *last = slot,
+            _ => runs.push((slot, slot)),
+        }
+    }
+    let streams = streams.clamp(1, PREFETCH_STREAMS).min(runs.len().max(1));
     let mut pages = 0;
-    let mut index = 0;
-    while index < sorted.len() {
-        let first = sorted[index];
-        let mut last = first;
-        while index + 1 < sorted.len() && sorted[index + 1] == last + 1 {
-            index += 1;
-            last = sorted[index];
+    let mut first_error: Option<io::Error> = None;
+    if streams <= 1 {
+        for (first, last) in runs {
+            match advise_rows(mapping, row_bytes, page_size, first, last) {
+                Ok(advised) => pages += advised,
+                Err(error) => {
+                    first_error = Some(error);
+                    break;
+                }
+            }
         }
-        let base = mapping.as_ptr() as usize + first * row_bytes;
-        let len = (last - first + 1) * row_bytes;
-        // SAFETY: the slots lie inside the sealed mapping and the range is whole
-        // rows, so it is mapped and page-aligned.
-        let advised = unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_WILLNEED) };
-        if advised != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        pages += len / page_size;
-        index += 1;
+    } else {
+        // Every stream takes every `streams`-th run, so the calls of different
+        // streams never describe the same range.
+        let mapping_ref = &*mapping;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(streams);
+            for lane in 0..streams {
+                let lane_runs: Vec<(usize, usize)> =
+                    runs.iter().copied().skip(lane).step_by(streams).collect();
+                if lane_runs.is_empty() {
+                    continue;
+                }
+                handles.push(scope.spawn(move || {
+                    let mut lane_pages = 0;
+                    for (first, last) in lane_runs {
+                        match advise_rows(mapping_ref, row_bytes, page_size, first, last) {
+                            Ok(advised) => lane_pages += advised,
+                            Err(error) => return (lane_pages, Some(error)),
+                        }
+                    }
+                    (lane_pages, None)
+                }));
+            }
+            let mut lane_pages_total = 0;
+            let mut lane_error: Option<io::Error> = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok((lane_pages, error)) => {
+                        lane_pages_total += lane_pages;
+                        if lane_error.is_none() {
+                            lane_error = error;
+                        }
+                    }
+                    Err(_) => {
+                        if lane_error.is_none() {
+                            lane_error = Some(invalid("prefetch panicked"));
+                        }
+                    }
+                }
+            }
+            pages += lane_pages_total;
+            if lane_error.is_some() {
+                first_error = lane_error;
+            }
+        });
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(pages)
+}
+
+/// One `MADV_WILLNEED` over rows `first..=last`.
+fn advise_rows(
+    mapping: &MmapMut,
+    row_bytes: usize,
+    page_size: usize,
+    first: usize,
+    last: usize,
+) -> io::Result<usize> {
+    let base = mapping.as_ptr() as usize + first * row_bytes;
+    let len = (last - first + 1) * row_bytes;
+    // SAFETY: the slots lie inside the sealed mapping and the range is whole
+    // rows, so it is mapped and page-aligned.
+    let advised = unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+    if advised != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(len / page_size)
 }
 
 impl Drop for Cache {

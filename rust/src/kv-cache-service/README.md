@@ -259,6 +259,14 @@ not committed, which is what makes the keys a lookup answered `pending` for safe
 to send. The reply counts the pages that were advised, not the pages the kernel
 fetched, exactly as `load`'s `prefetched` does.
 
+One prefetch drives up to four `MADV_WILLNEED` streams over disjoint rows. A
+shmem willneed becomes one `swap_io_ctx` submitted once by `shmem_swapin_range()`,
+so a thread issuing rows one after another keeps a single read stream in flight
+however many batches the kernel would allow: measured against a bound Redis peer,
+average read concurrency is 0.6-1.0 with one stream and 1.3 with four, against a
+kernel limit of eight, which means the remaining serialisation is inside the
+backend's submit path, not in this fan-out.
+
 `spill` asks the kernel to write committed chunks out through the swap path
 without waiting for memory pressure: it faults each page of the chunk into this
 process's page tables first, because the digest is resolved from the VMA that
