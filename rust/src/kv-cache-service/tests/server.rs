@@ -192,6 +192,36 @@ fn open_with(client: &mut Client, namespace: &str, fingerprint: &str, num_chunks
     }))
 }
 
+#[test]
+fn no_eviction_retains_keys_when_the_namespace_is_full() {
+    let service = Service::start_with(&["--eviction-policy", "none"]);
+    let mut client = service.connect();
+    assert_eq!(open(&mut client, "no-eviction")["ok"], true);
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": ["aa", "bb"], "request": "writer"}))["ok"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "commit", "keys": ["aa", "bb"], "request": "writer", "success": true
+        }))["ok"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": ["cc"], "request": "writer"})),
+        json!({"ok": true, "full": true})
+    );
+    let retained = client.call(json!({
+        "op": "store", "keys": ["aa", "bb"], "request": "writer"
+    }));
+    assert_eq!(retained["keys"], json!([]));
+    assert_eq!(retained["evicted"], json!([]));
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    assert_eq!(stats["evictions"], 0);
+    assert_eq!(stats["entries"], 2);
+    assert_eq!(stats["pending"], 0);
+}
+
 /// The replay a reconnecting client sends: adopt what a departed owner left, or
 /// nothing.
 fn adopt(client: &mut Client, namespace: &str) -> Value {

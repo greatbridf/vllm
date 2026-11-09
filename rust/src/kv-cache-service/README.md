@@ -5,6 +5,19 @@ The Rust process owns sealed `memfd` mappings, slot reservations, content keys,
 lookup leases, and LRU eviction. Workers map the descriptors and execute the
 existing GPU DMA transfers. No CUDA code runs in the service.
 
+Pass `--eviction-policy none` to bypass the service's LRU bookkeeping and
+replacement (the default is `lru`). Committed keys keep their slots while Linux
+decides which pages to reclaim or swap out. Kernel page reclaim does not free
+logical slots: once a namespace is full, stores needing new slots return `full`
+without removing existing keys. Aborted or expired reservations and a cache
+reset still release slots. With watermark spilling enabled, this mode uses
+cgroup reclaim without selecting LRU rows. Explicit `spill` requests still work.
+
+For reclaimable cache pages, set `"pin_host_memory": false` in the connector
+configuration and leave `--pin-lease-bytes` at `0`. The service-side eviction
+option does not override these pinning settings or the connector's
+`eviction_policy` setting, which must remain `lru`.
+
 ## Start
 
 ```bash

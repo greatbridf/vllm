@@ -105,6 +105,18 @@ The Rust service owns DRAM mappings, reservations, lookup leases, and eviction;
 vLLM workers map its shared-memory descriptors and execute GPU copies.
 This differs from `offload_region: "mmap"`, which allocates memory inside workers.
 
+The service defaults to `--eviction-policy lru`. Start it with
+`--eviction-policy none` to bypass LRU bookkeeping and retain committed cache
+keys while the kernel decides which pages to reclaim or swap out. Page reclaim
+does not release logical chunk slots: once all slots are occupied, stores
+needing new keys return `full`, leaving existing keys intact. Aborted or expired
+reservations and cache reset can still release slots. In this mode, optional
+watermark spilling uses cgroup reclaim without choosing LRU rows; explicit
+`spill` requests are unchanged. Set `"pin_host_memory": false` and leave the
+service's `--pin-lease-bytes` at `0` to keep cache pages reclaimable. This is a
+service CLI option, not `kv_connector_extra_config`: the connector's
+`eviction_policy` must still be `lru`.
+
 Choose this backend when one DRAM cache on the node should outlive a worker
 restart within one engine lifetime, with eviction and lease bookkeeping outside
 the engine process. It replaces the in-process CPU tier of `OffloadingConnector`

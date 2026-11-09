@@ -14,6 +14,7 @@ fn help_documents_rswap_attach_and_alias() {
     assert!(stdout.contains("--hash-attach"));
     assert!(stdout.contains("/sys/kernel/mm/xswap/rswap_attach"));
     assert!(stdout.contains("bench"));
+    assert!(stdout.contains("--eviction-policy"));
 }
 
 fn bench(args: &[&str]) -> Output {

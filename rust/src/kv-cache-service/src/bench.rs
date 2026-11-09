@@ -318,6 +318,7 @@ impl Service {
             budget,
             rswap_attach: None,
             pin_lease_bytes: 0,
+            eviction_policy: crate::EvictionPolicy::Lru,
             prefetch: PrefetchLimits::default(),
             pending_timeout: None,
             started: Instant::now(),

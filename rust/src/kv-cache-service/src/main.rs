@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde_json::{Value, json};
 use vllm_kv_cache_service::cache::{
-    Cache, PREFETCH_STREAMS, PrefetchLimits, Released, Status, StoreRejection, check_keys,
-    check_request, namespace_bytes, page_out_rows, prefetch_rows, prefetch_rows_parallel,
+    Cache, EvictionPolicy, PREFETCH_STREAMS, PrefetchLimits, Released, Status, StoreRejection,
+    check_keys, check_request, namespace_bytes, page_out_rows, prefetch_rows,
+    prefetch_rows_parallel,
 };
 use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
 use vllm_kv_cache_service::protocol::{self, Request};
@@ -50,6 +51,10 @@ struct Args {
     /// Aggregate upper bound on bytes allocated across cache namespaces.
     #[arg(long, required = true)]
     capacity_bytes: Option<usize>,
+    /// Replace least-recently-used keys, or retain keys and leave page reclaim
+    /// to Linux. With `none`, stores needing more slots return `full`.
+    #[arg(long, value_enum, default_value = "lru")]
+    eviction_policy: EvictionPolicy,
     /// Simultaneous client connections served at once.
     #[arg(long, default_value_t = 128)]
     max_connections: usize,
@@ -159,6 +164,7 @@ struct Registry {
     budget: usize,
     rswap_attach: Option<PathBuf>,
     pin_lease_bytes: usize,
+    eviction_policy: EvictionPolicy,
     /// `(memory.reclaim, watermark percent)` of this service's cgroup.
     spill: Option<(PathBuf, u64)>,
     prefetch: PrefetchLimits,
@@ -840,6 +846,7 @@ impl Registry {
             remaining,
             self.pin_lease_bytes,
             self.prefetch,
+            self.eviction_policy,
             factory.as_ref().map(|factory| factory as &dyn HashFactory),
         )?;
         let frame = protocol::encode_response(&geometry_reply(&cache))?;
@@ -1238,6 +1245,7 @@ fn run_service(args: Args) -> io::Result<()> {
         "pending_timeout_secs" = args.pending_timeout_secs,
         "namespace_grace_secs" = args.namespace_grace_secs,
         "pin_lease_bytes" = args.pin_lease_bytes,
+        "eviction_policy" = format!("{:?}", args.eviction_policy),
         "spill_watermark_percent" = args.spill_watermark_percent,
         "prefetch_cooldown_ms" = args.prefetch_cooldown_ms,
         "prefetch_max_chunks" = args.prefetch_max_chunks,
@@ -1248,6 +1256,7 @@ fn run_service(args: Args) -> io::Result<()> {
         budget: capacity_bytes,
         rswap_attach: args.rswap_attach,
         pin_lease_bytes: args.pin_lease_bytes,
+        eviction_policy: args.eviction_policy,
         spill: cgroup_reclaim_path()
             .filter(|_| args.spill_watermark_percent > 0 && args.spill_watermark_percent < 100)
             .map(|path| (path, args.spill_watermark_percent)),

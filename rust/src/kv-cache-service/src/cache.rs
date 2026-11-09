@@ -19,6 +19,14 @@ use crate::protocol::{MAX_KEYS, store_reply_fits};
 /// Absent slot, at either end of the LRU order. Chunk ids stay below it.
 const NO_SLOT: u32 = u32::MAX;
 
+/// Whether the service replaces committed keys or leaves page reclaim to Linux.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum EvictionPolicy {
+    #[default]
+    Lru,
+    None,
+}
+
 /// One chunk slot. `prev`/`next` thread the LRU order, which holds every slot a
 /// key is indexed by, most recently used first; `readers` holds interned request
 /// ids so a lease costs no allocation per hit.
@@ -115,6 +123,7 @@ pub struct Cache {
     /// Most recently used slot, and the eviction end of the same order.
     lru_head: u32,
     lru_tail: u32,
+    eviction_policy: EvictionPolicy,
     leases: LeaseIndex,
     owners: OwnerIndex,
     counters: Counters,
@@ -383,6 +392,7 @@ impl Cache {
             budget,
             pin_budget,
             prefetch,
+            EvictionPolicy::Lru,
             None,
         )
     }
@@ -395,6 +405,7 @@ impl Cache {
         budget: usize,
         pin_budget: usize,
         prefetch: PrefetchLimits,
+        eviction_policy: EvictionPolicy,
         factory: Option<&dyn HashFactory>,
     ) -> io::Result<Self> {
         let size = namespace_bytes(worker_bytes, world_size, num_chunks)?;
@@ -457,6 +468,7 @@ impl Cache {
             free: (0..num_chunks as u32).rev().collect(),
             lru_head: NO_SLOT,
             lru_tail: NO_SLOT,
+            eviction_policy,
             leases: LeaseIndex::default(),
             owners: OwnerIndex::default(),
             counters: Counters::default(),
@@ -544,6 +556,9 @@ impl Cache {
     /// Walks the eviction order from the tail and takes committed rows nobody
     /// holds, so the spill costs exactly the chunks the cache would evict next.
     pub fn spill_candidates(&self, max: usize) -> Vec<usize> {
+        if self.eviction_policy == EvictionPolicy::None {
+            return Vec::new();
+        }
         let mut slots = Vec::with_capacity(max);
         let mut cursor = self.lru_tail;
         while cursor != NO_SLOT && slots.len() < max {
@@ -1173,6 +1188,9 @@ impl Cache {
 
     /// Moves a slot to the head of the LRU order.
     fn promote(&mut self, slot: u32) {
+        if self.eviction_policy == EvictionPolicy::None {
+            return;
+        }
         if self.lru_head != slot {
             self.unlink(slot);
             self.push_front(slot);
@@ -1180,6 +1198,9 @@ impl Cache {
     }
 
     fn push_front(&mut self, slot: u32) {
+        if self.eviction_policy == EvictionPolicy::None {
+            return;
+        }
         let head = self.lru_head;
         self.slots[slot as usize].prev = NO_SLOT;
         self.slots[slot as usize].next = head;
@@ -1192,6 +1213,9 @@ impl Cache {
     }
 
     fn unlink(&mut self, slot: u32) {
+        if self.eviction_policy == EvictionPolicy::None {
+            return;
+        }
         let (prev, next) = (
             self.slots[slot as usize].prev,
             self.slots[slot as usize].next,
@@ -1387,6 +1411,9 @@ impl Cache {
     /// past those only as far as it must, and returns `None` when the cache
     /// cannot make room.
     fn eviction_victims(&self, needed: usize, incoming: &HashSet<&str>) -> Option<Vec<u32>> {
+        if self.eviction_policy == EvictionPolicy::None {
+            return (needed == 0).then(Vec::new);
+        }
         let mut victims = Vec::with_capacity(needed);
         let mut slot = self.lru_tail;
         while victims.len() < needed && slot != NO_SLOT {
@@ -1439,7 +1466,11 @@ impl Cache {
         }
         assert_eq!(
             listed,
-            self.index.len(),
+            if self.eviction_policy == EvictionPolicy::Lru {
+                self.index.len()
+            } else {
+                0
+            },
             "an indexed slot is missing from the LRU order"
         );
     }
@@ -1740,6 +1771,7 @@ mod tests {
             2 * 1024 * 1024,
             pin_budget,
             PrefetchLimits::default(),
+            EvictionPolicy::Lru,
             Some(&factory as &dyn HashFactory),
         )
         .unwrap();
@@ -1760,10 +1792,49 @@ mod tests {
             2 * 1024 * 1024,
             0,
             PrefetchLimits::default(),
+            EvictionPolicy::Lru,
             Some(&factory as &dyn HashFactory),
         )
         .unwrap();
         (cache, ops)
+    }
+
+    #[test]
+    fn no_eviction_skips_lru_and_reuses_only_released_slots() {
+        let mut cache = Cache::with_hashes(
+            1,
+            64,
+            1,
+            2,
+            2 * 1024 * 1024,
+            0,
+            PrefetchLimits::default(),
+            EvictionPolicy::None,
+            None,
+        )
+        .unwrap();
+        readable(&mut cache, "aa");
+        assert_eq!(cache.lookup("aa", "reader"), Status::Hit);
+        cache.load(&keys(&["aa"]), "reader").unwrap();
+        cache.touch(&keys(&["aa"]));
+        cache.release_request("reader");
+        assert!(cache.spill_candidates(2).is_empty());
+        assert_eq!(cache.lru_head, NO_SLOT);
+        assert_eq!(cache.lru_tail, NO_SLOT);
+        cache.assert_slot_accounting();
+
+        cache.store(&keys(&["bb"]), "writer").unwrap();
+        assert!(matches!(
+            cache.store(&keys(&["cc"]), "writer"),
+            Err(StoreRejection::Full)
+        ));
+        cache.commit(&keys(&["bb"]), "writer", false).unwrap();
+        let (_, _, evicted) = cache.store(&keys(&["cc"]), "writer").unwrap();
+        assert!(evicted.is_empty());
+        assert_eq!(cache.lookup("aa", "reader"), Status::Hit);
+        cache.assert_slot_accounting();
+        cache.reset(true).unwrap();
+        cache.assert_slot_accounting();
     }
 
     fn recorded(ops: &Arc<Mutex<Vec<Op>>>) -> Vec<Op> {
