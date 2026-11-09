@@ -58,8 +58,8 @@ fn fill_row(cache: &Cache, slot: usize) {
 impl Fixture {
     fn new(n: usize) -> Fixture {
         let keys: Vec<String> = (0..n).map(|index| hex_key('a', index)).collect();
-        let mut cache =
-            Cache::new(1, WORKER_BYTES, 1, n, n * WORKER_BYTES).expect("fixture geometry is valid");
+        let mut cache = Cache::new(1, WORKER_BYTES, 1, n, n * WORKER_BYTES, 0)
+            .expect("fixture geometry is valid");
         let mut slots = Vec::with_capacity(n);
         for batch in keys.chunks(FIXTURE_BATCH) {
             let (_, reserved, _) =

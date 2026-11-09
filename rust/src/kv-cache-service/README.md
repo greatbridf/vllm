@@ -66,6 +66,10 @@ copy. The two behaviours are pinned by `test_service_rswap_offload.py`
 (`test_locked_region_is_not_reclaimable`, `test_released_pinning_skips_host_registration`,
 and a store/swap-out/load round trip through a mock engine).
 
+The service locks the same way for its own leases when `--pin-lease-bytes` is
+set, so a deployment that wants kernel-managed offload keeps that flag at its
+default `0`: a row locked by a lease is not reclaimable either.
+
 ## Deployment
 
 Run the service under a supervisor. A `systemd` unit:
@@ -176,6 +180,12 @@ A size that does not fit shows up in one of three ways:
   `store` answer `{"ok": true, "full": true}` and the engine keeps those chunks
   in GPU memory only.
 
+`--pin-lease-bytes` is sized by the working set, not by the cache. A locked row
+cannot be reclaimed, so a `memory.max` close to the cache size pushes the pressure
+onto the other memory charged to the same cgroup and can OOM the writer instead.
+Size the flag to roughly the bytes the engines keep leased at once, and leave
+`memory.max` headroom above the cache size for the rest of the process.
+
 ## Protocol
 
 Every message is one frame: a 4-byte big-endian length and that many bytes of
@@ -260,7 +270,9 @@ attach, so the service has to be the caller; a worker's mapping cannot do it.
 kernel it reports success while nothing is reclaimed (`/proc/swaps` `xswap<N>`
 `Used` stays 0) and no digest program run is recorded, whereas an anonymous
 mapping of the same size writes every page out. So the response `pages` is what
-was advised, not what reached the backend.
+was advised, not what reached the backend. A row a lease holds locked under
+`--pin-lease-bytes` is excluded from reclaim the same way, so `MADV_PAGEOUT`
+answers `EINVAL` for it: spill only the chunks no request leases.
 
 Cgroup v2 reclaim is the trigger that works: charge the KV pages to a cgroup of
 its own and write `memory.reclaim`. At the DeepSeek-V4.1-Flash geometry
@@ -295,7 +307,7 @@ A `stats` reply, one counter set per namespace, plus the sessions using it and
 whether its owner left it adoptable:
 
 ```json
-{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "resident": 0, "remote": 0, "free_chunks": 2, "requests": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}, "sessions": 2, "detached": false}
+{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "resident": 0, "remote": 0, "free_chunks": 2, "requests": 0, "pinned_slots": 0, "pinned_bytes": 0, "pin_skipped": 0, "pin_failures": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}, "sessions": 2, "detached": false}
 ```
 
 An `info` reply, which an operator or a probe can read before any engine opened a
@@ -331,6 +343,24 @@ yet is what would stop a later allocation from replacing it with a chunk that ca
 The check is one `mincore(2)` over the chunk's row, so `pending` covers both
 "reserved and not published" and "published but not resident".
 
+A hit also stays readable. The residency check answers for the moment it runs, so
+`--pin-lease-bytes` has the service `mlock(2)` the row of a fresh hit before that
+hit is reported, which makes the kernel keep it: a `HIT` is then readable from
+DRAM until the last request leasing it releases, whatever the cgroup's
+`memory.max` does in between. `load` locks the rows it names again, which costs
+nothing for a row already locked. Locking a row is one `mlock(2)` over its pages
+(4096 of them for a 16 MiB DeepSeek row), so an opting-in deployment pays that
+once per chunk it starts reading and the budget is what bounds it. A lock ends
+with the last reader's `release` or `release_request`, with a forced `reset`, and
+with the slot's teardown, so no lock outlives the chunk it belongs to.
+
+The flag is a ceiling and never an eviction policy: a pin that would pass it is
+skipped, the hit stands without the guarantee, and no other request's lease is
+ever dropped to make room. `0`, the default, pins nothing and leaves a `pending`
+answer as the only protection. A lock or unlock the kernel refuses (no
+`CAP_IPC_LOCK`, a `RLIMIT_MEMLOCK` below one row) is logged once as `pin_failed`
+and counted, never fatal.
+
 `lookup` reports the status of one key. `lookup_many` reports the same for a
 batch of up to 4096 keys, as `{"ok": true, "statuses": [...]}` with one status
 per key in the order they were sent, and takes the same lease and LRU promotion
@@ -364,10 +394,12 @@ eviction order until the engine stops.
 
 `stats` reports the namespace state (`entries`, `pending`, `leased`,
 `free_chunks`, `bytes`, `num_chunks`, `requests` for requests currently holding
-a lease) plus counters that are monotonic since the namespace opened and survive
-`reset`: `hits`, `misses`, `pending_hits`, `evictions`, `stores`, `commits`,
-`aborted`, `reclaimed` in keys, and the rejected or failed `commit` calls in
-`failed_commits`. Where the kernel holds the entries is reported beside them:
+a lease, and the `pinned_slots` and `pinned_bytes` a lock holds) plus counters
+that are monotonic since the namespace opened and survive `reset`: `hits`,
+`misses`, `pending_hits`, `evictions`, `stores`, `commits`, `aborted`, `reclaimed`
+in keys, the rejected or failed `commit` calls in `failed_commits`, and the pins
+the budget skipped or the kernel refused in `pin_skipped` and `pin_failures`.
+Where the kernel holds the entries is reported beside them:
 `resident` counts the chunks whose whole row is in DRAM and `remote` the rest
 (`entries - resident`), so an operator can see how much of the cache a memory
 limit has moved out. Beside that object it reports the `sessions` using the
@@ -493,11 +525,13 @@ service. `--pending-timeout-secs` (default 60; 0 disables) bounds how long a
 reservation may stay pending; see Ownership. `--namespace-grace-secs` (default
 300; 0 disables) bounds how long a namespace whose owner left stays adoptable;
 the accept loop's own poll sweeps it, so no thread or timer exists for that.
+`--pin-lease-bytes` (default 0; 0 disables pinning) bounds the bytes of leased
+rows the service may lock, per namespace; see Ownership and Sizing.
 Every event writes one line to stderr, starting with `kv-cache-service: start`
 (socket, capacity, pid, and every limit) and ending with `shutdown`: namespace
 open, attach, detach, adoption, retirement, and reclaim, the reclaimed socket,
-and rejected or failed requests with the operation name. Per-lookup paths log
-nothing.
+the first refused `mlock` or `munlock` as `pin_failed`, and rejected or failed
+requests with the operation name. Per-lookup paths log nothing.
 
 A request loop runs under `catch_unwind`, so a build with unwinding answers
 `{"ok": false, "error": "internal error"}` and closes only that connection, and
@@ -543,6 +577,8 @@ stalls:
 | `hits`, `misses`, `pending_hits` | Lookup outcomes since `open`, unchanged across `reset`. `pending_hits` counts the answers that were `pending`, both from a reservation and from a row that was not resident. |
 | `evictions`, `stores`, `commits`, `aborted` | Chunks evicted, reserved, published, and released without publishing. |
 | `failed_commits`, `reclaimed` | Commits rejected (ownership, missing reservation, failed publish) and keys reclaimed by the pending timeout. |
+| `pinned_slots`, `pinned_bytes` | Rows a lease holds locked under `--pin-lease-bytes`, and the bytes they charge. They cannot be reclaimed, so a value that does not fall to 0 once the engine is idle is a lock its leases kept; see Sizing before raising the flag. |
+| `pin_skipped`, `pin_failures` | Pins the budget refused, and locks or unlocks the kernel refused. A `pin_skipped` that climbs means the flag is below the working set and later hits go without the guarantee; a `pin_failures` that climbs means the host cannot lock memory at all, which `pin_failed` logged once. |
 | `sessions`, `detached` | Sessions using the namespace, and whether an owner left it adoptable. `detached` with `sessions` above 0 is a scheduler that is gone while its workers still hold the mapping; `--namespace-grace-secs` is what frees it. |
 
 Engine side, the connector samples one `stats` RPC per collection and reports
@@ -669,7 +705,8 @@ Numbers the service enforces:
 - One namespace per session, because a session `open`s or `attach`es once, and
   one in-flight request per client: the connector never pipelines.
 - `--max-connections` 128, `--idle-timeout-secs` 900,
-  `--pending-timeout-secs` 60, and `--namespace-grace-secs` 300 by default.
+  `--pending-timeout-secs` 60, `--namespace-grace-secs` 300, and
+  `--pin-lease-bytes` 0 by default.
 
 ## Performance
 

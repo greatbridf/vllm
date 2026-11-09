@@ -624,6 +624,50 @@ fn prefetch_asks_for_a_whole_row_before_the_load_that_reads_it() {
 }
 
 #[test]
+fn a_leased_chunk_is_pinned_until_its_request_releases_it() {
+    // The namespace reserves two rows, which this budget covers, so a `hit` that
+    // pinned nothing here was refused by the kernel rather than by the budget.
+    let budget = (64 * 1024).to_string();
+    let service = Service::start_with(&["--pin-lease-bytes", budget.as_str()]);
+    let mut client = service.connect();
+    let opened = open(&mut client, "engine-pin");
+    assert_eq!(opened["ok"], true);
+    let row_bytes = opened["row_bytes"].as_u64().expect("geometry reports row_bytes");
+
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": ["aa"], "request": "a"}))["ok"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
+        true
+    );
+    // A hit means readable now, so a worker writes the row before the lookup.
+    let _mapping = WorkerMapping::faulted(&service, "engine-pin", 0);
+    assert_eq!(
+        client.call(json!({"op": "lookup", "key": "aa", "request": "a"}))["status"],
+        "hit"
+    );
+
+    // A host that cannot `mlock` (no `CAP_IPC_LOCK`, or a `RLIMIT_MEMLOCK` below
+    // one row) counts the refusal instead of offering the guarantee.
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    let refused = stats["pin_failures"].as_u64().expect("stats reports pin_failures");
+    if refused == 0 {
+        assert_eq!(stats["pinned_slots"], 1);
+        assert!(stats["pinned_bytes"].as_u64().unwrap() >= row_bytes);
+    }
+
+    let released = client.call(json!({"op": "release_request", "request": "a"}));
+    assert_eq!(released["released"], 1);
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    if refused == 0 {
+        assert_eq!(stats["pinned_slots"], 0);
+        assert_eq!(stats["pinned_bytes"], 0);
+    }
+}
+
+#[test]
 fn store_from_one_request_cannot_be_published_by_another() {
     let service = Service::start();
     let mut client = service.connect();

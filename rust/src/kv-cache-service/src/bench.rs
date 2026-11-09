@@ -316,6 +316,7 @@ impl Service {
             retired: Vec::new(),
             budget,
             rswap_attach: None,
+            pin_lease_bytes: 0,
             pending_timeout: None,
             started: Instant::now(),
         }));

@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use memmap2::{MmapMut, MmapOptions};
@@ -26,6 +27,8 @@ struct Slot {
     next: u32,
     readers: Vec<u32>,
     ready: bool,
+    /// Whether the slot's row is locked against reclaim for its readers.
+    pinned: bool,
     reservation: Option<Reservation>,
 }
 
@@ -37,6 +40,7 @@ impl Slot {
             next: NO_SLOT,
             readers: Vec::new(),
             ready: false,
+            pinned: false,
             reservation: None,
         }
     }
@@ -89,6 +93,11 @@ pub struct Cache {
     leases: LeaseIndex,
     owners: OwnerIndex,
     counters: Counters,
+    /// Bytes of leased rows the service may lock, a ceiling that a pin it cannot
+    /// fit is skipped against; 0 leaves every lease unpinned.
+    pin_budget: usize,
+    /// Bytes the service currently holds locked.
+    pinned_bytes: usize,
     hashes: Option<Box<dyn PageHashes>>,
 }
 
@@ -105,6 +114,8 @@ struct Counters {
     aborted: usize,
     failed_commits: usize,
     reclaimed: usize,
+    pin_skipped: usize,
+    pin_failures: usize,
 }
 
 /// Leases ended by `release` or `release_request`, and the keys or request id
@@ -316,8 +327,17 @@ impl Cache {
         world_size: usize,
         num_chunks: usize,
         budget: usize,
+        pin_budget: usize,
     ) -> io::Result<Self> {
-        Self::with_hashes(owner, worker_bytes, world_size, num_chunks, budget, None)
+        Self::with_hashes(
+            owner,
+            worker_bytes,
+            world_size,
+            num_chunks,
+            budget,
+            pin_budget,
+            None,
+        )
     }
 
     pub fn with_hashes(
@@ -326,6 +346,7 @@ impl Cache {
         world_size: usize,
         num_chunks: usize,
         budget: usize,
+        pin_budget: usize,
         factory: Option<&dyn HashFactory>,
     ) -> io::Result<Self> {
         let size = namespace_bytes(worker_bytes, world_size, num_chunks)?;
@@ -391,6 +412,8 @@ impl Cache {
             leases: LeaseIndex::default(),
             owners: OwnerIndex::default(),
             counters: Counters::default(),
+            pin_budget,
+            pinned_bytes: 0,
             hashes,
         })
     }
@@ -424,6 +447,9 @@ impl Cache {
             self.slots[slot as usize].readers.push(request);
             self.leases.lease(request, slot);
         }
+        // The row was just found resident, so locking it faults nothing back in
+        // and keeps a later reclaim from taking it away from this lease.
+        self.pin_slot(slot as usize);
         self.promote(slot);
         Status::Hit
     }
@@ -525,7 +551,7 @@ impl Cache {
     pub fn resident_pages(&self, slot: usize) -> io::Result<usize> {
         let pages = self.row_bytes / self.page_size;
         let mut residency = vec![0u8; pages];
-        let base = self.mapping.as_ptr() as usize + slot * self.row_bytes;
+        let base = self.row_base(slot);
         // SAFETY: the row lies inside the sealed mapping and is page-aligned, and
         // `residency` holds the one byte per page that mincore(2) writes.
         let queried = unsafe {
@@ -597,22 +623,30 @@ impl Cache {
             .collect()
     }
 
-    pub fn load(&self, keys: &[String], request: &str) -> io::Result<Vec<usize>> {
+    /// Slots of the chunks `request` leases, and the row of each is locked for
+    /// the copy that reads it. Pinning again is free, so a repeated load of the
+    /// same chunk neither counts nor locks twice.
+    pub fn load(&mut self, keys: &[String], request: &str) -> io::Result<Vec<usize>> {
         let request = self.leases.get(request);
-        keys.iter()
-            .map(|key| {
-                let slot = *self
-                    .index
-                    .get(key.as_str())
-                    .ok_or_else(|| invalid("load requires a ready leased entry"))?;
-                let entry = &self.slots[slot as usize];
-                let leased = request.is_some_and(|request| entry.readers.contains(&request));
-                if !entry.ready || !leased {
-                    return Err(invalid("load requires a ready leased entry"));
-                }
-                Ok(slot as usize)
-            })
-            .collect()
+        let mut slots = Vec::with_capacity(keys.len());
+        for key in keys {
+            let slot = *self
+                .index
+                .get(key.as_str())
+                .ok_or_else(|| invalid("load requires a ready leased entry"))?;
+            let entry = &self.slots[slot as usize];
+            let leased = request.is_some_and(|request| entry.readers.contains(&request));
+            if !entry.ready || !leased {
+                return Err(invalid("load requires a ready leased entry"));
+            }
+            slots.push(slot as usize);
+        }
+        // Every key is checked before any row is locked, so a rejected batch
+        // leaves the locks where they were.
+        for &slot in &slots {
+            self.pin_slot(slot);
+        }
+        Ok(slots)
     }
 
     pub fn release(&mut self, keys: &[String], request: &str) -> Released {
@@ -626,11 +660,15 @@ impl Cache {
                 released.unknown += 1;
                 continue;
             };
-            let readers = &mut self.slots[slot as usize].readers;
-            match readers.iter().position(|reader| *reader == request) {
+            let entry = &mut self.slots[slot as usize];
+            match entry.readers.iter().position(|reader| *reader == request) {
                 Some(position) => {
-                    readers.swap_remove(position);
+                    entry.readers.swap_remove(position);
+                    let unleased = entry.readers.is_empty();
                     self.leases.unlease(request, slot);
+                    if unleased {
+                        self.unpin_slot(slot as usize);
+                    }
                     released.leases += 1;
                 }
                 None => released.unknown += 1,
@@ -647,7 +685,11 @@ impl Cache {
             };
         };
         for slot in &slots {
-            self.slots[*slot as usize].readers.retain(|reader| *reader != request);
+            let entry = &mut self.slots[*slot as usize];
+            entry.readers.retain(|reader| *reader != request);
+            if entry.readers.is_empty() {
+                self.unpin_slot(*slot as usize);
+            }
         }
         Released {
             leases: slots.len(),
@@ -834,6 +876,11 @@ impl Cache {
         if let Some(hashes) = &mut self.hashes {
             hashes.reset();
         }
+        // Every reader is gone, so no row may stay locked. A slot keeps its lock
+        // only if the kernel refused the unlock, and the retry here is free.
+        for slot in 0..self.num_chunks {
+            self.unpin_slot(slot);
+        }
         self.index.clear();
         self.leases = LeaseIndex::default();
         self.owners = OwnerIndex::default();
@@ -875,6 +922,10 @@ impl Cache {
             ("failed_commits", self.counters.failed_commits),
             ("reclaimed", self.counters.reclaimed),
             ("requests", self.leases.lease_holders()),
+            ("pinned_slots", self.pinned_slots()),
+            ("pinned_bytes", self.pinned_bytes),
+            ("pin_skipped", self.counters.pin_skipped),
+            ("pin_failures", self.counters.pin_failures),
             ("bytes", self.mapping.len()),
             ("num_chunks", self.num_chunks),
         ])
@@ -922,6 +973,9 @@ impl Cache {
     /// Drops a slot's key and returns it to the free list. Only a slot without
     /// leases is released, so no request's lease index needs rewriting.
     fn release_slot(&mut self, slot: u32) {
+        // Eviction never picks a leased slot, but a lock must not outlive the
+        // slot it is charged to, so the unlock is unconditional.
+        self.unpin_slot(slot as usize);
         self.unlink(slot);
         let key = std::mem::take(&mut self.slots[slot as usize].key);
         self.slots[slot as usize].ready = false;
@@ -943,6 +997,64 @@ impl Cache {
         if let Some(reservation) = self.slots[slot as usize].reservation.take() {
             self.owners.release(reservation.owner);
         }
+    }
+
+    /// Address of the slot's row in the mapping, which is the range residency and
+    /// locking cover.
+    fn row_base(&self, slot: usize) -> usize {
+        self.mapping.as_ptr() as usize + slot * self.row_bytes
+    }
+
+    /// Rows currently locked against reclaim.
+    fn pinned_slots(&self) -> usize {
+        self.slots.iter().filter(|entry| entry.pinned).count()
+    }
+
+    /// Locks the slot's row in DRAM, so the lease that reports it readable keeps
+    /// it that way: the kernel excludes a locked range from reclaim.
+    ///
+    /// The budget is a ceiling, never an eviction policy: a pin that does not fit
+    /// it is skipped and the caller keeps its hit without the guarantee, because
+    /// unlocking a row another request still reads to make room would break that
+    /// request instead. A refused `mlock` is counted and logged once, never fatal.
+    fn pin_slot(&mut self, slot: usize) {
+        if self.slots[slot].pinned || self.pin_budget == 0 {
+            return;
+        }
+        if self.pinned_bytes.saturating_add(self.row_bytes) > self.pin_budget {
+            self.counters.pin_skipped += 1;
+            return;
+        }
+        // SAFETY: the row lies inside the sealed mapping, so the range is mapped
+        // and page-aligned.
+        let row = self.row_base(slot) as *const libc::c_void;
+        let locked = unsafe { libc::mlock(row, self.row_bytes) };
+        if locked != 0 {
+            self.counters.pin_failures += 1;
+            log_pin_failure(io::Error::last_os_error());
+            return;
+        }
+        self.slots[slot].pinned = true;
+        self.pinned_bytes += self.row_bytes;
+    }
+
+    /// Unlocks a row no request leases any more. A refused `munlock` keeps the
+    /// flag and the bytes charged, because the range stays locked; a slot reused
+    /// with that flag is already locked and is not charged twice.
+    fn unpin_slot(&mut self, slot: usize) {
+        if !self.slots[slot].pinned {
+            return;
+        }
+        // SAFETY: the row is the range `pin_slot` locked inside the mapping.
+        let row = self.row_base(slot) as *const libc::c_void;
+        let unlocked = unsafe { libc::munlock(row, self.row_bytes) };
+        if unlocked != 0 {
+            self.counters.pin_failures += 1;
+            log_pin_failure(io::Error::last_os_error());
+            return;
+        }
+        self.slots[slot].pinned = false;
+        self.pinned_bytes -= self.row_bytes;
     }
 
     /// Collects `needed` eviction victims from the least recently used end,
@@ -1005,6 +1117,16 @@ impl Cache {
             self.index.len(),
             "an indexed slot is missing from the LRU order"
         );
+    }
+}
+
+/// Reports a refused `mlock` or `munlock` once per process: a host without the
+/// privilege to lock memory refuses every row, and one line names the cause while
+/// `stats` counts the rest.
+fn log_pin_failure(error: io::Error) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        log_event!("pin_failed", "error" = error);
     }
 }
 
@@ -1102,7 +1224,11 @@ mod tests {
     }
 
     fn cache_with(num_chunks: usize) -> Cache {
-        Cache::new(1, 64, 1, num_chunks, 16 * 1024 * 1024).unwrap()
+        cache_with_pins(num_chunks, 0)
+    }
+
+    fn cache_with_pins(num_chunks: usize, pin_budget: usize) -> Cache {
+        Cache::new(1, 64, 1, num_chunks, 16 * 1024 * 1024, pin_budget).unwrap()
     }
 
     fn keys(values: &[&str]) -> Vec<String> {
@@ -1129,6 +1255,7 @@ mod tests {
             1,
             2,
             2 * 1024 * 1024,
+            0,
             Some(&factory as &dyn HashFactory),
         )
         .unwrap();
@@ -1227,6 +1354,96 @@ mod tests {
         assert_eq!(cache.stats()["remote"], 0);
     }
 
+    /// Stores, publishes and faults in one key, so a lookup of it is a hit.
+    fn readable(cache: &mut Cache, key: &str) {
+        let batch = keys(&[key]);
+        cache.store(&batch, "writer").unwrap();
+        cache.commit(&batch, "writer", true).unwrap();
+        touch(cache, key);
+    }
+
+    #[test]
+    fn a_hit_pins_its_row_until_the_lease_ends() {
+        let mut cache = cache_with_pins(2, 8 * page_size().unwrap());
+        readable(&mut cache, "aa");
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
+        // A host that refuses `mlock` (no `CAP_IPC_LOCK`, or a `RLIMIT_MEMLOCK`
+        // smaller than one row) pins nothing and counts the refusal, so the two
+        // account for the one pin the hit asked for either way.
+        let stats = cache.stats();
+        assert_eq!(stats["pinned_slots"] + stats["pin_failures"], 1);
+        assert_eq!(
+            stats["pinned_bytes"],
+            stats["pinned_slots"] * cache.row_bytes
+        );
+        // A second load of the same chunk is not a second lock.
+        assert_eq!(cache.load(&keys(&["aa"]), "r").unwrap().len(), 1);
+        assert_eq!(cache.stats()["pinned_bytes"], stats["pinned_bytes"]);
+
+        cache.release_request("r");
+        assert_eq!(cache.stats()["pinned_slots"], 0);
+        assert_eq!(cache.stats()["pinned_bytes"], 0);
+    }
+
+    #[test]
+    fn a_pin_budget_of_one_row_leaves_the_second_lease_unpinned() {
+        let mut cache = cache_with_pins(2, page_size().unwrap());
+        let both = keys(&["aa", "bb"]);
+        cache.store(&both, "writer").unwrap();
+        cache.commit(&both, "writer", true).unwrap();
+        touch_all(&cache, &both);
+
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
+        let pinned_one = cache.stats()["pinned_slots"] == 1;
+        assert_eq!(cache.lookup("bb", "r"), Status::Hit);
+        let stats = cache.stats();
+        // The budget changes the guarantee, not the answer: both keys are hits
+        // and both keep their lease without the second row being unlocked.
+        assert_eq!(stats["hits"], 2);
+        assert_eq!(stats["leased"], 2);
+        if pinned_one {
+            assert_eq!(stats["pinned_slots"], 1);
+            assert_eq!(stats["pinned_bytes"], cache.row_bytes);
+            assert_eq!(stats["pin_skipped"], 1);
+        } else {
+            // `mlock` refused on this host, so both pins failed instead.
+            assert_eq!(stats["pin_failures"], 2);
+            assert_eq!(stats["pin_skipped"], 0);
+            assert_eq!(stats["pinned_bytes"], 0);
+        }
+    }
+
+    #[test]
+    fn a_row_stays_pinned_while_another_request_leases_it() {
+        let mut cache = cache_with_pins(2, 8 * page_size().unwrap());
+        readable(&mut cache, "aa");
+        assert_eq!(cache.lookup("aa", "a"), Status::Hit);
+        assert_eq!(cache.lookup("aa", "b"), Status::Hit);
+        let pinned = cache.stats()["pinned_bytes"];
+        // The first release ends one lease, not the lock the other still reads.
+        assert_eq!(cache.release(&keys(&["aa"]), "a").leases, 1);
+        assert_eq!(cache.stats()["pinned_bytes"], pinned);
+        assert_eq!(cache.release(&keys(&["aa"]), "b").leases, 1);
+        assert_eq!(cache.stats()["pinned_bytes"], 0);
+    }
+
+    #[test]
+    fn forced_reset_unpins_every_row() {
+        let mut cache = cache_with_pins(2, 8 * page_size().unwrap());
+        let both = keys(&["aa", "bb"]);
+        cache.store(&both, "writer").unwrap();
+        cache.commit(&both, "writer", true).unwrap();
+        touch_all(&cache, &both);
+        assert_eq!(cache.lookup("aa", "a"), Status::Hit);
+        assert_eq!(cache.lookup("bb", "a"), Status::Hit);
+        assert!(cache.reset(false).is_err());
+
+        cache.reset(true).unwrap();
+        assert_eq!(cache.stats()["entries"], 0);
+        assert_eq!(cache.stats()["pinned_slots"], 0);
+        assert_eq!(cache.stats()["pinned_bytes"], 0);
+    }
+
     #[test]
     fn lookup_lease_prevents_eviction_before_load() {
         let mut cache = cache();
@@ -1271,7 +1488,7 @@ mod tests {
 
     #[test]
     fn geometry_and_keys_are_bounded() {
-        assert!(Cache::new(1, usize::MAX, 2, 1, 8192).is_err());
+        assert!(Cache::new(1, usize::MAX, 2, 1, 8192, 0).is_err());
         assert!(check_keys(&keys(&["aa", "aa"])).is_err());
         assert!(check_keys(&keys(&["not-hex"])).is_err());
     }
@@ -1577,7 +1794,7 @@ mod tests {
     fn store_that_cannot_echo_its_evictions_reserves_nothing() {
         // Long stored keys and short incoming ones: only the evicted keys make
         // the reply exceed one frame, which the incoming batch alone cannot show.
-        let mut cache = Cache::new(1, 64, 1, 2048, 64 * 1024 * 1024).unwrap();
+        let mut cache = Cache::new(1, 64, 1, 2048, 64 * 1024 * 1024, 0).unwrap();
         let long: Vec<String> = (0..2048).map(|index| format!("{index:0510x}")).collect();
         for batch in long.chunks(512) {
             cache.store(batch, "r").unwrap();

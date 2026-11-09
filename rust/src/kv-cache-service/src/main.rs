@@ -64,6 +64,10 @@ struct Args {
     /// sessions left.
     #[arg(long, default_value_t = 300)]
     namespace_grace_secs: u64,
+    /// Lock the rows of leased chunks with `mlock(2)` so a `hit` stays readable,
+    /// up to this many bytes across the namespace; 0 leaves leases unpinned.
+    #[arg(long, default_value_t = 0)]
+    pin_lease_bytes: usize,
     /// Attach the rswap digest BPF program through sysfs; disabled by default.
     /// Defaults to /sys/kernel/mm/xswap/rswap_attach when no path is given.
     #[arg(
@@ -133,6 +137,7 @@ struct Registry {
     retired: Vec<Namespace>,
     budget: usize,
     rswap_attach: Option<PathBuf>,
+    pin_lease_bytes: usize,
     pending_timeout: Option<Duration>,
     started: Instant,
 }
@@ -672,6 +677,7 @@ impl Registry {
             geometry.world_size,
             geometry.num_chunks,
             remaining,
+            self.pin_lease_bytes,
             factory.as_ref().map(|factory| factory as &dyn HashFactory),
         )?;
         let frame = protocol::encode_response(&geometry_reply(&cache))?;
@@ -1069,12 +1075,14 @@ fn run_service(args: Args) -> io::Result<()> {
         "idle_timeout_secs" = args.idle_timeout_secs,
         "pending_timeout_secs" = args.pending_timeout_secs,
         "namespace_grace_secs" = args.namespace_grace_secs,
+        "pin_lease_bytes" = args.pin_lease_bytes,
     );
     let registry = Arc::new(Mutex::new(Registry {
         namespaces: HashMap::new(),
         retired: Vec::new(),
         budget: capacity_bytes,
         rswap_attach: args.rswap_attach,
+        pin_lease_bytes: args.pin_lease_bytes,
         pending_timeout: (args.pending_timeout_secs > 0)
             .then(|| Duration::from_secs(args.pending_timeout_secs)),
         started: Instant::now(),
@@ -1130,5 +1138,6 @@ mod tests {
         assert_eq!(args.idle_timeout_secs, 900);
         assert_eq!(args.pending_timeout_secs, 60);
         assert_eq!(args.namespace_grace_secs, 300);
+        assert_eq!(args.pin_lease_bytes, 0);
     }
 }

@@ -13,6 +13,10 @@ The operator-facing side of this backend, including its
   loads; publish stores only after every participating worker reports completion.
   A batched lookup is one frame of per-key lookups, so it takes the same lease
   and may name keys past the miss that ends the scan.
+- A lease must keep its chunk readable, not only unevictable: a hit locks its row
+  so the kernel cannot reclaim it before the copy reads it, the last reader
+  unlocks it, and a pin the budget or the kernel refuses leaves the hit in place
+  without the guarantee. Never drop another request's lease to make room.
 - A reservation belongs to the request that made it: reject a `commit` from any
   other request and keep the reservation pending. Bound how long a reservation may
   stay pending, because the connector reports a pending key as a hit that is not
@@ -92,6 +96,17 @@ that pins it:
   ends the scan, so a `pending` reservation it walks past is still reported, and
   it takes no lease of its own
   (`an_until_miss_scan_reports_the_pending_status_it_walks_past`).
+- **A hit stays readable.** A hit locks its row (`cache.rs::pin_slot`) before the
+  reply leaves, so the kernel cannot reclaim the chunk between the lookup and the
+  copy, and the row stays locked while any request leases it and no longer
+  (`a_hit_pins_its_row_until_the_lease_ends`,
+  `a_row_stays_pinned_while_another_request_leases_it`,
+  `a_leased_chunk_is_pinned_until_its_request_releases_it`). The budget is a
+  ceiling: a pin it refuses is counted in `pin_skipped` and the hit stands, and a
+  lock the host refuses is counted in `pin_failures` instead of failing the
+  request (`a_pin_budget_of_one_row_leaves_the_second_lease_unpinned`). A forced
+  reset and a slot teardown unlock, so no lock outlives its slot
+  (`forced_reset_unpins_every_row`).
 - **Namespace retirement.** A disconnected worker never hands its mapping to a
   new namespace: the namespace is retired and stays charged to capacity until its
   last session leaves (`main.rs::Registry::retire`,
@@ -159,7 +174,9 @@ that pins it:
   kernel-managed offload sets it to `false` and accepts pageable copies
   (`test_service_rswap_offload.py::test_locked_region_is_not_reclaimable`,
   `::test_released_pinning_skips_host_registration`,
-  `::test_mock_engine_store_load_round_trip`).
+  `::test_mock_engine_store_load_round_trip`). The service's own locks are the
+  same contract: `--pin-lease-bytes` locks rows the kernel then excludes from
+  reclaim, so a cache that must stay migratable for rswap leaves it at `0`.
 
 ## Validating a change
 
