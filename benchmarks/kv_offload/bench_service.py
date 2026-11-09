@@ -163,7 +163,9 @@ class RswapDevice:
 
 
 class Service:
-    def __init__(self, capacity_bytes: int, rswap: bool):
+    def __init__(
+        self, capacity_bytes: int, rswap: bool, extra_args: list[str] | None = None
+    ):
         self.dir = tempfile.TemporaryDirectory()
         Path(self.dir.name).chmod(0o700)
         self.path = str(Path(self.dir.name) / "cache.sock")
@@ -176,6 +178,7 @@ class Service:
         ]
         if rswap:
             argv.append("--rswap-attach")
+        argv.extend(extra_args or [])
         self.process = subprocess.Popen(argv, stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + 10
         while not Path(self.path).exists():
