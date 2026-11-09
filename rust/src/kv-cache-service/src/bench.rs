@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use memmap2::MmapMut;
 use serde_json::{Value, json};
-use vllm_kv_cache_service::cache::namespace_bytes;
+use vllm_kv_cache_service::cache::{PrefetchLimits, namespace_bytes};
 use vllm_kv_cache_service::protocol::{self, MAX_KEYS};
 
 use crate::{Limits, Registry, SHUTDOWN, accept_connections, invalid, lock_or_recover};
@@ -317,6 +317,7 @@ impl Service {
             budget,
             rswap_attach: None,
             pin_lease_bytes: 0,
+            prefetch: PrefetchLimits::default(),
             pending_timeout: None,
             started: Instant::now(),
         }));

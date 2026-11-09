@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use vllm_kv_cache_service::cache::{Cache, check_keys};
+use vllm_kv_cache_service::cache::{Cache, PrefetchLimits, check_keys};
 
 /// Bounds the samples of a group whose every iteration rebuilds its fixture, so
 /// the run stays short: an O(n) path is orders of magnitude away from an O(1)
@@ -58,8 +58,16 @@ fn fill_row(cache: &Cache, slot: usize) {
 impl Fixture {
     fn new(n: usize) -> Fixture {
         let keys: Vec<String> = (0..n).map(|index| hex_key('a', index)).collect();
-        let mut cache = Cache::new(1, WORKER_BYTES, 1, n, n * WORKER_BYTES, 0)
-            .expect("fixture geometry is valid");
+        let mut cache = Cache::new(
+            1,
+            WORKER_BYTES,
+            1,
+            n,
+            n * WORKER_BYTES,
+            0,
+            PrefetchLimits::default(),
+        )
+        .expect("fixture geometry is valid");
         let mut slots = Vec::with_capacity(n);
         for batch in keys.chunks(FIXTURE_BATCH) {
             let (_, reserved, _) =

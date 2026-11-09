@@ -184,7 +184,10 @@ A size that does not fit shows up in one of three ways:
 cannot be reclaimed, so a `memory.max` close to the cache size pushes the pressure
 onto the other memory charged to the same cgroup and can OOM the writer instead.
 Size the flag to roughly the bytes the engines keep leased at once, and leave
-`memory.max` headroom above the cache size for the rest of the process.
+`memory.max` headroom above the cache size for the rest of the process. A pin a
+lookup-time readahead takes comes out of the same budget, and the service skips a
+readahead pin while its cgroup is within a tenth of `memory.max`, so the readahead
+cannot push the writer over that limit on its own.
 
 ## Protocol
 
@@ -257,7 +260,10 @@ between may still evict one of its keys, and the readahead of a slot that has
 since been recycled reads bytes nobody needs. It rejects a key that is missing or
 not committed, which is what makes the keys a lookup answered `pending` for safe
 to send. The reply counts the pages that were advised, not the pages the kernel
-fetched, exactly as `load`'s `prefetched` does.
+fetched, exactly as `load`'s `prefetched` does. A lookup already starts the
+readahead of a row it answers `pending` for and locks it once it is resident, so
+this call reaches the keys that lookup could not start or asks again for a row
+whose readahead did not finish; it never pins.
 
 One prefetch drives up to four `MADV_WILLNEED` streams over disjoint rows. A
 shmem willneed becomes one `swap_io_ctx` submitted once by `shmem_swapin_range()`,
@@ -315,7 +321,7 @@ A `stats` reply, one counter set per namespace, plus the sessions using it and
 whether its owner left it adoptable:
 
 ```json
-{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "resident": 0, "remote": 0, "free_chunks": 2, "requests": 0, "pinned_slots": 0, "pinned_bytes": 0, "pin_skipped": 0, "pin_failures": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}, "sessions": 2, "detached": false}
+{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "resident": 0, "remote": 0, "free_chunks": 2, "requests": 0, "pinned_slots": 0, "pinned_bytes": 0, "pin_skipped": 0, "pin_skipped_headroom": 0, "pin_failures": 0, "prefetch_calls": 0, "prefetch_chunks": 0, "prefetch_skipped": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}, "sessions": 2, "detached": false}
 ```
 
 An `info` reply, which an operator or a probe can read before any engine opened a
@@ -350,6 +356,29 @@ per page, and that answer takes no lease: a lease on a chunk that cannot be read
 yet is what would stop a later allocation from replacing it with a chunk that can.
 The check is one `mincore(2)` over the chunk's row, so `pending` covers both
 "reserved and not published" and "published but not resident".
+
+A pending row is also where the readahead starts. A `lookup` or `lookup_many`
+that answered `pending` for a committed row hands those slots to
+`cache.rs::begin_prefetch`, which starts the `MADV_WILLNEED` readahead on a
+detached thread inside the same RPC, so the reply never waits for it. One lookup
+starts at most `--prefetch-max-chunks` rows (default 32) and counts the rest as
+`prefetch_skipped`; a row whose readahead started less than
+`--prefetch-cooldown-ms` ago (default 2000; 0 starts one on every lookup) is left
+alone, so a lookup the readahead has not satisfied yet does not queue the same
+pages again. Once the readahead finishes, every row it made resident is locked for
+the request that asked, so the next lookup is a hit whose copy cannot fault the
+row back out. That lock is the budget `--pin-lease-bytes` bounds, so it needs the
+flag, and it ends with the request's `release_request`, a forced `reset`, or the
+slot's teardown.
+
+A pin the budget does not fit, the kernel refuses, or the cgroup's headroom does
+not allow leaves the row readable without the guarantee and counts
+`pin_skipped`, `pin_failures`, or `pin_skipped_headroom`. The headroom check reads
+`/proc/self/cgroup` and then `memory.current` and `memory.max` of that cgroup, and
+takes the pin only while `memory.current` plus the row stays below 90 % of
+`memory.max`, because a locked row turns the next reclaim onto the rest of the
+cgroup; an unlimited cgroup, or one whose files the service cannot read, leaves
+the budget as the only ceiling.
 
 A hit also stays readable. The residency check answers for the moment it runs, so
 `--pin-lease-bytes` has the service `mlock(2)` the row of a fresh hit before that
@@ -405,8 +434,11 @@ eviction order until the engine stops.
 a lease, and the `pinned_slots` and `pinned_bytes` a lock holds) plus counters
 that are monotonic since the namespace opened and survive `reset`: `hits`,
 `misses`, `pending_hits`, `evictions`, `stores`, `commits`, `aborted`, `reclaimed`
-in keys, the rejected or failed `commit` calls in `failed_commits`, and the pins
-the budget skipped or the kernel refused in `pin_skipped` and `pin_failures`.
+in keys, the rejected or failed `commit` calls in `failed_commits`, the pins the
+budget, the cgroup's headroom, or the kernel refused in `pin_skipped`,
+`pin_skipped_headroom`, and `pin_failures`, and the lookup-time readahead in
+`prefetch_calls` (one per lookup that started one), `prefetch_chunks` (rows it
+accepted), and `prefetch_skipped` (rows the cooldown or the cap left behind).
 Where the kernel holds the entries is reported beside them:
 `resident` counts the chunks whose whole row is in DRAM and `remote` the rest
 (`entries - resident`), so an operator can see how much of the cache a memory
@@ -535,6 +567,9 @@ reservation may stay pending; see Ownership. `--namespace-grace-secs` (default
 the accept loop's own poll sweeps it, so no thread or timer exists for that.
 `--pin-lease-bytes` (default 0; 0 disables pinning) bounds the bytes of leased
 rows the service may lock, per namespace; see Ownership and Sizing.
+`--prefetch-cooldown-ms` (default 2000; 0 prefetches on every lookup) and
+`--prefetch-max-chunks` (default 32) bound the readahead a lookup starts for the
+rows it could not report as readable; see Ownership.
 Every event writes one line to stderr, starting with `kv-cache-service: start`
 (socket, capacity, pid, and every limit) and ending with `shutdown`: namespace
 open, attach, detach, adoption, retirement, and reclaim, the reclaimed socket,
@@ -585,8 +620,11 @@ stalls:
 | `hits`, `misses`, `pending_hits` | Lookup outcomes since `open`, unchanged across `reset`. `pending_hits` counts the answers that were `pending`, both from a reservation and from a row that was not resident. |
 | `evictions`, `stores`, `commits`, `aborted` | Chunks evicted, reserved, published, and released without publishing. |
 | `failed_commits`, `reclaimed` | Commits rejected (ownership, missing reservation, failed publish) and keys reclaimed by the pending timeout. |
-| `pinned_slots`, `pinned_bytes` | Rows a lease holds locked under `--pin-lease-bytes`, and the bytes they charge. They cannot be reclaimed, so a value that does not fall to 0 once the engine is idle is a lock its leases kept; see Sizing before raising the flag. |
+| `pinned_slots`, `pinned_bytes` | Rows the service holds locked under `--pin-lease-bytes`, from a lease's hit and from the readahead's pin, and the bytes they charge. They cannot be reclaimed, so a value that does not fall to 0 once the engine is idle is a lock a request kept; see Sizing before raising the flag. |
 | `pin_skipped`, `pin_failures` | Pins the budget refused, and locks or unlocks the kernel refused. A `pin_skipped` that climbs means the flag is below the working set and later hits go without the guarantee; a `pin_failures` that climbs means the host cannot lock memory at all, which `pin_failed` logged once. |
+| `pin_skipped_headroom` | Pins the service skipped because its own cgroup v2 was within a tenth of `memory.max`, where a lock would push the reclaim onto the rest of the cgroup. A value that climbs means the cache is at its limit and the readahead keeps rows readable without the guarantee. |
+| `prefetch_calls`, `prefetch_chunks` | Lookup-time readaheads started, and rows they accepted, since `open`. `prefetch_chunks` above `prefetch_calls` is a wide lookup batch; both 0 with `remote` above 0 means no readahead is running, which the cooldown or `--prefetch-max-chunks 0` explains. |
+| `prefetch_skipped` | Rows a lookup left out of the readahead because the slot was inside `--prefetch-cooldown-ms` or the call was at `--prefetch-max-chunks`. A climbing value with a large `remote` means the cooldown is longer than the kernel needs for a row. |
 | `sessions`, `detached` | Sessions using the namespace, and whether an owner left it adoptable. `detached` with `sessions` above 0 is a scheduler that is gone while its workers still hold the mapping; `--namespace-grace-secs` is what frees it. |
 
 Engine side, the connector samples one `stats` RPC per collection and reports

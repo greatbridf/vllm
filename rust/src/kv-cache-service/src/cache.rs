@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
+use std::fs;
 use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
@@ -72,6 +73,27 @@ pub enum Status {
     Miss,
 }
 
+/// How far a lookup-time readahead reaches.
+#[derive(Clone, Copy, Debug)]
+pub struct PrefetchLimits {
+    /// How long a slot stays out of the readahead after one started for it, so a
+    /// lookup the readahead has not satisfied yet does not queue the same pages
+    /// again; 0 prefetches on every lookup.
+    pub cooldown: Duration,
+    /// Rows one readahead may start; a wider batch counts the rest as skipped and
+    /// leaves them for a later lookup.
+    pub max_chunks: usize,
+}
+
+impl Default for PrefetchLimits {
+    fn default() -> Self {
+        Self {
+            cooldown: Duration::from_secs(2),
+            max_chunks: 32,
+        }
+    }
+}
+
 pub struct Cache {
     pub owner: u64,
     pub worker_bytes: usize,
@@ -98,7 +120,21 @@ pub struct Cache {
     pin_budget: usize,
     /// Bytes the service currently holds locked.
     pinned_bytes: usize,
+    prefetch: PrefetchLimits,
+    /// The readahead a lookup started for a slot, by slot.
+    readaheads: HashMap<u32, ReadAhead>,
+    /// Slots a readahead locked for the request that asked for them.
+    prefetch_pins: HashMap<Box<str>, Vec<u32>>,
     hashes: Option<Box<dyn PageHashes>>,
+}
+
+/// A readahead a lookup started for one slot: when it started, which the cooldown
+/// measures, and the request whose load it keeps the row for while it is in
+/// flight. The worker that reads the row clears the request, so a row released
+/// meanwhile is not locked for a request that can no longer load it.
+struct ReadAhead {
+    since: Instant,
+    request: Option<Box<str>>,
 }
 
 /// Monotonic per-namespace counters since `open`. `reset` leaves them alone, so a
@@ -115,7 +151,11 @@ struct Counters {
     failed_commits: usize,
     reclaimed: usize,
     pin_skipped: usize,
+    pin_skipped_headroom: usize,
     pin_failures: usize,
+    prefetch_calls: usize,
+    prefetch_chunks: usize,
+    prefetch_skipped: usize,
 }
 
 /// Leases ended by `release` or `release_request`, and the keys or request id
@@ -328,6 +368,7 @@ impl Cache {
         num_chunks: usize,
         budget: usize,
         pin_budget: usize,
+        prefetch: PrefetchLimits,
     ) -> io::Result<Self> {
         Self::with_hashes(
             owner,
@@ -336,6 +377,7 @@ impl Cache {
             num_chunks,
             budget,
             pin_budget,
+            prefetch,
             None,
         )
     }
@@ -347,6 +389,7 @@ impl Cache {
         num_chunks: usize,
         budget: usize,
         pin_budget: usize,
+        prefetch: PrefetchLimits,
         factory: Option<&dyn HashFactory>,
     ) -> io::Result<Self> {
         let size = namespace_bytes(worker_bytes, world_size, num_chunks)?;
@@ -414,6 +457,9 @@ impl Cache {
             counters: Counters::default(),
             pin_budget,
             pinned_bytes: 0,
+            prefetch,
+            readaheads: HashMap::new(),
+            prefetch_pins: HashMap::new(),
             hashes,
         })
     }
@@ -581,6 +627,90 @@ impl Cache {
             .is_ok_and(|pages| pages == self.row_bytes / self.page_size)
     }
 
+    /// Slots of the committed chunks `keys` name, skipping a key the cache does
+    /// not hold or has only reserved: a reservation has no row to read ahead yet.
+    pub fn prefetch_slots(&self, keys: &[&str]) -> Vec<usize> {
+        keys.iter()
+            .filter_map(|key| {
+                let slot = *self.index.get(*key)?;
+                self.slots[slot as usize].ready.then_some(slot as usize)
+            })
+            .collect()
+    }
+
+    /// Starts the readahead a lookup's `pending` answers asked for.
+    ///
+    /// A slot already locked stays as it is, and so does one whose readahead
+    /// started less than the cooldown ago: the kernel may still be fetching it,
+    /// and another lookup would only queue the same pages again. One call accepts
+    /// at most `max_chunks` rows and counts the rest, so a wide scan cannot turn
+    /// into thousands of outstanding reads. The accepted slots stay marked until
+    /// [`Cache::finish_prefetch`] ends their readahead.
+    ///
+    /// Args:
+    ///     slots: Slots of committed rows that are not resident.
+    ///     request: Request whose load the readahead keeps the rows for.
+    ///     now: When the readahead starts.
+    ///
+    /// Returns:
+    ///     The slots to read ahead, in the order given.
+    pub fn begin_prefetch(&mut self, slots: &[usize], request: &str, now: Instant) -> Vec<usize> {
+        let mut accepted = Vec::new();
+        for &slot in slots {
+            if self.slots[slot].pinned {
+                continue;
+            }
+            let cooled = self.readaheads.get(&(slot as u32)).is_some_and(|readahead| {
+                now.saturating_duration_since(readahead.since) < self.prefetch.cooldown
+            });
+            if cooled || accepted.len() >= self.prefetch.max_chunks {
+                self.counters.prefetch_skipped += 1;
+                continue;
+            }
+            accepted.push(slot);
+        }
+        if accepted.is_empty() {
+            return accepted;
+        }
+        self.counters.prefetch_calls += 1;
+        self.counters.prefetch_chunks += accepted.len();
+        let request = Some(Box::from(request));
+        for &slot in &accepted {
+            self.readaheads.insert(
+                slot as u32,
+                ReadAhead {
+                    since: now,
+                    request: request.clone(),
+                },
+            );
+        }
+        accepted
+    }
+
+    /// Ends one readahead: clears the mark this request set, and locks the row for
+    /// that request once it is resident, so the load that follows reads it without
+    /// a fault. A mark a release or a reset already dropped is left alone.
+    ///
+    /// Args:
+    ///     slot: A slot `begin_prefetch` accepted.
+    ///     request: The request that asked for the readahead.
+    ///
+    /// Returns:
+    ///     Whether the row was left locked for the request.
+    pub fn finish_prefetch(&mut self, slot: usize, request: &str) -> bool {
+        let Some(readahead) = self.readaheads.get_mut(&(slot as u32)) else {
+            return false;
+        };
+        if readahead.request.as_deref() != Some(request) {
+            return false;
+        }
+        readahead.request = None;
+        if !self.is_resident(slot) {
+            return false;
+        }
+        self.pin_prefetched(slot, request)
+    }
+
     #[allow(dead_code)]
     fn prefetch_locked(&self, slots: &[usize]) -> io::Result<usize> {
         let mut sorted = slots.to_vec();
@@ -683,24 +813,42 @@ impl Cache {
         released
     }
 
+    /// Ends one request's leases, then its prefetch pins.
+    ///
+    /// A readahead the request started is dropped with them, so a row it makes
+    /// resident is not locked for a request that can no longer load it.
     pub fn release_request(&mut self, request: &str) -> Released {
-        let Some((request, slots)) = self.leases.release(request) else {
-            return Released {
-                leases: 0,
-                unknown: 1,
-            };
-        };
-        for slot in &slots {
-            let entry = &mut self.slots[*slot as usize];
-            entry.readers.retain(|reader| *reader != request);
-            if entry.readers.is_empty() {
-                self.unpin_slot(*slot as usize);
+        let mut released = Released::default();
+        let mut held = false;
+        if let Some((id, slots)) = self.leases.release(request) {
+            held = true;
+            for slot in &slots {
+                let entry = &mut self.slots[*slot as usize];
+                entry.readers.retain(|reader| *reader != id);
+                if entry.readers.is_empty() {
+                    self.unpin_slot(*slot as usize);
+                }
+            }
+            released.leases = slots.len();
+        }
+        if let Some(pinned) = self.prefetch_pins.remove(request) {
+            held = true;
+            for slot in pinned {
+                if self.slots[slot as usize].readers.is_empty() {
+                    self.unpin_slot(slot as usize);
+                }
             }
         }
-        Released {
-            leases: slots.len(),
-            unknown: 0,
+        let readaheads = self.readaheads.len();
+        self.readaheads
+            .retain(|_, readahead| readahead.request.as_deref() != Some(request));
+        if self.readaheads.len() != readaheads {
+            held = true;
         }
+        if !held {
+            released.unknown = 1;
+        }
+        released
     }
 
     pub fn touch(&mut self, keys: &[String]) {
@@ -890,6 +1038,8 @@ impl Cache {
         self.index.clear();
         self.leases = LeaseIndex::default();
         self.owners = OwnerIndex::default();
+        self.readaheads.clear();
+        self.prefetch_pins.clear();
         self.lru_head = NO_SLOT;
         self.lru_tail = NO_SLOT;
         for entry in &mut self.slots {
@@ -931,7 +1081,11 @@ impl Cache {
             ("pinned_slots", self.pinned_slots()),
             ("pinned_bytes", self.pinned_bytes),
             ("pin_skipped", self.counters.pin_skipped),
+            ("pin_skipped_headroom", self.counters.pin_skipped_headroom),
             ("pin_failures", self.counters.pin_failures),
+            ("prefetch_calls", self.counters.prefetch_calls),
+            ("prefetch_chunks", self.counters.prefetch_chunks),
+            ("prefetch_skipped", self.counters.prefetch_skipped),
             ("bytes", self.mapping.len()),
             ("num_chunks", self.num_chunks),
         ])
@@ -982,6 +1136,7 @@ impl Cache {
         // Eviction never picks a leased slot, but a lock must not outlive the
         // slot it is charged to, so the unlock is unconditional.
         self.unpin_slot(slot as usize);
+        self.forget_prefetch(slot);
         self.unlink(slot);
         let key = std::mem::take(&mut self.slots[slot as usize].key);
         self.slots[slot as usize].ready = false;
@@ -1016,6 +1171,62 @@ impl Cache {
         self.slots.iter().filter(|entry| entry.pinned).count()
     }
 
+    /// Drops what a readahead left on the slot, so a recycled slot neither stays
+    /// in a request's pin list nor inside the cooldown of the row it held.
+    fn forget_prefetch(&mut self, slot: u32) {
+        self.readaheads.remove(&slot);
+        for pinned in self.prefetch_pins.values_mut() {
+            pinned.retain(|pinned_slot| *pinned_slot != slot);
+        }
+    }
+
+    /// Whether one more row fits the pin budget.
+    fn pin_fits_budget(&self) -> bool {
+        self.pin_budget != 0 && self.pinned_bytes.saturating_add(self.row_bytes) <= self.pin_budget
+    }
+
+    /// Locks a row the readahead just made resident and charges the pin to
+    /// `request`, so the release that ends the request unlocks it too.
+    ///
+    /// A row another request already holds locked is left to that request, and a
+    /// pin the budget or the cgroup's headroom refuses leaves the row readable
+    /// without the guarantee.
+    fn pin_prefetched(&mut self, slot: usize, request: &str) -> bool {
+        if self.slots[slot].pinned {
+            return false;
+        }
+        if !self.pin_fits_budget() {
+            if self.pin_budget != 0 {
+                self.counters.pin_skipped += 1;
+            }
+            return false;
+        }
+        if !self.pin_headroom() {
+            self.counters.pin_skipped_headroom += 1;
+            return false;
+        }
+        self.pin_slot(slot);
+        if !self.slots[slot].pinned {
+            return false;
+        }
+        self.prefetch_pins.entry(Box::from(request)).or_default().push(slot as u32);
+        true
+    }
+
+    /// Whether this process's cgroup v2 has room for one more locked row.
+    ///
+    /// A lock makes the row unreclaimable, so pinning just under `memory.max`
+    /// would push the reclaim onto the rest of the cgroup and could OOM the writer
+    /// instead of the cache. A tenth of the limit stays free; a cgroup without a
+    /// limit, or one whose files this process cannot read, leaves the budget as the
+    /// only ceiling.
+    fn pin_headroom(&self) -> bool {
+        let Some((current, limit)) = cgroup_memory() else {
+            return true;
+        };
+        current.saturating_add(self.row_bytes as u64) <= limit.saturating_sub(limit / 10)
+    }
+
     /// Locks the slot's row in DRAM, so the lease that reports it readable keeps
     /// it that way: the kernel excludes a locked range from reclaim.
     ///
@@ -1027,7 +1238,7 @@ impl Cache {
         if self.slots[slot].pinned || self.pin_budget == 0 {
             return;
         }
-        if self.pinned_bytes.saturating_add(self.row_bytes) > self.pin_budget {
+        if !self.pin_fits_budget() {
             self.counters.pin_skipped += 1;
             return;
         }
@@ -1136,6 +1347,26 @@ fn log_pin_failure(error: io::Error) {
     }
 }
 
+/// Bytes the process's own cgroup v2 charges to `memory.current` against
+/// `memory.max`.
+///
+/// Returns:
+///     `None` when the process is in no v2 cgroup, either file is unreadable, or
+///     the limit is `max`; the caller then has no headroom to check.
+fn cgroup_memory() -> Option<(u64, u64)> {
+    let cgroup = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let path = path.trim_end_matches('/');
+    let read = |name: &str| -> Option<u64> {
+        fs::read_to_string(format!("/sys/fs/cgroup{path}/{name}"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some((read("memory.current")?, read("memory.max")?))
+}
+
 /// Asks the kernel to read whole rows back in with one `MADV_WILLNEED` each.
 pub fn prefetch_rows(
     mapping: &MmapMut,
@@ -1192,7 +1423,7 @@ pub fn prefetch_rows_parallel(
     } else {
         // Every stream takes every `streams`-th run, so the calls of different
         // streams never describe the same range.
-        let mapping_ref = &*mapping;
+        let mapping_ref = mapping;
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(streams);
             for lane in 0..streams {
@@ -1325,7 +1556,12 @@ mod tests {
     }
 
     fn cache_with_pins(num_chunks: usize, pin_budget: usize) -> Cache {
-        Cache::new(1, 64, 1, num_chunks, 16 * 1024 * 1024, pin_budget).unwrap()
+        let limits = PrefetchLimits::default();
+        Cache::new(1, 64, 1, num_chunks, 16 * 1024 * 1024, pin_budget, limits).unwrap()
+    }
+
+    fn cache_with_prefetch(num_chunks: usize, prefetch: PrefetchLimits) -> Cache {
+        Cache::new(1, 64, 1, num_chunks, 16 * 1024 * 1024, 0, prefetch).unwrap()
     }
 
     fn keys(values: &[&str]) -> Vec<String> {
@@ -1353,6 +1589,7 @@ mod tests {
             2,
             2 * 1024 * 1024,
             0,
+            PrefetchLimits::default(),
             Some(&factory as &dyn HashFactory),
         )
         .unwrap();
@@ -1511,6 +1748,119 @@ mod tests {
     }
 
     #[test]
+    fn begin_prefetch_caps_a_lookup_at_the_configured_chunks() {
+        let prefetch = PrefetchLimits {
+            max_chunks: 2,
+            ..Default::default()
+        };
+        let mut cache = cache_with_prefetch(4, prefetch);
+        let stored = keys(&["aa", "bb", "cc"]);
+        cache.store(&stored, "r").unwrap();
+        cache.commit(&stored, "r", true).unwrap();
+
+        // A key the cache does not hold has no row to read ahead, and the cap
+        // keeps the third committed row for a later lookup.
+        assert_eq!(
+            cache.prefetch_slots(&["aa", "zz"]),
+            vec![slot(&cache, "aa")]
+        );
+        let slots = cache.prefetch_slots(&["aa", "bb", "cc"]);
+        assert_eq!(cache.begin_prefetch(&slots, "r", Instant::now()).len(), 2);
+        let stats = cache.stats();
+        assert_eq!(stats["prefetch_calls"], 1);
+        assert_eq!(stats["prefetch_chunks"], 2);
+        assert_eq!(stats["prefetch_skipped"], 1);
+
+        // The two accepted slots are inside their cooldown, so the next lookup
+        // takes the row the cap left behind and nothing else.
+        assert_eq!(cache.begin_prefetch(&slots, "r", Instant::now()).len(), 1);
+        assert_eq!(cache.stats()["prefetch_chunks"], 3);
+        assert_eq!(cache.stats()["prefetch_skipped"], 3);
+    }
+
+    #[test]
+    fn a_readahead_inside_the_cooldown_is_not_started_again() {
+        let mut cache = cache_with(2);
+        let stored = keys(&["aa"]);
+        cache.store(&stored, "r").unwrap();
+        cache.commit(&stored, "r", true).unwrap();
+        let slots = cache.prefetch_slots(&["aa"]);
+        let now = Instant::now();
+
+        assert_eq!(cache.begin_prefetch(&slots, "r", now), slots);
+        assert!(cache.begin_prefetch(&slots, "r", now).is_empty());
+        assert!(cache.begin_prefetch(&slots, "r", now + Duration::from_millis(500)).is_empty());
+        assert_eq!(cache.stats()["prefetch_skipped"], 2);
+        assert_eq!(cache.stats()["prefetch_calls"], 1);
+
+        let later = now + Duration::from_secs(5);
+        assert_eq!(cache.begin_prefetch(&slots, "r", later), slots);
+        assert_eq!(cache.stats()["prefetch_calls"], 2);
+        assert_eq!(cache.stats()["prefetch_chunks"], 2);
+    }
+
+    #[test]
+    fn a_pinned_row_is_not_prefetched_again() {
+        let mut cache = cache_with_pins(2, 8 * page_size().unwrap());
+        readable(&mut cache, "aa");
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
+        if cache.stats()["pinned_slots"] == 0 {
+            // The host refused `mlock`, so no row is locked and every row stays a
+            // readahead candidate.
+            return;
+        }
+        assert!(cache.begin_prefetch(&[slot(&cache, "aa")], "r", Instant::now()).is_empty());
+        assert_eq!(cache.stats()["prefetch_calls"], 0);
+    }
+
+    #[test]
+    fn release_request_drops_the_prefetch_pins_of_its_rows() {
+        let mut cache = cache_with_pins(2, page_size().unwrap());
+        readable(&mut cache, "aa");
+        let slots = cache.prefetch_slots(&["aa"]);
+        assert_eq!(cache.begin_prefetch(&slots, "r", Instant::now()), slots);
+        assert!(cache.finish_prefetch(slots[0], "r"));
+        // The budget covers the row, so the readahead either locked it or the
+        // host or the cgroup's headroom refused that one pin.
+        let stats = cache.stats();
+        assert_eq!(
+            stats["pinned_slots"] + stats["pin_failures"] + stats["pin_skipped_headroom"],
+            1
+        );
+
+        assert_eq!(
+            cache.release_request("r"),
+            Released {
+                leases: 0,
+                unknown: 0,
+            }
+        );
+        assert_eq!(cache.stats()["pinned_slots"], 0);
+        assert_eq!(cache.stats()["pinned_bytes"], 0);
+        assert!(cache.prefetch_pins.is_empty());
+    }
+
+    #[test]
+    fn release_request_drops_a_readahead_that_is_still_in_flight() {
+        let mut cache = cache_with_pins(2, page_size().unwrap());
+        readable(&mut cache, "aa");
+        let slots = cache.prefetch_slots(&["aa"]);
+        assert_eq!(cache.begin_prefetch(&slots, "r", Instant::now()), slots);
+
+        // The request ends before the worker read or locked the row, so nothing
+        // is charged to a request that can no longer load it.
+        assert_eq!(
+            cache.release_request("r"),
+            Released {
+                leases: 0,
+                unknown: 0,
+            }
+        );
+        assert!(!cache.finish_prefetch(slots[0], "r"));
+        assert_eq!(cache.stats()["pinned_slots"], 0);
+    }
+
+    #[test]
     fn a_row_stays_pinned_while_another_request_leases_it() {
         let mut cache = cache_with_pins(2, 8 * page_size().unwrap());
         readable(&mut cache, "aa");
@@ -1585,7 +1935,7 @@ mod tests {
 
     #[test]
     fn geometry_and_keys_are_bounded() {
-        assert!(Cache::new(1, usize::MAX, 2, 1, 8192, 0).is_err());
+        assert!(Cache::new(1, usize::MAX, 2, 1, 8192, 0, PrefetchLimits::default()).is_err());
         assert!(check_keys(&keys(&["aa", "aa"])).is_err());
         assert!(check_keys(&keys(&["not-hex"])).is_err());
     }
@@ -1891,7 +2241,16 @@ mod tests {
     fn store_that_cannot_echo_its_evictions_reserves_nothing() {
         // Long stored keys and short incoming ones: only the evicted keys make
         // the reply exceed one frame, which the incoming batch alone cannot show.
-        let mut cache = Cache::new(1, 64, 1, 2048, 64 * 1024 * 1024, 0).unwrap();
+        let mut cache = Cache::new(
+            1,
+            64,
+            1,
+            2048,
+            64 * 1024 * 1024,
+            0,
+            PrefetchLimits::default(),
+        )
+        .unwrap();
         let long: Vec<String> = (0..2048).map(|index| format!("{index:0510x}")).collect();
         for batch in long.chunks(512) {
             cache.store(batch, "r").unwrap();

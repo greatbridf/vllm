@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde_json::{Value, json};
 use vllm_kv_cache_service::cache::{
-    Cache, Released, StoreRejection, check_keys, check_request, namespace_bytes, prefetch_rows,
+    Cache, PREFETCH_STREAMS, PrefetchLimits, Released, Status, StoreRejection, check_keys,
+    check_request, namespace_bytes, prefetch_rows, prefetch_rows_parallel,
 };
 use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
 use vllm_kv_cache_service::protocol::{self, Request};
@@ -68,6 +69,16 @@ struct Args {
     /// up to this many bytes across the namespace; 0 leaves leases unpinned.
     #[arg(long, default_value_t = 0)]
     pin_lease_bytes: usize,
+    /// Read the row of a `lookup` that is not resident ahead, then lock it once it
+    /// is, so a later load reads it without a fault; a slot whose readahead
+    /// started less than this many milliseconds ago is left alone, and 0
+    /// prefetches on every lookup. Locking needs `--pin-lease-bytes`.
+    #[arg(long, default_value_t = 2000)]
+    prefetch_cooldown_ms: u64,
+    /// Rows one lookup-time readahead may start; a wider batch leaves the rest
+    /// for a later lookup.
+    #[arg(long, default_value_t = 32)]
+    prefetch_max_chunks: usize,
     /// Attach the rswap digest BPF program through sysfs; disabled by default.
     /// Defaults to /sys/kernel/mm/xswap/rswap_attach when no path is given.
     #[arg(
@@ -138,6 +149,7 @@ struct Registry {
     budget: usize,
     rswap_attach: Option<PathBuf>,
     pin_lease_bytes: usize,
+    prefetch: PrefetchLimits,
     pending_timeout: Option<Duration>,
     started: Instant,
 }
@@ -326,7 +338,7 @@ fn handle(
         }
         command => {
             let name = namespace.as_deref().ok_or_else(|| reject("handshake required"))?;
-            let (cache, pending_timeout, sessions, detached) = {
+            let (handle, pending_timeout, sessions, detached) = {
                 let registry = lock_or_recover(registry, "registry");
                 let entry = registry
                     .namespaces
@@ -339,7 +351,7 @@ fn handle(
                     entry.detached(),
                 )
             };
-            let mut cache = lock_or_recover(&cache, "cache");
+            let mut cache = lock_or_recover(&handle, "cache");
             // Read-only stats stay available to attached workers; every other
             // command mutates scheduler-owned cache metadata.
             if cache.owner != session && !matches!(command, Request::Stats) {
@@ -349,7 +361,15 @@ fn handle(
                 Request::Lookup { key, request } => {
                     check_keys(std::slice::from_ref(&key)).map_err(reject)?;
                     check_request(&request).map_err(reject)?;
-                    json!({"ok": true, "status": cache.lookup(&key, &request)})
+                    let status = cache.lookup(&key, &request);
+                    prefetch_pending(
+                        &mut cache,
+                        &handle,
+                        std::slice::from_ref(&key),
+                        &[status],
+                        &request,
+                    );
+                    json!({"ok": true, "status": status})
                 }
                 Request::LookupMany {
                     keys,
@@ -361,6 +381,7 @@ fn handle(
                     // A truncated scan reports fewer statuses than keys, which
                     // is smaller than the batch and so still fits one frame.
                     let statuses = cache.lookup_many(&keys, &request, until_miss);
+                    prefetch_pending(&mut cache, &handle, &keys, &statuses, &request);
                     json!({"ok": true, "statuses": statuses})
                 }
                 Request::Load {
@@ -472,6 +493,46 @@ fn prefetch_detached(cache: &Cache, slots: Vec<usize>) {
     let (mapping, row_bytes, page_size) = cache.prefetch_parts();
     std::thread::spawn(move || {
         let _ = prefetch_rows(&mapping, row_bytes, page_size, &slots);
+    });
+}
+
+/// Starts the readahead a lookup's `pending` answers asked for.
+///
+/// Only a committed row that is not resident has anything to read ahead, and the
+/// readahead runs on a thread of its own so the reply never waits. Each row it
+/// makes resident is locked for `request` once the read finishes, which is what
+/// turns the later lookup from another `pending` into a hit the load can copy
+/// without faulting.
+fn prefetch_pending(
+    cache: &mut Cache,
+    handle: &Arc<Mutex<Cache>>,
+    keys: &[String],
+    statuses: &[Status],
+    request: &str,
+) {
+    let pending: Vec<&str> = keys
+        .iter()
+        .zip(statuses)
+        .filter(|(_, status)| **status == Status::Pending)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let slots = cache.prefetch_slots(&pending);
+    let accepted = cache.begin_prefetch(&slots, request, Instant::now());
+    if accepted.is_empty() {
+        return;
+    }
+    let handle = Arc::clone(handle);
+    let request = request.to_owned();
+    thread::spawn(move || {
+        let (mapping, row_bytes, page_size) = lock_or_recover(&handle, "cache").prefetch_parts();
+        let _ = prefetch_rows_parallel(&mapping, row_bytes, page_size, &accepted, PREFETCH_STREAMS);
+        let mut cache = lock_or_recover(&handle, "cache");
+        for slot in accepted {
+            cache.finish_prefetch(slot, &request);
+        }
     });
 }
 
@@ -678,6 +739,7 @@ impl Registry {
             geometry.num_chunks,
             remaining,
             self.pin_lease_bytes,
+            self.prefetch,
             factory.as_ref().map(|factory| factory as &dyn HashFactory),
         )?;
         let frame = protocol::encode_response(&geometry_reply(&cache))?;
@@ -1076,6 +1138,8 @@ fn run_service(args: Args) -> io::Result<()> {
         "pending_timeout_secs" = args.pending_timeout_secs,
         "namespace_grace_secs" = args.namespace_grace_secs,
         "pin_lease_bytes" = args.pin_lease_bytes,
+        "prefetch_cooldown_ms" = args.prefetch_cooldown_ms,
+        "prefetch_max_chunks" = args.prefetch_max_chunks,
     );
     let registry = Arc::new(Mutex::new(Registry {
         namespaces: HashMap::new(),
@@ -1083,6 +1147,10 @@ fn run_service(args: Args) -> io::Result<()> {
         budget: capacity_bytes,
         rswap_attach: args.rswap_attach,
         pin_lease_bytes: args.pin_lease_bytes,
+        prefetch: PrefetchLimits {
+            cooldown: Duration::from_millis(args.prefetch_cooldown_ms),
+            max_chunks: args.prefetch_max_chunks,
+        },
         pending_timeout: (args.pending_timeout_secs > 0)
             .then(|| Duration::from_secs(args.pending_timeout_secs)),
         started: Instant::now(),
@@ -1139,5 +1207,7 @@ mod tests {
         assert_eq!(args.pending_timeout_secs, 60);
         assert_eq!(args.namespace_grace_secs, 300);
         assert_eq!(args.pin_lease_bytes, 0);
+        assert_eq!(args.prefetch_cooldown_ms, 2000);
+        assert_eq!(args.prefetch_max_chunks, 32);
     }
 }

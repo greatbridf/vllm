@@ -17,6 +17,12 @@ The operator-facing side of this backend, including its
   so the kernel cannot reclaim it before the copy reads it, the last reader
   unlocks it, and a pin the budget or the kernel refuses leaves the hit in place
   without the guarantee. Never drop another request's lease to make room.
+- A `pending` answer is the moment to read ahead: a lookup hands the committed
+  rows it cannot report as readable to the readahead at once, bounded by a per-call
+  count and a cooldown, and locks each row once it is resident for the request
+  that asked. A `hit` therefore means resident, and pinned when the budget and the
+  cgroup's headroom allow. Never pin a row past the budget or the cgroup's
+  headroom: a locked row turns the next reclaim onto the rest of the cgroup.
 - A reservation belongs to the request that made it: reject a `commit` from any
   other request and keep the reservation pending. Bound how long a reservation may
   stay pending, because the connector reports a pending key as a hit that is not
@@ -107,6 +113,22 @@ that pins it:
   request (`a_pin_budget_of_one_row_leaves_the_second_lease_unpinned`). A forced
   reset and a slot teardown unlock, so no lock outlives its slot
   (`forced_reset_unpins_every_row`).
+- **A pending row is read ahead, then pinned once resident.** A lookup hands the
+  committed rows it could not report as readable to `cache.rs::begin_prefetch`,
+  which caps one call at `--prefetch-max-chunks` and leaves a row whose readahead
+  started inside `--prefetch-cooldown-ms` alone
+  (`begin_prefetch_caps_a_lookup_at_the_configured_chunks`,
+  `a_readahead_inside_the_cooldown_is_not_started_again`), skips a row another
+  pin already holds (`a_pinned_row_is_not_prefetched_again`), and lets the
+  detached worker lock each row that became resident for the request that asked
+  (`main.rs::prefetch_pending`,
+  `a_pending_lookup_many_starts_the_readahead_of_its_committed_rows`). The pin is
+  the budget ceiling again, and the cgroup's own headroom bounds it further
+  (`pin_skipped_headroom`). `release_request` unpins the request's rows and drops
+  a readahead still in flight (`release_request_drops_the_prefetch_pins_of_its_rows`,
+  `release_request_drops_a_readahead_that_is_still_in_flight`), and a forced
+  reset drops every pin, so a `hit` means resident and, when the budget and the
+  headroom allow it, locked.
 - **Namespace retirement.** A disconnected worker never hands its mapping to a
   new namespace: the namespace is retired and stays charged to capacity until its
   last session leaves (`main.rs::Registry::retire`,
@@ -176,7 +198,8 @@ that pins it:
   `::test_released_pinning_skips_host_registration`,
   `::test_mock_engine_store_load_round_trip`). The service's own locks are the
   same contract: `--pin-lease-bytes` locks rows the kernel then excludes from
-  reclaim, so a cache that must stay migratable for rswap leaves it at `0`.
+  reclaim, including the rows a lookup-time readahead pins once they are resident,
+  so a cache that must stay migratable for rswap leaves it at `0`.
 
 ## Validating a change
 

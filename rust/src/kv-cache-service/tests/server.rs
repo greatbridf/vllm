@@ -624,6 +624,108 @@ fn prefetch_asks_for_a_whole_row_before_the_load_that_reads_it() {
 }
 
 #[test]
+fn a_pending_lookup_many_starts_the_readahead_of_its_committed_rows() {
+    let service = Service::start();
+    let mut client = service.connect();
+    let opened = open_with(&mut client, "engine-readahead", &"a".repeat(64), 4);
+    assert_eq!(opened["ok"], true);
+
+    // Committed but never written by a worker, so both rows are still remote and
+    // both lookups report them as not readable yet.
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": ["aa", "bb"], "request": "a"}))["ok"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "commit",
+            "keys": ["aa", "bb"],
+            "request": "a",
+            "success": true,
+        }))["ok"],
+        true
+    );
+    let reply = client.call(json!({
+        "op": "lookup_many",
+        "keys": ["aa", "bb"],
+        "request": "b",
+    }));
+    assert_eq!(reply["statuses"], json!(["pending", "pending"]));
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    assert_eq!(stats["prefetch_calls"], 1);
+    assert_eq!(stats["prefetch_chunks"], 2);
+
+    // The rows are inside their cooldown, so the second scan starts nothing and
+    // counts the two rows it dropped.
+    let reply = client.call(json!({
+        "op": "lookup_many",
+        "keys": ["aa", "bb"],
+        "request": "b",
+    }));
+    assert_eq!(reply["statuses"], json!(["pending", "pending"]));
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    assert_eq!(stats["prefetch_calls"], 1);
+    assert_eq!(stats["prefetch_skipped"], 2);
+}
+
+#[test]
+fn a_zero_prefetch_cooldown_reads_a_pending_row_ahead_again() {
+    let service = Service::start_with(&["--prefetch-cooldown-ms", "0"]);
+    let mut client = service.connect();
+    let opened = open(&mut client, "engine-readahead-again");
+    assert_eq!(opened["ok"], true);
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": ["aa"], "request": "a"}))["ok"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
+        true
+    );
+
+    for calls in 1..=2 {
+        let reply = client.call(json!({"op": "lookup", "key": "aa", "request": "b"}));
+        assert_eq!(reply["status"], "pending");
+        assert_eq!(
+            client.call(json!({"op": "stats"}))["stats"]["prefetch_calls"],
+            calls
+        );
+    }
+}
+
+#[test]
+fn prefetch_max_chunks_leaves_the_rest_of_a_batch_to_a_later_lookup() {
+    let service = Service::start_with(&["--prefetch-max-chunks", "1"]);
+    let mut client = service.connect();
+    let opened = open_with(&mut client, "engine-readahead-cap", &"a".repeat(64), 4);
+    assert_eq!(opened["ok"], true);
+    assert_eq!(
+        client.call(json!({"op": "store", "keys": ["aa", "bb"], "request": "a"}))["ok"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "commit",
+            "keys": ["aa", "bb"],
+            "request": "a",
+            "success": true,
+        }))["ok"],
+        true
+    );
+
+    let reply = client.call(json!({
+        "op": "lookup_many",
+        "keys": ["aa", "bb"],
+        "request": "b",
+    }));
+    assert_eq!(reply["statuses"], json!(["pending", "pending"]));
+    let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+    assert_eq!(stats["prefetch_calls"], 1);
+    assert_eq!(stats["prefetch_chunks"], 1);
+    assert_eq!(stats["prefetch_skipped"], 1);
+}
+
+#[test]
 fn a_leased_chunk_is_pinned_until_its_request_releases_it() {
     // The namespace reserves two rows, which this budget covers, so a `hit` that
     // pinned nothing here was refused by the kernel rather than by the budget.
