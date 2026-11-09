@@ -350,6 +350,47 @@ def test_worker_disconnect_invalidates_namespace_without_recycling_old_mapping(s
         manager.shutdown()
 
 
+def test_a_pending_lookup_drives_the_services_readahead(service, monkeypatch):
+    """A chunk whose pages were never touched is prefetched at the step end.
+
+    The service reports a committed chunk `pending` until its whole row is in
+    DRAM, which is what makes the connector defer that request; the manager asks
+    for the readahead at the step's end, so the retried lookup reads a resident
+    row instead of faulting page by page.
+    """
+    spec = _spec(service)
+    manager = spec.get_manager()
+    request = ReqContext("first")
+    readaheads: list[list[str]] = []
+    call = manager.client.call
+
+    def counting_call(op, retry=False, **fields):
+        reply = call(op, retry=retry, **fields)
+        if op == "prefetch":
+            readaheads.append(list(fields["keys"]))
+        return reply
+
+    try:
+        key = OffloadKey(b"readahead")
+        assert manager.prepare_store([key], request) is not None
+        manager.complete_store([key], request)
+        manager.on_schedule_end(SCHEDULE_END)
+        # Committed, but no worker wrote its row, so nothing is resident.
+        assert manager.lookup(key, request) is LookupResult.HIT_PENDING
+
+        monkeypatch.setattr(manager.client, "call", counting_call)
+        manager.on_schedule_end(SCHEDULE_END)
+
+        # The service accepted the readahead, so it resolved the committed row.
+        assert readaheads == [[key.hex()]]
+        region = _fault_in(spec)
+        assert manager.lookup(key, request) is LookupResult.HIT
+        assert manager.client.call("stats")["stats"]["pending_hits"] == 1
+        region.cleanup()
+    finally:
+        manager.shutdown()
+
+
 def test_service_spec_worker_uses_memfd_and_existing_dma_worker(service, monkeypatch):
     import vllm.v1.kv_offload.service.spec as module
 

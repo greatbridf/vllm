@@ -193,7 +193,10 @@ completed store queues one `commit` per 4096-key batch, a finished request queue
 its `release_request`, and `touch` queues its batches, and the manager writes that
 queue as one burst from `on_schedule_end`, once per scheduler step. A step therefore
 costs one write burst and one read burst for its completions and releases instead
-of two or three round trips per request. The calls whose answer the step needs --
+of two or three round trips per request. A step whose lookups answered `pending`
+writes one more burst after it, the `prefetch` of those keys, so the readahead of
+a chunk the kernel moved out starts at the step boundary instead of inside the
+deferred load that reads it. The calls whose answer the step needs --
 `lookup`, `lookup_many`, `load`, `store` -- stay one request each, so a key stored
 earlier in a step is published at the end of that step and a `lookup` for it in the
 same step still reports `pending`. The manager flushes the queue before a `store`,

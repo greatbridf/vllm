@@ -127,7 +127,8 @@ cannot serve, naming the key: `cache_policy_module_path`, `max_tracker_size`, an
 as unsupported. It honours `service_socket`, `service_timeout`,
 `service_connect_timeout`, `cpu_bytes_to_use`, `blocks_per_chunk`/`block_size`,
 `spec_name`, `offload_region: "shared"`, `eviction_policy: "lru"`,
-`store_threshold` below 2, `pin_host_memory`, and the generic `offload_prompt_only`,
+`store_threshold` below 2, `pin_host_memory`, `prefetch_on_load` and
+`prefetch_on_lookup`, and the generic `offload_prompt_only`,
 `self_describing_kv_events`, and `sync_load_budget_bytes` settings. A
 `canonical_layout` request is refused. `service_timeout` (default 5 s) bounds each
 control RPC, and `service_connect_timeout` (default 5 s) bounds connecting,
@@ -232,6 +233,21 @@ under memory pressure. Such a key is retried after the step like any other
 `HIT_PENDING`, and it becomes a hit again once a worker's transfer or the
 service's own readahead brought the chunk back. `stats` splits the entries into
 `resident` and `remote` for exactly that reason.
+
+The connector starts that readahead itself. A `pending` answer puts its key in the
+step's prefetch set, and the step boundary sends the set as one `prefetch` RPC per
+4096 keys, so the service resolves those committed chunks and asks the kernel to
+read their rows back while the rest of the step runs. The connector defers the
+request on `HIT_PENDING`, so by the time it retries it, the row is usually back in
+DRAM and the same lookup answers `HIT`. The set holds at most 16384 keys and drops
+the oldest past that, which costs nothing but another deferred step, and it is
+cleared at every step boundary. A prefetch the service refuses, which a `store`
+evicting the key in between leaves behind, is logged once and costs only that
+readahead; a prefetch that cannot reach the service stops offloading like every
+other failed call. Set `prefetch_on_lookup: false` to leave the readback to the
+load's own page faults. `prefetch_on_load` still decides whether a load prefetches
+the chunks it reads, because a lookup may not have been issued for every loaded
+key and a hit's pages can leave DRAM again between the lookup and the transfer.
 
 The connector reports the CPU tier's metrics from that namespace state, with one
 `stats` RPC per collection and none per lookup:
@@ -379,6 +395,7 @@ Each region's address and size are available as `base_tensor.data_ptr()` and `to
 | `service_timeout` | no | `5.0` | `RustServiceOffloadingSpec` | Seconds allowed for each control RPC. A timeout stops offloading for the engine instead of failing the scheduler step. |
 | `service_connect_timeout` | no | `5.0` | `RustServiceOffloadingSpec` | Seconds allowed for one connect attempt, including the bounded retry that covers a service still starting. |
 | `prefetch_on_load` | no | `true` | `RustServiceOffloadingSpec` | Ask the kernel to read a load's chunks back in as one range before the transfer, which overlaps the remote reads instead of submitting one per fault. Disable to make a load purely synchronous. |
+| `prefetch_on_lookup` | no | `true` | `RustServiceOffloadingSpec` | Ask the service to read back every chunk a lookup reported `pending` (committed, but its row is not in DRAM), as one `prefetch` RPC per step at the step boundary, so the request the connector deferred finds the chunk resident when it retries it. Disable to leave the readback to the deferred load's page faults. |
 | `pin_host_memory` | no | `true` | `RustServiceOffloadingSpec` | Register the service-owned region with the accelerator for pinned DMA. A registered range is page-locked and therefore unevictable, so set it to `false` when cold pages must reach an rswap remote tier; the copies then run pageable. |
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). `RustServiceOffloadingSpec` reserves it inside the service's aggregate `--capacity-bytes`, rounded down to whole chunks, and caps it to what that budget holds; see [Sizing](../../rust/src/kv-cache-service/README.md#sizing). |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |

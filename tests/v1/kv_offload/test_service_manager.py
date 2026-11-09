@@ -21,7 +21,10 @@ from vllm.v1.kv_offload.service.client import (
     CacheServiceError,
     CacheServiceUnavailable,
 )
-from vllm.v1.kv_offload.service.manager import ServiceOffloadingManager
+from vllm.v1.kv_offload.service.manager import (
+    MAX_PREFETCH_KEYS,
+    ServiceOffloadingManager,
+)
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 NUM_CHUNKS = 8
@@ -157,6 +160,9 @@ class FakeClient:
         slots = self.load_slots if self.load_slots is not None else self._slots(keys)
         return {"ok": True, "slots": list(slots)}
 
+    def _prefetch(self, keys: list[str]) -> dict[str, Any]:
+        return {"ok": True, "pages": len(keys)}
+
     @staticmethod
     def _slots(keys: list[str]) -> list[int]:
         # Slots are chunk ids of the namespace, so they repeat modulo its size.
@@ -205,6 +211,7 @@ def make_manager(
     enable_events: bool = False,
     flush_immediately: bool = False,
     prefetch: bool = True,
+    prefetch_on_lookup: bool = True,
 ) -> ServiceOffloadingManager:
     return ServiceOffloadingManager(
         client or FakeClient(),
@@ -213,6 +220,7 @@ def make_manager(
         enable_events=enable_events,
         flush_immediately=flush_immediately,
         prefetch=prefetch,
+        prefetch_on_lookup=prefetch_on_lookup,
     )
 
 
@@ -460,6 +468,115 @@ def test_lookup_many_degrades_to_misses():
     # One failure disables offloading instead of retrying inside every step.
     assert manager.lookup_many([make_key(0)], request) == [LookupResult.MISS]
     assert len(client.calls) == 1
+
+
+def test_pending_lookup_queues_the_key_for_prefetch():
+    """A chunk the service is still reading back is asked for at the step end."""
+    client = FakeClient()
+    client.status = "pending"
+    manager = make_manager(client)
+    request = ReqContext("request")
+    key = make_key()
+
+    assert manager.lookup(key, request) is LookupResult.HIT_PENDING
+    # A pending answer takes no lease, so the request owes no release either.
+    assert not manager._requests
+    assert client.ops("prefetch") == []
+
+    manager.on_schedule_end(SCHEDULE_END)
+
+    assert client.ops("prefetch") == [{"retry": False, "keys": [key.hex()]}]
+    # The set covers one step, so the next step owes no readahead.
+    assert manager._pending_prefetch == {}
+    manager.on_schedule_end(SCHEDULE_END)
+    assert len(client.ops("prefetch")) == 1
+
+
+def test_prefetch_is_not_sent_for_a_hit_or_a_miss():
+    """Only a chunk the service says is unreadable is worth a readahead."""
+    client = FakeClient()
+    manager = make_manager(client)
+    request = ReqContext("request")
+
+    assert manager.lookup(make_key(0), request) is LookupResult.HIT
+    client.status = "miss"
+    assert manager.lookup(make_key(1), request) is LookupResult.MISS
+    manager.on_schedule_end(SCHEDULE_END)
+
+    assert manager._pending_prefetch == {}
+    assert client.ops("prefetch") == []
+
+
+def test_prefetch_batches_above_max_keys():
+    """One step of pending keys leaves as one RPC per 4096 keys, in scan order."""
+    client = FakeClient()
+    client.status = "pending"
+    manager = make_manager(client)
+    request = ReqContext("request")
+    keys = [make_key(index) for index in range(MAX_KEYS + 2)]
+
+    assert manager.lookup_many(keys, request) == [LookupResult.HIT_PENDING] * len(keys)
+    manager.on_schedule_end(SCHEDULE_END)
+
+    assert [fields["keys"] for fields in client.ops("prefetch")] == [
+        [key.hex() for key in keys[:MAX_KEYS]],
+        [key.hex() for key in keys[MAX_KEYS:]],
+    ]
+
+
+def test_prefetch_drops_the_oldest_keys_past_the_bound():
+    """A step's readahead is a hint, so it is bounded instead of growing."""
+    client = FakeClient()
+    client.status = "pending"
+    manager = make_manager(client)
+    keys = [make_key(index) for index in range(MAX_PREFETCH_KEYS + 2)]
+
+    manager.lookup_many(keys, ReqContext("request"))
+
+    assert len(manager._pending_prefetch) == MAX_PREFETCH_KEYS
+    assert next(iter(manager._pending_prefetch)) == keys[2].hex()
+
+
+def test_prefetch_failure_degrades_instead_of_raising():
+    """A readahead the service will not start leaves only that chunk a fault."""
+    client = FakeClient()
+    client.status = "pending"
+    manager = make_manager(client)
+    request = ReqContext("request")
+
+    assert manager.lookup(make_key(0), request) is LookupResult.HIT_PENDING
+    client.unavailable = True
+    manager.on_schedule_end(SCHEDULE_END)
+
+    assert manager._degraded
+    assert len(client.ops("prefetch")) == 1
+    # A degraded manager drops the set instead of retrying it.
+    assert manager._pending_prefetch == {}
+
+    # A rejected readahead is not a lost connection: offloading stays on.
+    refused = FakeClient()
+    refused.status = "pending"
+    refusing = make_manager(refused)
+    assert refusing.lookup(make_key(1), request) is LookupResult.HIT_PENDING
+    refused.reject = True
+    refusing.on_schedule_end(SCHEDULE_END)
+    assert not refusing._degraded
+    assert len(refused.ops("prefetch")) == 1
+
+
+def test_prefetch_on_lookup_can_be_disabled():
+    """The readahead costs one RPC per step, so a deployment may turn it off."""
+    client = FakeClient()
+    client.status = "pending"
+    manager = make_manager(client, prefetch_on_lookup=False)
+
+    assert manager.lookup(make_key(), ReqContext("request")) is (
+        LookupResult.HIT_PENDING
+    )
+    manager.on_schedule_end(SCHEDULE_END)
+
+    assert manager._pending_prefetch == {}
+    assert client.ops("prefetch") == []
 
 
 def test_prepare_load_asks_the_service_to_prefetch():

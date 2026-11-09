@@ -145,7 +145,13 @@ that pins it:
   (`test_completions_are_flushed_once_per_step_in_order`,
   `test_flush_before_reset_and_shutdown`,
   `test_a_failed_flush_is_not_replayed`,
-  `test_a_queued_commit_is_flushed_before_an_observing_call`).
+  `test_a_queued_commit_is_flushed_before_an_observing_call`). The readahead a
+  `pending` lookup asks for is the other step-boundary burst: `on_schedule_end`
+  writes those keys as `prefetch` after the queue, so it can never reorder a
+  completion, and a refused or lost one costs only that readahead
+  (`test_pending_lookup_queues_the_key_for_prefetch`,
+  `test_prefetch_batches_above_max_keys`,
+  `test_prefetch_failure_degrades_instead_of_raising`).
 - **Pinned memory is not migratable.** Registering the service region with the
   accelerator page-locks it; the kernel excludes `VM_LOCKED` ranges from reclaim,
   so `MADV_PAGEOUT` answers `EINVAL` and rswap never stores those pages. The region

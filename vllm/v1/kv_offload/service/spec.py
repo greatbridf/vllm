@@ -35,6 +35,7 @@ _SUPPORTED_KEYS = frozenset(
         "offload_region",
         "pin_host_memory",
         "prefetch_on_load",
+        "prefetch_on_lookup",
         "self_describing_kv_events",
         "service_connect_timeout",
         "service_socket",
@@ -134,6 +135,14 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
         if not isinstance(prefetch, bool):
             raise ValueError("prefetch_on_load must be a boolean")
         self.prefetch_on_load: bool = prefetch
+        prefetch_on_lookup = extra.get("prefetch_on_lookup", True)
+        if not isinstance(prefetch_on_lookup, bool):
+            raise ValueError("prefetch_on_lookup must be a boolean")
+        # A `pending` lookup means the chunk is committed but not in DRAM, so the
+        # connector defers that request; the manager asks the service to read the
+        # chunk back at the step's end instead of leaving the page faults to the
+        # deferred load.
+        self.prefetch_on_lookup: bool = prefetch_on_lookup
         self.worker_bytes = self.cpu_page_size_per_worker
         world = config.parallel.world_size
         self.kv_bytes_per_chunk = (
@@ -243,6 +252,7 @@ class RustServiceOffloadingSpec(CPUOffloadingSpec):
                 info=self.cpu_info,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 prefetch=self.prefetch_on_load,
+                prefetch_on_lookup=self.prefetch_on_lookup,
             )
         return self._manager
 

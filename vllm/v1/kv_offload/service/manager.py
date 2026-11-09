@@ -67,6 +67,16 @@ _REFUSED_DEFERRED = (
     "KV cache service refused a deferred call, so state this client already "
     "dropped may still stand in the service: %s"
 )
+_REFUSED_PREFETCH = (
+    "KV cache service refused a readahead for a chunk a lookup reported as not "
+    "readable yet, so it stays pending until a transfer or a later readahead "
+    "brings it back: %s"
+)
+
+# A step's readahead is a hint, so its set is bounded instead of growing with the
+# step: it holds four RPC batches and drops its oldest keys past that, which costs
+# another deferred step, not a chunk.
+MAX_PREFETCH_KEYS = MAX_KEYS * 4
 
 
 @dataclass
@@ -130,8 +140,12 @@ class ServiceOffloadingManager(OffloadingManager):
     calls produced once KV cache events are enabled. `lookup_many()` answers a
     whole batch of a scan with one RPC per `MAX_KEYS` keys instead of one per
     key, and stops at the first miss when the caller asks it to, so a prefix scan
-    leases only the chunks it consumes. `shutdown()` closes the namespace before
-    the connection, so the service retires it instead of keeping it adoptable.
+    leases only the chunks it consumes. A lookup that answers `HIT_PENDING` also
+    queues that key, and `on_schedule_end()` sends the queued keys as one
+    `prefetch` burst, so the chunk is read back from the remote tier while the
+    connector defers the request instead of faulting page by page in the next
+    step's load. `shutdown()` closes the namespace before the connection, so the
+    service retires it instead of keeping it adoptable.
     """
 
     def __init__(
@@ -142,6 +156,7 @@ class ServiceOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         flush_immediately: bool = False,
         prefetch: bool = True,
+        prefetch_on_lookup: bool = True,
     ):
         self.client = client
         self.num_chunks = num_chunks
@@ -149,6 +164,11 @@ class ServiceOffloadingManager(OffloadingManager):
         # range: a swap-in is submitted per fault and the faulting task blocks
         # until it completes, so prefetching is what overlaps the remote reads.
         self.prefetch = prefetch
+        # A `pending` answer means the chunk is committed but not readable yet,
+        # so the connector defers that request to the next step; asking for the
+        # readahead at this step's end is what makes that answer a hit instead
+        # of a fault per page.
+        self.prefetch_on_lookup = prefetch_on_lookup
         # Static labels the connector publishes; empty when the spec gave none.
         self._config_info: ConfigInfoMapping = (
             info.as_config_info() if info is not None else {}
@@ -161,6 +181,10 @@ class ServiceOffloadingManager(OffloadingManager):
         # them one at a time, which is the reference this pipeline must match.
         self._deferred = not flush_immediately
         self._queue: list[tuple[str, dict[str, Any]]] = []
+        # Keys a lookup of this step reported `pending`, in the order they were
+        # first reported: a dict used as an ordered set, so two requests that
+        # scan the same prefix ask for its readahead once.
+        self._pending_prefetch: dict[str, None] = {}
         # Chunks each store call asked the service for since the last drain.
         self._allocation_sizes: list[int] = []
         self._events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -247,7 +271,23 @@ class ServiceOffloadingManager(OffloadingManager):
         if result is LookupResult.HIT:
             # The service takes the lease itself and reports a hit only then.
             self._request_state(request).leased = True
+        elif result is LookupResult.HIT_PENDING:
+            self._remember_pending([key.hex()])
         return result
+
+    def _remember_pending(self, keys: Iterable[str]) -> None:
+        """Records the keys this step's lookups reported as not readable yet.
+
+        Dropping a key costs a page fault, not a chunk: a readahead this step
+        does not ask for leaves the key pending, so the next lookup reports it
+        again and the connector defers that request once more.
+        """
+        if not self.prefetch_on_lookup:
+            return
+        for key in keys:
+            self._pending_prefetch[key] = None
+        while len(self._pending_prefetch) > MAX_PREFETCH_KEYS:
+            del self._pending_prefetch[next(iter(self._pending_prefetch))]
 
     @staticmethod
     def _lookup_result(status: Any) -> LookupResult:
@@ -296,7 +336,13 @@ class ServiceOffloadingManager(OffloadingManager):
                 # sees the gap where offloading stopped.
                 return [LookupResult.MISS] * len(encoded)
             statuses = self._lookup_statuses(response, len(batch), until_miss)
-            results += [self._lookup_result(status) for status in statuses]
+            batch_results = [self._lookup_result(status) for status in statuses]
+            self._remember_pending(
+                key
+                for key, result in zip(batch, batch_results)
+                if result is LookupResult.HIT_PENDING
+            )
+            results += batch_results
             if len(statuses) < len(batch):
                 break
         if LookupResult.HIT in results:
@@ -521,8 +567,30 @@ class ServiceOffloadingManager(OffloadingManager):
         self._maybe_release(request)
 
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
-        """Writes the step's deferred completions, touches, and releases."""
+        """Writes the step's deferred calls and the readahead its lookups asked for."""
         self.flush()
+        self._flush_prefetch()
+
+    def _flush_prefetch(self) -> None:
+        """Asks the service to start the reads a lookup this step could not answer.
+
+        It is written after the step's completions, because nothing in the step
+        waits for its reply and the queue may not be reordered behind it. Its
+        failure is never fatal for the same reason: a transport failure degrades
+        like every other call, and a key a `store` evicted in between is refused,
+        which leaves only that chunk a fault per page.
+        """
+        keys, self._pending_prefetch = self._pending_prefetch, {}
+        if not keys or self._degraded:
+            return
+        try:
+            self._send_chunks(
+                [("prefetch", {"keys": batch}) for batch in _batches(list(keys))]
+            )
+        except CacheServiceUnavailable as error:
+            self._degrade("prefetch", error)
+        except CacheServiceError as error:
+            logger.warning_once(_REFUSED_PREFETCH, error)
 
     def flush(self) -> None:
         """Writes every queued deferrable call as one burst.
