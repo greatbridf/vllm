@@ -405,6 +405,7 @@ def service(tmp_path):
 def test_a_burst_of_lookups_answers_one_ordered_reply_per_request(service):
     """A real service answers 64 pipelined lookups in request order."""
     client = CacheServiceClient(service)
+    worker = CacheServiceClient(service)
     keys = [f"{index:02x}" * 32 for index in range(64)]
     stored = keys[0::2]
     request = "pipelined"
@@ -420,6 +421,25 @@ def test_a_burst_of_lookups_answers_one_ordered_reply_per_request(service):
         )
         client.call("store", keys=stored, request=request)
         client.call("commit", keys=stored, request=request, success=True)
+        # A committed chunk is readable only once a worker wrote its row.
+        geometry = worker.call(
+            "attach",
+            version=1,
+            namespace="pipelined",
+            fingerprint="a" * 64,
+            rank=0,
+        )
+        fd = worker.receive_fd()
+        try:
+            rows = mmap.mmap(
+                fd,
+                geometry["num_chunks"] * geometry["row_bytes"],
+                flags=mmap.MAP_SHARED,
+            )
+        finally:
+            os.close(fd)
+        rows[:] = bytes(len(rows))
+        rows.close()
         replies = client.pipeline(
             [("lookup", {"key": key, "request": request}) for key in keys]
         )
@@ -428,6 +448,7 @@ def test_a_burst_of_lookups_answers_one_ordered_reply_per_request(service):
         with contextlib.suppress(CacheServiceError):
             client.call("close")
         client.close()
+        worker.close()
 
     assert len(replies) == 64
     assert [reply["status"] for reply in replies] == [

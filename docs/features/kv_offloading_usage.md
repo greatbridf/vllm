@@ -192,7 +192,8 @@ its leases, keeps stepping while workers report the transfers the reset flushed,
 and only then sends the forced reset that recycles the slots. The service's
 `stats` op reports the namespace counters (`hits`, `misses`, `pending_hits`,
 `evictions`, `stores`, `commits`, `aborted`, `failed_commits`, `reclaimed`, and the
-requests holding leases) that make such a leak visible.
+requests holding leases) that make such a leak visible, plus how many entries the
+kernel still holds in DRAM (`resident`) and how many it has moved out (`remote`).
 
 A service that stops answering, or that dropped the engine's namespace, does not
 abort the scheduler step: the connector logs one error, reports every later lookup
@@ -223,6 +224,14 @@ the same step reports `HIT_PENDING` and is retried after the step, and `stats` c
 report a non-zero `pending` at a step boundary. A `store`, a `stats` collection, a
 `reset`, and the engine shutdown write whatever is still queued first, so none of
 them reads a state the queue had not reached yet.
+
+A committed key also reports `HIT_PENDING` while its pages are not in DRAM: the
+service reports `pending` instead of a hit when the kernel no longer holds the
+whole chunk, because reading it then pays a fault per page while the cache is
+under memory pressure. Such a key is retried after the step like any other
+`HIT_PENDING`, and it becomes a hit again once a worker's transfer or the
+service's own readahead brought the chunk back. `stats` splits the entries into
+`resident` and `remote` for exactly that reason.
 
 The connector reports the CPU tier's metrics from that namespace state, with one
 `stats` RPC per collection and none per lookup:

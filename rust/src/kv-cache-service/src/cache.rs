@@ -402,12 +402,18 @@ impl Cache {
         }
     }
 
+    /// Looks up one key, leasing it and promoting it on a hit.
+    ///
+    /// `pending` covers both a chunk that is reserved but not published and one
+    /// whose pages the kernel no longer holds in DRAM: neither is readable now,
+    /// so neither takes a lease the caller could load through. A chunk becomes
+    /// readable once a worker wrote its row and the kernel has it back in memory.
     pub fn lookup(&mut self, key: &str, request: &str) -> Status {
         let Some(&slot) = self.index.get(key) else {
             self.counters.misses += 1;
             return Status::Miss;
         };
-        if !self.slots[slot as usize].ready {
+        if !self.slots[slot as usize].ready || !self.is_resident(slot as usize) {
             self.counters.pending_hits += 1;
             return Status::Pending;
         }
@@ -514,6 +520,35 @@ impl Cache {
         (Arc::clone(&self.mapping), self.row_bytes, self.page_size)
     }
 
+    /// Number of the slot's row pages the kernel holds in DRAM, as `mincore(2)`
+    /// reports them. Asking touches no page, so it cannot change the answer.
+    pub fn resident_pages(&self, slot: usize) -> io::Result<usize> {
+        let pages = self.row_bytes / self.page_size;
+        let mut residency = vec![0u8; pages];
+        let base = self.mapping.as_ptr() as usize + slot * self.row_bytes;
+        // SAFETY: the row lies inside the sealed mapping and is page-aligned, and
+        // `residency` holds the one byte per page that mincore(2) writes.
+        let queried = unsafe {
+            libc::mincore(
+                base as *mut libc::c_void,
+                self.row_bytes,
+                residency.as_mut_ptr(),
+            )
+        };
+        if queried != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(residency.iter().filter(|resident| **resident & 1 != 0).count())
+    }
+
+    /// Whether the whole row is in DRAM, and so readable without waiting for a
+    /// fault to fetch a page back. A range `mincore(2)` refuses to describe is
+    /// not resident, because a chunk the service cannot vouch for is not a hit.
+    pub fn is_resident(&self, slot: usize) -> bool {
+        self.resident_pages(slot)
+            .is_ok_and(|pages| pages == self.row_bytes / self.page_size)
+    }
+
     #[allow(dead_code)]
     fn prefetch_locked(&self, slots: &[usize]) -> io::Result<usize> {
         let mut sorted = slots.to_vec();
@@ -541,6 +576,25 @@ impl Cache {
             index += 1;
         }
         Ok(pages)
+    }
+
+    /// Slots of the committed chunks `keys` name, without taking a lease.
+    ///
+    /// A prefetch runs before the load that needs the slots, so it must not hold
+    /// the chunks a request leases on the lookup that produced the keys.
+    pub fn committed_slots(&self, keys: &[String]) -> io::Result<Vec<usize>> {
+        keys.iter()
+            .map(|key| {
+                let slot = *self
+                    .index
+                    .get(key.as_str())
+                    .ok_or_else(|| invalid("prefetch requires a stored chunk"))?;
+                if !self.slots[slot as usize].ready {
+                    return Err(invalid("prefetch requires a committed chunk"));
+                }
+                Ok(slot as usize)
+            })
+            .collect()
     }
 
     pub fn load(&self, keys: &[String], request: &str) -> io::Result<Vec<usize>> {
@@ -793,17 +847,23 @@ impl Cache {
     }
 
     pub fn stats(&self) -> HashMap<&'static str, usize> {
-        let entries = self.index.values().map(|slot| &self.slots[*slot as usize]);
         let mut pending = 0;
         let mut leased = 0;
-        for entry in entries {
+        let mut resident = 0;
+        for &slot in self.index.values() {
+            let entry = &self.slots[slot as usize];
             pending += usize::from(!entry.ready);
             leased += usize::from(!entry.readers.is_empty());
+            resident += usize::from(self.is_resident(slot as usize));
         }
         HashMap::from([
             ("entries", self.index.len()),
             ("pending", pending),
             ("leased", leased),
+            ("resident", resident),
+            // Entries whose pages are not all in DRAM, so reading them costs a
+            // fault that fetches the page back.
+            ("remote", self.index.len() - resident),
             ("free_chunks", self.free.len()),
             ("hits", self.counters.hits),
             ("misses", self.counters.misses),
@@ -1113,6 +1173,60 @@ mod tests {
         assert!(cache.spill(&keys(&["bb"])).is_err());
     }
 
+    /// Faults every page of `key`'s row in, as a worker's DMA does before the
+    /// service accepts the chunk as readable. Writing back the byte the page
+    /// already holds installs a page table entry and changes no data.
+    fn touch(cache: &Cache, key: &str) {
+        let base = cache.mapping.as_ptr() as usize + slot(cache, key) * cache.row_bytes;
+        for offset in (0..cache.row_bytes).step_by(cache.page_size) {
+            // SAFETY: the page lies inside the sealed mapping.
+            unsafe {
+                let page = std::ptr::with_exposed_provenance_mut::<u8>(base + offset);
+                std::ptr::write_volatile(page, std::ptr::read_volatile(page));
+            }
+        }
+    }
+
+    fn touch_all(cache: &Cache, values: &[String]) {
+        for value in values {
+            touch(cache, value);
+        }
+    }
+
+    #[test]
+    fn a_committed_chunk_is_pending_until_its_pages_are_in_dram() {
+        let mut cache = cache();
+        let first = keys(&["aa"]);
+        cache.store(&first, "r").unwrap();
+        cache.commit(&first, "r", true).unwrap();
+
+        // A fresh mapping holds no page, so the committed chunk is not readable.
+        let first_slot = slot(&cache, "aa");
+        assert_eq!(cache.resident_pages(first_slot).unwrap(), 0);
+        assert!(!cache.is_resident(first_slot));
+        assert_eq!(cache.lookup("aa", "r"), Status::Pending);
+        assert_eq!(cache.stats()["pending_hits"], 1);
+        assert_eq!(cache.stats()["hits"], 0);
+        // A chunk that cannot be read yet is not a hit, so it holds no lease.
+        assert_eq!(cache.stats()["leased"], 0);
+        assert!(cache.load(&first, "r").is_err());
+        assert_eq!(cache.stats()["resident"], 0);
+        assert_eq!(cache.stats()["remote"], 1);
+
+        touch(&cache, "aa");
+        assert_eq!(
+            cache.resident_pages(first_slot).unwrap(),
+            cache.row_bytes / cache.page_size
+        );
+        assert!(cache.is_resident(first_slot));
+        assert_eq!(cache.lookup("aa", "r"), Status::Hit);
+        assert_eq!(cache.stats()["hits"], 1);
+        assert_eq!(cache.stats()["leased"], 1);
+        assert_eq!(cache.load(&first, "r").unwrap(), vec![first_slot]);
+        assert_eq!(cache.stats()["resident"], 1);
+        assert_eq!(cache.stats()["remote"], 0);
+    }
+
     #[test]
     fn lookup_lease_prevents_eviction_before_load() {
         let mut cache = cache();
@@ -1120,6 +1234,7 @@ mod tests {
         cache.store(&first, "r").unwrap();
         assert_eq!(cache.lookup("aa", "r"), Status::Pending);
         cache.commit(&first, "r", true).unwrap();
+        touch(&cache, "aa");
         assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
         assert_eq!(evicted, keys(&["bb"]));
@@ -1149,6 +1264,7 @@ mod tests {
             cache.store(&keys(&["aa", "bb", "cc"]), "r"),
             Err(StoreRejection::Full)
         );
+        touch(&cache, "aa");
         assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         assert!(cache.reset(false).is_err());
     }
@@ -1265,6 +1381,7 @@ mod tests {
         cache.commit(&first, "r", true).unwrap();
         let before = recorded(&ops);
         let slot = slot(&cache, "aa");
+        touch(&cache, "aa");
         assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         assert_eq!(cache.load(&keys(&["aa"]), "r").unwrap(), vec![slot]);
         cache.touch(&first);
@@ -1277,6 +1394,7 @@ mod tests {
         let stored = keys(&["aa", "bb", "cc"]);
         cache.store(&stored, "r").unwrap();
         cache.commit(&stored, "r", true).unwrap();
+        touch(&cache, "aa");
         assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         // `bb` is the least recently used key, not the oldest inserted one.
         assert_eq!(cache.store(&keys(&["dd"]), "r").unwrap().2, keys(&["bb"]));
@@ -1309,6 +1427,8 @@ mod tests {
             cache.store(&stored, "r").unwrap();
             cache.commit(&keys(&["aa", "ee"]), "r", true).unwrap();
             cache.store(&keys(&["bb"]), "r").unwrap();
+            touch(cache, "aa");
+            touch(cache, "ee");
         }
 
         let statuses = batched.lookup_many(&mixed, "r", false);
@@ -1345,6 +1465,7 @@ mod tests {
         for cache in [&mut truncated, &mut whole] {
             cache.store(&stored, "r").unwrap();
             cache.commit(&stored, "r", true).unwrap();
+            touch_all(cache, &stored);
         }
 
         assert_eq!(
@@ -1380,6 +1501,7 @@ mod tests {
         let stored = keys(&["aa", "bb"]);
         cache.store(&stored, "writer").unwrap();
         cache.commit(&keys(&["aa"]), "writer", true).unwrap();
+        touch(&cache, "aa");
 
         let scan = keys(&["aa", "bb", "zz", "cc"]);
         assert_eq!(
@@ -1397,6 +1519,7 @@ mod tests {
         let stored = keys(&["aa", "bb", "cc"]);
         cache.store(&stored, "r1").unwrap();
         cache.commit(&stored, "r1", true).unwrap();
+        touch_all(&cache, &stored);
         assert_eq!(cache.lookup("aa", "r1"), Status::Hit);
         assert_eq!(cache.lookup("bb", "r1"), Status::Hit);
         assert_eq!(cache.lookup("cc", "r2"), Status::Hit);
@@ -1466,6 +1589,7 @@ mod tests {
         // Nothing was evicted or reserved: the caller keeps the cache it had.
         assert_eq!(cache.stats(), before);
         cache.assert_slot_accounting();
+        touch(&cache, &long[0]);
         assert_eq!(cache.lookup(&long[0], "r"), Status::Hit);
     }
 
@@ -1530,13 +1654,19 @@ mod tests {
                         // Commit most reservations at once so the mix spends more
                         // of its time on published chunks than on pending ones.
                         if random.below(4) != 0 {
-                            assert!(cache.commit(&reserved, &owner, random.below(4) != 0).is_ok());
+                            let success = random.below(4) != 0;
+                            assert!(cache.commit(&reserved, &owner, success).is_ok());
+                            if success {
+                                // A worker's DMA is what makes a chunk readable.
+                                touch_all(&cache, &reserved);
+                            }
                             reserved.clear();
                         }
                     }
                 }
                 1 => {
                     if cache.commit(&reserved, &owner, true).is_ok() {
+                        touch_all(&cache, &reserved);
                         reserved.clear();
                     }
                 }
@@ -1603,6 +1733,7 @@ mod tests {
         assert_eq!(cache.stats()["failed_commits"], 1);
         assert_eq!(cache.stats()["pending"], 1);
         cache.commit(&first, "a", true).unwrap();
+        touch(&cache, "aa");
         assert_eq!(cache.lookup("aa", "a"), Status::Hit);
         assert_eq!(cache.stats()["commits"], 1);
         cache.assert_slot_accounting();
@@ -1655,6 +1786,7 @@ mod tests {
         cache.store(&stored, "r").unwrap();
         cache.store(&keys(&["cc"]), "r").unwrap();
         cache.commit(&keys(&["aa"]), "r", true).unwrap();
+        touch(&cache, "aa");
         assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         // A lease and a pending reservation both keep the ordinary reset out.
         assert!(cache.reset(false).is_err());
@@ -1701,6 +1833,7 @@ mod tests {
         let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
         assert_eq!(evicted, keys(&["aa"]));
         cache.commit(&keys(&["cc"]), "r", true).unwrap();
+        touch(&cache, "cc");
         assert_eq!(cache.lookup("cc", "r"), Status::Hit);
         assert_eq!(cache.lookup("dd", "r"), Status::Miss);
         stats = cache.stats();
@@ -1727,6 +1860,7 @@ mod tests {
         let stored = keys(&["aa", "bb"]);
         cache.store(&stored, "r").unwrap();
         cache.commit(&stored, "r", true).unwrap();
+        touch_all(&cache, &stored);
         assert_eq!(cache.lookup("aa", "r"), Status::Hit);
         assert_eq!(
             cache.release(&keys(&["aa", "bb", "cc"]), "r"),

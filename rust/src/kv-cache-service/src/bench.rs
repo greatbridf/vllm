@@ -20,14 +20,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use memmap2::MmapMut;
 use serde_json::{Value, json};
 use vllm_kv_cache_service::cache::namespace_bytes;
 use vllm_kv_cache_service::protocol::{self, MAX_KEYS};
 
-use crate::{Limits, Registry, SHUTDOWN, accept_connections, invalid};
+use crate::{Limits, Registry, SHUTDOWN, accept_connections, invalid, lock_or_recover};
 
-/// Per-chunk worker bytes of a realistic service geometry; the benches never
-/// touch the mapping, so this only has to be shaped like a deployed one.
+/// Per-chunk worker bytes of a realistic service geometry, so the rows a case
+/// faults in are shaped like a deployed cache's.
 const WORKER_BYTES: usize = 64 * 1024;
 /// Chunks per namespace for every key of the population, so a case can populate
 /// its prefix and still leave the store path room to evict.
@@ -225,9 +226,8 @@ pub fn run(args: BenchArgs) -> io::Result<()> {
         .checked_mul(CHUNKS_PER_KEY)
         .ok_or_else(|| invalid("--keys is too large"))?;
     let worker_bytes = worker_bytes(args.conns, chunks, args.cache_bytes)?;
-    let service = Service::start(args.cache_bytes)?;
     let mut bench = Bench {
-        socket: service.socket.clone(),
+        service: Service::start(args.cache_bytes)?,
         keys: (0..args.keys).map(|index| hex_key('a', index)).collect(),
         conns: args.conns,
         iterations: args.iterations,
@@ -259,7 +259,6 @@ pub fn run(args: BenchArgs) -> io::Result<()> {
         }
     }
     drop(bench);
-    drop(service);
     for bound in &args.assert_max {
         let case = cases
             .iter()
@@ -302,6 +301,7 @@ struct Service {
     /// Removed after the listener is gone, in that order.
     _dir: PrivateDir,
     socket: PathBuf,
+    registry: Arc<Mutex<Registry>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -323,15 +323,34 @@ impl Service {
             max_connections: 128,
             idle_timeout: None,
         };
+        let accept = Arc::clone(&registry);
         let thread = thread::spawn(move || {
             // Only a listener failure ends the loop early, and the next client
             // call then reports it.
-            let _ = accept_connections(&listener, &registry, &limits, None);
+            let _ = accept_connections(&listener, &accept, &limits, None);
         });
         Ok(Service {
             _dir: dir,
             socket,
+            registry,
             thread: Some(thread),
+        })
+    }
+
+    /// The rows a case fills, taken from the namespace the service allocated. The
+    /// bench is the process that serves it too, so it writes through the cache's
+    /// own mapping instead of a worker's descriptor.
+    fn rows(&self, namespace: &str) -> io::Result<Rows> {
+        let registry = lock_or_recover(&self.registry, "registry");
+        let entry = registry
+            .namespaces
+            .get(namespace)
+            .ok_or_else(|| invalid(format!("the bench namespace {namespace} is not open")))?;
+        let cache = lock_or_recover(&entry.cache, "cache");
+        Ok(Rows {
+            mapping: Arc::clone(&cache.mapping),
+            row_bytes: cache.row_bytes,
+            page_size: cache.page_size,
         })
     }
 }
@@ -429,20 +448,47 @@ fn accepted(reply: &Value) -> io::Result<&Value> {
     }
 }
 
+/// The rows a case stored, written through the cache's mapping as a worker's DMA
+/// would: the service reports a chunk `pending` until its pages are in DRAM, so a
+/// case that measures lookups has to fill what it populated.
+struct Rows {
+    mapping: Arc<MmapMut>,
+    row_bytes: usize,
+    page_size: usize,
+}
+
+impl Rows {
+    /// Faults the rows of `slots` in, one page at a time, writing back the byte
+    /// each page already holds.
+    fn fill(&self, slots: &[usize]) {
+        for slot in slots {
+            let base = self.mapping.as_ptr() as usize + slot * self.row_bytes;
+            for offset in (0..self.row_bytes).step_by(self.page_size) {
+                // SAFETY: the row lies inside the sealed mapping.
+                unsafe {
+                    let page = std::ptr::with_exposed_provenance_mut::<u8>(base + offset);
+                    std::ptr::write_volatile(page, std::ptr::read_volatile(page));
+                }
+            }
+        }
+    }
+}
+
 /// One bench connection and the namespace it opened.
 struct Session {
     client: Client,
+    rows: Rows,
 }
 
 impl Session {
     fn open(
-        socket: &Path,
+        service: &Service,
         namespace: String,
         fingerprint: u64,
         worker_bytes: usize,
         chunks: usize,
     ) -> io::Result<Session> {
-        let mut client = Client::connect(socket)?;
+        let mut client = Client::connect(&service.socket)?;
         let reply = client.call(&json!({
             "op": "open",
             "version": 1,
@@ -453,7 +499,8 @@ impl Session {
             "num_chunks": chunks,
         }))?;
         accepted(&reply)?;
-        Ok(Session { client })
+        let rows = service.rows(&namespace)?;
+        Ok(Session { client, rows })
     }
 
     /// Publishes `keys`, so every case starts from a populated cache.
@@ -464,7 +511,17 @@ impl Session {
                 "keys": batch,
                 "request": POPULATE_REQUEST,
             }))?;
-            accepted(&stored)?;
+            let reserved = accepted(&stored)?["slots"]
+                .as_array()
+                .ok_or_else(|| invalid("store reply without slots"))?;
+            let slots: Vec<usize> = reserved
+                .iter()
+                .map(|slot| {
+                    slot.as_u64()
+                        .map(|slot| slot as usize)
+                        .ok_or_else(|| invalid("store reply with a non-numeric slot"))
+                })
+                .collect::<io::Result<_>>()?;
             let committed = self.client.call(&json!({
                 "op": "commit",
                 "keys": batch,
@@ -472,6 +529,7 @@ impl Session {
                 "success": true,
             }))?;
             accepted(&committed)?;
+            self.rows.fill(&slots);
         }
         Ok(())
     }
@@ -572,7 +630,7 @@ fn deferred_calls(request: String, fresh: &[String]) -> [Value; 2] {
 }
 
 struct Bench {
-    socket: PathBuf,
+    service: Service,
     keys: Vec<String>,
     conns: usize,
     iterations: u64,
@@ -591,7 +649,7 @@ impl Bench {
             self.opened += 1;
             let namespace = format!("bench-{case}-{index}-{}", self.opened);
             let mut session = Session::open(
-                &self.socket,
+                &self.service,
                 namespace,
                 self.opened,
                 self.worker_bytes,
@@ -611,7 +669,7 @@ impl Bench {
             accepted(&closed)?;
         }
         drop(sessions);
-        let mut probe = Client::connect(&self.socket)?;
+        let mut probe = Client::connect(&self.service.socket)?;
         let deadline = Instant::now() + RELEASE_TIMEOUT;
         loop {
             let response = probe.call(&json!({"op": "info"}))?;

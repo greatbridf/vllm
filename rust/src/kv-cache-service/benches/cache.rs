@@ -33,10 +33,26 @@ const KEY_BATCH: [usize; 3] = [1, 256, 4096];
 struct Fixture {
     cache: Cache,
     keys: Vec<String>,
+    /// Slot of every key, as the store that reserved it reported.
+    slots: Vec<usize>,
 }
 
 fn hex_key(prefix: char, index: usize) -> String {
     format!("{prefix}{index:063x}")
+}
+
+/// Writes one chunk's row through the mapping, as a worker's DMA does. A chunk
+/// whose pages are not in DRAM answers `pending` rather than a hit, so a case
+/// that leases chunks has to publish readable ones.
+fn fill_row(cache: &Cache, slot: usize) {
+    let base = cache.mapping.as_ptr() as usize + slot * cache.row_bytes;
+    for offset in (0..cache.row_bytes).step_by(cache.page_size) {
+        // SAFETY: the row lies inside the sealed mapping.
+        unsafe {
+            let page = std::ptr::with_exposed_provenance_mut::<u8>(base + offset);
+            std::ptr::write_volatile(page, std::ptr::read_volatile(page));
+        }
+    }
 }
 
 impl Fixture {
@@ -44,20 +60,25 @@ impl Fixture {
         let keys: Vec<String> = (0..n).map(|index| hex_key('a', index)).collect();
         let mut cache =
             Cache::new(1, WORKER_BYTES, 1, n, n * WORKER_BYTES).expect("fixture geometry is valid");
+        let mut slots = Vec::with_capacity(n);
         for batch in keys.chunks(FIXTURE_BATCH) {
-            cache.store(batch, FIXTURE_REQUEST).expect("room for every fixture key");
+            let (_, reserved, _) =
+                cache.store(batch, FIXTURE_REQUEST).expect("room for every fixture key");
             cache
                 .commit(batch, FIXTURE_REQUEST, true)
                 .expect("a fixture publishes its own reservations");
+            slots.extend(reserved);
         }
-        Fixture { cache, keys }
+        Fixture { cache, keys, slots }
     }
 }
 
 fn lookup_hit(c: &mut Criterion) {
     let mut group = c.benchmark_group("lookup_hit");
     for n in SIZES {
-        let Fixture { mut cache, keys } = Fixture::new(n);
+        let Fixture {
+            mut cache, keys, ..
+        } = Fixture::new(n);
         let mut cursor = 0;
         group.bench_function(BenchmarkId::from_parameter(n), |b| {
             b.iter(|| {
@@ -85,7 +106,9 @@ fn touch_least_recent(c: &mut Criterion) {
                     // Rebuilt per iteration so the touched key really is the least
                     // recently used one, which is the cost an order maintained by
                     // shifting the whole map pays in full.
-                    let Fixture { mut cache, keys } = Fixture::new(n);
+                    let Fixture {
+                        mut cache, keys, ..
+                    } = Fixture::new(n);
                     let key = std::slice::from_ref(&keys[0]);
                     let start = Instant::now();
                     cache.touch(black_box(key));
@@ -134,11 +157,16 @@ fn release_request(c: &mut Criterion) {
                 b.iter_custom(|iterations| {
                     let mut elapsed = Duration::ZERO;
                     for _ in 0..iterations {
-                        let Fixture { mut cache, keys } = Fixture::new(n);
-                        let leased: Vec<&String> =
-                            keys.iter().step_by((n / leases).max(1)).take(leases).collect();
-                        for key in &leased {
-                            cache.lookup(key, LEASE_REQUEST);
+                        let Fixture {
+                            mut cache,
+                            keys,
+                            slots,
+                        } = Fixture::new(n);
+                        let step = (n / leases).max(1);
+                        for index in (0..leases).map(|lease| lease * step) {
+                            // A lease needs a chunk a worker wrote.
+                            fill_row(&cache, slots[index]);
+                            cache.lookup(&keys[index], LEASE_REQUEST);
                         }
                         let start = Instant::now();
                         black_box(cache.release_request(LEASE_REQUEST));

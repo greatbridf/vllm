@@ -228,6 +228,94 @@ fn attach_worker(service: &Service, namespace: &str, rank: usize) -> Client {
     worker
 }
 
+fn page_size() -> usize {
+    // SAFETY: sysconf takes no pointer arguments.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(page > 0, "cannot determine the page size");
+    page as usize
+}
+
+/// A test-owned writable mapping of a namespace, taken through an attached worker.
+///
+/// A chunk is only readable once a worker wrote its row, so a test that expects a
+/// `hit` faults the row in through this mapping first. The session keeps the
+/// namespace alive for as long as the mapping does: a worker's departure retires
+/// it.
+struct WorkerMapping {
+    /// The session the descriptor arrived on.
+    worker: Client,
+    base: *mut u8,
+    size: usize,
+    page_size: usize,
+}
+
+impl WorkerMapping {
+    fn attach(service: &Service, namespace: &str, rank: usize) -> WorkerMapping {
+        let mut worker = service.connect();
+        assert_eq!(attach(&mut worker, namespace, rank)["ok"], true);
+        let descriptors = receive_descriptor(&worker.stream);
+        assert_eq!(descriptors.len(), 1, "attach must send one descriptor");
+        let fd = descriptors[0];
+        let size = file_size(fd);
+        // SAFETY: fd is the sealed mapping the service handed this process, and
+        // `Drop` unmaps exactly this range.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "cannot map the service mapping");
+        // SAFETY: the descriptor is owned by this test and the mapping holds it.
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        WorkerMapping {
+            worker,
+            base: base.cast::<u8>(),
+            size,
+            page_size: page_size(),
+        }
+    }
+
+    /// Attaches at `rank` and faults every page in, for a test that only needs
+    /// the chunks of the namespace to be readable.
+    fn faulted(service: &Service, namespace: &str, rank: usize) -> WorkerMapping {
+        let mapping = WorkerMapping::attach(service, namespace, rank);
+        mapping.touch(0, mapping.size);
+        mapping
+    }
+
+    /// Faults the bytes in as a worker's DMA does, one page at a time, writing
+    /// back the byte each page already holds.
+    fn touch(&self, offset: usize, len: usize) {
+        for position in (offset..offset + len).step_by(self.page_size) {
+            // SAFETY: the page lies inside this mapping.
+            unsafe {
+                let page = self.base.add(position);
+                std::ptr::write_volatile(page, std::ptr::read_volatile(page));
+            }
+        }
+    }
+}
+
+impl Drop for WorkerMapping {
+    fn drop(&mut self) {
+        // SAFETY: base and size are the mapping this struct created.
+        assert_eq!(unsafe { libc::munmap(self.base.cast(), self.size) }, 0);
+    }
+}
+
+/// Size of the sealed mapping behind `fd`.
+fn file_size(fd: RawFd) -> usize {
+    // SAFETY: status is a live buffer of the size fstat writes.
+    let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(fd, &mut status) }, 0, "fstat failed");
+    status.st_size as usize
+}
+
 fn info(probe: &mut Client) -> Value {
     probe.call(json!({"op": "info"}))
 }
@@ -404,6 +492,7 @@ fn lookup_many_reports_one_status_per_key_and_leases_the_hits() {
         client.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
         true
     );
+    let _mapping = WorkerMapping::faulted(&service, "engine-batch", 0);
 
     let reply = client.call(json!({
         "op": "lookup_many",
@@ -460,6 +549,7 @@ fn until_miss_scan_ends_at_the_miss_and_leases_nothing_past_it() {
         "success": true,
     }));
     assert_eq!(committed["ok"], true);
+    let _mapping = WorkerMapping::faulted(&service, "engine-prefix", 0);
 
     // `dd` is missing, so the scan stops there and `cc` is never looked up.
     let reply = client.call(json!({
@@ -482,6 +572,55 @@ fn until_miss_scan_ends_at_the_miss_and_leases_nothing_past_it() {
     assert_eq!(stats["hits"], 1);
     assert_eq!(stats["misses"], 1);
     assert_eq!(stats["leased"], 1);
+}
+
+#[test]
+fn prefetch_asks_for_a_whole_row_before_the_load_that_reads_it() {
+    let service = Service::start();
+    let mut scheduler = service.connect();
+    let opened = open_with(&mut scheduler, "engine-prefetch", &"a".repeat(64), 4);
+    assert_eq!(opened["ok"], true);
+    let row_bytes = opened["row_bytes"].as_u64().expect("geometry reports row_bytes") as usize;
+
+    // `aa` is committed but no worker has written its row yet, so it is not
+    // readable, while `bb` is still only reserved.
+    let stored = scheduler.call(json!({"op": "store", "keys": ["aa", "bb"], "request": "a"}));
+    assert_eq!(stored["ok"], true);
+    let slot = stored["slots"][0].as_u64().expect("store reports the slot") as usize;
+    assert_eq!(
+        scheduler.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
+        true
+    );
+    assert_eq!(
+        scheduler.call(json!({"op": "lookup", "key": "aa", "request": "a"}))["status"],
+        "pending"
+    );
+
+    let mapping = WorkerMapping::attach(&service, "engine-prefetch", 0);
+    let prefetched = scheduler.call(json!({"op": "prefetch", "keys": ["aa"]}));
+    assert_eq!(prefetched["ok"], true);
+    assert_eq!(prefetched["pages"], json!(row_bytes / mapping.page_size));
+
+    // The reply does not wait for the readahead, so let it finish and then take
+    // the fault a worker's DMA would have taken before the chunk was read.
+    thread::sleep(Duration::from_millis(50));
+    mapping.touch(slot * row_bytes, row_bytes);
+    assert_eq!(
+        scheduler.call(json!({"op": "lookup", "key": "aa", "request": "a"}))["status"],
+        "hit"
+    );
+
+    // A key the cache does not hold and one it has only reserved are both
+    // refused, and a rejection leaves the session that sent it alive.
+    for (key, error) in [
+        ("cc", "prefetch requires a stored chunk"),
+        ("bb", "prefetch requires a committed chunk"),
+    ] {
+        let rejected = scheduler.call(json!({"op": "prefetch", "keys": [key]}));
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"], error);
+    }
+    assert_eq!(scheduler.call(json!({"op": "stats"}))["ok"], true);
 }
 
 #[test]
@@ -513,6 +652,7 @@ fn store_from_one_request_cannot_be_published_by_another() {
         "success": true,
     }));
     assert_eq!(committed["ok"], true);
+    let _mapping = WorkerMapping::faulted(&service, "engine-owner", 0);
     let hit = client.call(json!({"op": "lookup", "key": "aa", "request": "a"}));
     assert_eq!(hit["status"], "hit");
 
@@ -537,6 +677,7 @@ fn forced_reset_discards_leases_and_pending_reservations() {
         client.call(json!({"op": "commit", "keys": ["aa"], "request": "a", "success": true}))["ok"],
         true
     );
+    let _mapping = WorkerMapping::faulted(&service, "engine-reset", 0);
     let hit = client.call(json!({"op": "lookup", "key": "aa", "request": "a"}));
     assert_eq!(hit["status"], "hit");
 
@@ -769,15 +910,17 @@ fn owner_reconnect_adopts_the_namespace_and_keeps_entries() {
     let reopened = open(&mut adopted, "engine-adopt");
     assert_eq!(reopened["ok"], true);
     assert_eq!(reopened["total_bytes"], opened["total_bytes"]);
-    // Adopted, not recreated: the published entry and its counters survive.
-    assert_eq!(
-        adopted.call(json!({"op": "lookup", "key": "aa", "request": "b"}))["status"],
-        "hit"
-    );
     let stats = adopted.call(json!({"op": "stats"}));
     assert_eq!(stats["stats"]["entries"], 1);
     assert_eq!(stats["sessions"].as_u64(), Some(1));
     assert_eq!(stats["detached"], false);
+    // Adopted, not recreated: the published entry survives the handshake and is
+    // readable once a worker writes its row.
+    let _mapping = WorkerMapping::faulted(&service, "engine-adopt", 0);
+    assert_eq!(
+        adopted.call(json!({"op": "lookup", "key": "aa", "request": "b"}))["status"],
+        "hit"
+    );
     // The adopting session owns the mapping, so it can still mutate it.
     assert_eq!(
         adopted.call(json!({"op": "store", "keys": ["bb"], "request": "c"}))["ok"],
@@ -999,7 +1142,7 @@ fn adoption_keeps_the_mapping_an_attached_worker_holds() {
     let service = Service::start();
     let mut owner = service.connect();
     assert_eq!(open(&mut owner, "engine-adopt-worker")["ok"], true);
-    let mut worker = attach_worker(&service, "engine-adopt-worker", 0);
+    let mut worker = WorkerMapping::faulted(&service, "engine-adopt-worker", 0);
     assert_eq!(
         owner.call(json!({"op": "store", "keys": ["aa"], "request": "a"}))["ok"],
         true
@@ -1019,7 +1162,7 @@ fn adoption_keeps_the_mapping_an_attached_worker_holds() {
 
     // The worker keeps the session and the mapping it already had, and the
     // adopted owner serves the entry the previous owner published.
-    let stats = worker.call(json!({"op": "stats"}));
+    let stats = worker.worker.call(json!({"op": "stats"}));
     assert_eq!(stats["ok"], true);
     assert_eq!(stats["sessions"].as_u64(), Some(2));
     assert_eq!(stats["detached"], false);

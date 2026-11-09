@@ -218,6 +218,7 @@ sent only once the burst is collected.
 | `lookup` | `key`, `request` | scheduler | `status` |
 | `lookup_many` | `keys`, `request`, `until_miss` (default `false`) | scheduler | `statuses`, one per key, ending at the first `miss` when `until_miss` is set |
 | `load` | `keys`, `request`, `prefetch` (default `true`) | scheduler | `slots`, one per key, and `prefetched`, the pages the kernel was asked to read ahead |
+| `prefetch` | `keys` | scheduler | `pages` the kernel was asked to read ahead |
 | `release` | `keys`, `request` | scheduler | `released`, `unknown` |
 | `release_request` | `request` | scheduler | `released`, `unknown` |
 | `store` | `keys`, `request` | scheduler | `keys`, `slots`, `evicted`, or `full` |
@@ -234,6 +235,16 @@ thread so the reply is never delayed. A swap-in is submitted per fault and the
 faulting task then blocks on the folio, so a task that faults page after page
 keeps exactly one request in flight; the prefetch is what lets the kernel overlap
 the remote round trips (measured: `read_peak_inflight` 1 before, 8 after).
+
+`prefetch` asks for that readahead earlier: it resolves the committed chunks
+`keys` name and hands every whole row to the kernel on a thread of its own, so a
+client can start the remote reads at the end of one schedule step instead of
+inside the load of the next. It takes no lease, so it pins nothing: a `store` in
+between may still evict one of its keys, and the readahead of a slot that has
+since been recycled reads bytes nobody needs. It rejects a key that is missing or
+not committed, which is what makes the keys a lookup answered `pending` for safe
+to send. The reply counts the pages that were advised, not the pages the kernel
+fetched, exactly as `load`'s `prefetched` does.
 
 `spill` asks the kernel to write committed chunks out through the swap path
 without waiting for memory pressure: it faults each page of the chunk into this
@@ -281,7 +292,7 @@ A `stats` reply, one counter set per namespace, plus the sessions using it and
 whether its owner left it adoptable:
 
 ```json
-{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "free_chunks": 2, "requests": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}, "sessions": 2, "detached": false}
+{"ok": true, "stats": {"entries": 0, "pending": 0, "leased": 0, "resident": 0, "remote": 0, "free_chunks": 2, "requests": 0, "bytes": 32768, "num_chunks": 2, "hits": 0, "misses": 0, "pending_hits": 0, "evictions": 0, "stores": 0, "commits": 0, "aborted": 0, "failed_commits": 0, "reclaimed": 0}, "sessions": 2, "detached": false}
 ```
 
 An `info` reply, which an operator or a probe can read before any engine opened a
@@ -309,6 +320,13 @@ scheduler receives completion from all workers.
 Lookup acquires a request lease before reporting a hit, so a later allocation
 cannot evict the load source. Request leases are released after finish and all
 pending transfers. Active leases and pending stores cannot be reset or evicted.
+
+A hit also means readable now. A committed chunk whose row is not entirely in
+DRAM answers `pending` instead of `hit`, because reading it would take a fault
+per page, and that answer takes no lease: a lease on a chunk that cannot be read
+yet is what would stop a later allocation from replacing it with a chunk that can.
+The check is one `mincore(2)` over the chunk's row, so `pending` covers both
+"reserved and not published" and "published but not resident".
 
 `lookup` reports the status of one key. `lookup_many` reports the same for a
 batch of up to 4096 keys, as `{"ok": true, "statuses": [...]}` with one status
@@ -346,10 +364,14 @@ eviction order until the engine stops.
 a lease) plus counters that are monotonic since the namespace opened and survive
 `reset`: `hits`, `misses`, `pending_hits`, `evictions`, `stores`, `commits`,
 `aborted`, `reclaimed` in keys, and the rejected or failed `commit` calls in
-`failed_commits`. Beside that object it reports the `sessions` using the
+`failed_commits`. Where the kernel holds the entries is reported beside them:
+`resident` counts the chunks whose whole row is in DRAM and `remote` the rest
+(`entries - resident`), so an operator can see how much of the cache a memory
+limit has moved out. Beside that object it reports the `sessions` using the
 namespace and whether its owner left it `detached`. A leaked lease or reservation
-shows up there instead of only as a stalled cache. `stats` reads no slot beyond
-the reservation and lease flags it counts.
+shows up there instead of only as a stalled cache. `stats` probes the residency of
+every entry, so it costs one `mincore(2)` over each row on top of the metadata it
+counts.
 
 `info` needs no handshake and reports the service rather than one namespace:
 `version`, `pid`, `uptime_ms`, `capacity_bytes`, `used_bytes` (live plus retired
@@ -514,7 +536,8 @@ stalls:
 | `leased`, `requests` | Chunks with a live request lease, and the requests holding them. A leased chunk cannot be evicted, and no lease has a timeout, so a value that does not fall to 0 once the engine is idle is a lease the engine never released. |
 | `pending` | Chunks reserved by a `store` and not committed. Sustained non-zero means a worker reserved slots and never committed them; `--pending-timeout-secs` reclaims them and logs `reservations_reclaimed`. |
 | `free_chunks` | Chunks no key holds. At 0 with `pending` at 0, a `store` can only evict. |
-| `hits`, `misses`, `pending_hits` | Lookup outcomes since `open`, unchanged across `reset`. |
+| `resident`, `remote` | Chunks whose whole row is in DRAM, and the entries whose pages the kernel no longer holds. A `remote` above 0 is a cache a memory limit or a remote tier has pushed out, where a lookup of those keys answers `pending` until they are resident again. |
+| `hits`, `misses`, `pending_hits` | Lookup outcomes since `open`, unchanged across `reset`. `pending_hits` counts the answers that were `pending`, both from a reservation and from a row that was not resident. |
 | `evictions`, `stores`, `commits`, `aborted` | Chunks evicted, reserved, published, and released without publishing. |
 | `failed_commits`, `reclaimed` | Commits rejected (ownership, missing reservation, failed publish) and keys reclaimed by the pending timeout. |
 | `sessions`, `detached` | Sessions using the namespace, and whether an owner left it adoptable. `detached` with `sessions` above 0 is a scheduler that is gone while its workers still hold the mapping; `--namespace-grace-secs` is what frees it. |
@@ -657,37 +680,49 @@ Cache metadata (`cargo bench`):
 
 | bench | shape | cost |
 | --- | --- | --- |
-| `lookup_hit` | 2^11 / 2^13 / 2^15 entries | 38 / 39 / 46 ns |
-| `touch_least_recent` | same, promoted entry at the LRU tail | 83 / 81 / 126 ns |
-| `store_evict` | 2^13 entries, 1 / 16 / 64 victims | 360 ns / 3.9 µs / 13.3 µs |
-| `store_evict` | 2^15 entries, 1 / 16 / 64 victims | 460 ns / 4.0 µs / 14.4 µs |
-| `release_request` | 2^13 entries, 1 / 64 leases | 80 ns / 163 ns |
-| `release_request` | 2^15 entries, 1 / 64 leases | 83 ns / 318 ns |
-| `check_keys` | 1 / 256 / 4096 keys | 20 ns / 10.3 µs / 179 µs |
+| `lookup_hit` | 2^11 / 2^13 / 2^15 entries, rows not faulted in | 209 / 226 / 234 ns |
+| `touch_least_recent` | same, promoted entry at the LRU tail | 85 / 86 / 113 ns |
+| `store_evict` | 2^13 entries, 1 / 16 / 64 victims | 414 ns / 3.95 µs / 13.9 µs |
+| `store_evict` | 2^15 entries, 1 / 16 / 64 victims | 428 ns / 4.36 µs / 14.5 µs |
+| `release_request` | 2^13 entries, 1 / 64 leases | 64 ns / 266 ns |
+| `release_request` | 2^15 entries, 1 / 64 leases | 66 ns / 378 ns |
+| `check_keys` | 1 / 256 / 4096 keys | 20 ns / 10.7 µs / 183 µs |
 
 Promotion, victim selection, and lease release are flat in the entry count: a
-2^15-entry cache evicts 64 keys in 14.4 µs. Only `check_keys` grows with its
-batch, at 44 ns per key of duplicate detection. The groups that rebuild their
+2^15-entry cache evicts 64 keys in 14.5 µs. Only `check_keys` grows with its
+batch, at 45 ns per key of duplicate detection. The groups that rebuild their
 fixture per iteration (`touch_least_recent`, `store_evict`, `release_request`)
 promote or evict the true LRU tail; at 2^15 entries that setup dominates each
 iteration, so criterion reports the fewer samples it warns about.
+
+`lookup_hit` is the residency check: the fixture's pages are never faulted in,
+which is what a cache at a memory limit looks like, so the case measures the
+`mincore(2)` over the chunk's row plus the metadata walk that answer `pending`.
+That is 170-190 ns of the 209-234 ns, against 38-46 ns before the check existed;
+a resident hit adds one lease and one promotion, which `touch_least_recent`
+measures. The probe grows with the row: 64 KiB rows here, 4096 pages for a
+16 MiB DeepSeek row.
 
 Control plane (`bench` subcommand, 4096 keys, 1 connection):
 
 | case | p50 | p99 | per op |
 | --- | --- | --- | --- |
-| `rpc_serial_lookup` | 26.9 µs | 31.5 µs | 27.1 µs |
-| `rpc_pipelined_lookup` | 0.63 µs | 0.79 µs | 0.67 µs |
-| `rpc_lookup_many` | 888 µs | 962 µs | 891 µs (0.22 µs per key) |
-| `mixed_schedule_step` | 74 µs | 897 µs | 338 µs |
-| `deferred_flush` | 43 µs | 82 µs | 39 µs |
-| `stats` | 34 µs | 44 µs | 34 µs |
+| `rpc_serial_lookup` | 27.7 µs | 30.9 µs | 27.9 µs |
+| `rpc_pipelined_lookup` | 0.71 µs | 9.5 µs | 1.30 µs |
+| `rpc_lookup_many` | 1656 µs | 2026 µs | 1706 µs (0.42 µs per key) |
+| `mixed_schedule_step` | 74.3 µs | 1685 µs | 494 µs |
+| `deferred_flush` | 42.9 µs | 86.5 µs | 39.9 µs |
+| `stats` | 750 µs | 828 µs | 755 µs |
 
-One lookup round trip costs 27 µs, so a per-chunk lookup costs the scheduler
-27 µs per chunk of the prefix. Pipelining the same lookups costs 0.67 µs per op,
-and one 4096-key `lookup_many` covers a 64 k-token prefix in 0.9 ms. Pipelined
-ops are charged the time since the previous reply, so the first op of a window
-also pays for the window to drain.
+One lookup round trip costs 28 µs, so a per-chunk lookup costs the scheduler
+28 µs per chunk of the prefix. Pipelining the same lookups costs 0.7 µs per op
+in the median and about 1.3 µs on average, because the residency probe is a
+syscall per chunk and no longer amortizes: a 4096-key `lookup_many` covers a
+64 k-token prefix in 1.7 ms, against 0.9 ms before the probe (0.42 µs per key).
+`stats` pays the same probe per entry, 750 µs for 8192 entries against 34 µs, so
+it is one collection per interval and never a per-lookup cost. Pipelined ops are
+charged the time since the previous reply, so the first op of a window also pays
+for the window to drain.
 
 `mixed_schedule_step` is a synthetic schedule step of `--requests` requests: each
 one scans the prefix, loads its hits, and stores one 64-chunk batch, then the
@@ -701,17 +736,18 @@ than in the reader's head:
 
 | requests per step | round trips, one call at a time | round trips, one burst | step cost, one at a time | step cost, burst |
 | --- | --- | --- | --- | --- |
-| 1 | 5 | 4 | 1.74 ms | 1.73 ms |
-| 8 | 40 | 25 | 14.4 ms | 13.9 ms |
-| 32 | 160 | 97 | 58.6 ms | 56.6 ms |
+| 1 | 5 | 4 | 2.52 ms | 2.52 ms |
+| 8 | 40 | 25 | 20.5 ms | 20.1 ms |
+| 32 | 160 | 97 | 84.5 ms | 82.6 ms |
 
 The two columns are the same binary on the same cache, so only the wire shape
 differs, and a step cost is `us_per_op` times the ops of one step. The deferrable
-tail is about 35 % cheaper (`deferred_flush`: 1.12 ms → 0.74 ms for 8 requests,
-4.5 ms → 2.85 ms for 32), but a step that also scans a 4096-key prefix is
-scan-bound, so the whole step only moves about 3 %. What falls everywhere is the
-round trips, by `2N - 1` per step: one write and one read per step instead of two
-more round trips per request. Per-round-trip cost on this host drifts by up to
+tail is about 35 % cheaper (`deferred_flush`: 1.19 ms → 0.73 ms for 8 requests,
+4.63 ms → 2.89 ms for 32), but a step that also scans a 4096-key prefix is
+scan-bound, so the whole step only moves about 2 %, and the residency probe the
+scan now makes moved both columns up by about 45 %. What falls everywhere is
+the round trips, by `2N - 1` per step: one write and one read per step instead of
+two more round trips per request. Per-round-trip cost on this host drifts by up to
 2x between runs, so compare the columns of one table instead of two tables.
 
 ```bash

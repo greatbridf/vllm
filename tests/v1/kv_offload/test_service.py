@@ -113,6 +113,19 @@ def _attach(spec):
     )
 
 
+def _fault_in(spec):
+    """Writes every row through a worker's mapping, as the workers' DMA does.
+
+    The service reports a committed chunk `pending` until its pages are in DRAM,
+    so a test that expects `HIT` has to fill what it published first. The region
+    holds the worker session, and with it the namespace, so keep it alive for the
+    rest of the test.
+    """
+    region = _attach(spec)
+    region.base_tensor.fill_(0)
+    return region
+
+
 def test_rust_service_shares_rank_slices_and_publishes_only_completed_stores(service):
     spec = _spec(service)
     manager = spec.get_manager()
@@ -152,7 +165,8 @@ def test_rust_service_shares_rank_slices_and_publishes_only_completed_stores(ser
 
 
 def test_store_commit_round_trip_publishes_the_leased_slot(service):
-    manager = _spec(service).get_manager()
+    spec = _spec(service)
+    manager = spec.get_manager()
     request = ReqContext("first")
     try:
         key = OffloadKey(b"round-trip")
@@ -161,6 +175,8 @@ def test_store_commit_round_trip_publishes_the_leased_slot(service):
         assert manager.lookup(key, request) is LookupResult.HIT_PENDING
         manager.complete_store([key], request)
         manager.on_schedule_end(SCHEDULE_END)
+        # Published, and readable once a worker wrote its row.
+        region = _fault_in(spec)
         assert manager.lookup(key, request) is LookupResult.HIT
         load = manager.prepare_load([key], request)
         assert load.block_ids == output.store_spec.block_ids
@@ -170,8 +186,11 @@ def test_store_commit_round_trip_publishes_the_leased_slot(service):
         assert stats["pending"] == 0
         assert stats["pending_hits"] == 1
         assert stats["leased"] == 1
+        assert stats["resident"] == 1
+        assert stats["remote"] == 0
         manager.on_request_finished(request)
         manager.complete_load([key], request)
+        region.cleanup()
     finally:
         manager.shutdown()
 
@@ -193,13 +212,15 @@ def test_commit_from_a_request_that_did_not_reserve_is_rejected(service):
 
 
 def test_lookup_lease_prevents_eviction_and_failed_store_is_removed(service):
-    manager = _spec(service).get_manager()
+    spec = _spec(service)
+    manager = spec.get_manager()
     request = ReqContext("first")
     try:
         keys = [OffloadKey(b"aa"), OffloadKey(b"bb")]
         assert manager.prepare_store(keys, request) is not None
         manager.complete_store(keys, request)
         manager.on_schedule_end(SCHEDULE_END)
+        region = _fault_in(spec)
         assert manager.lookup(keys[0], request) is LookupResult.HIT
         third = OffloadKey(b"cc")
         output = manager.prepare_store([third], request)
@@ -210,13 +231,15 @@ def test_lookup_lease_prevents_eviction_and_failed_store_is_removed(service):
         manager.on_request_finished(request)
         manager.reset_cache()
         manager.on_reset_flushed()
+        region.cleanup()
     finally:
         manager.shutdown()
 
 
 def test_lookup_many_costs_one_rpc_and_leases_the_hits(service, monkeypatch):
     """A batched scan replaces one lookup RPC per chunk with one per batch."""
-    manager = _wide_spec(service, num_chunks=64).get_manager()
+    spec = _wide_spec(service, num_chunks=64)
+    manager = spec.get_manager()
     request = ReqContext("first")
     ops: list[str] = []
     call = manager.client.call
@@ -233,6 +256,7 @@ def test_lookup_many_costs_one_rpc_and_leases_the_hits(service, monkeypatch):
         manager.complete_store(keys, request)
         # The step's burst publishes the keys, and the scan reads them back.
         manager.on_schedule_end(SCHEDULE_END)
+        region = _fault_in(spec)
 
         ops.clear()
         assert manager.lookup_many(keys, request) == [LookupResult.HIT] * len(keys)
@@ -251,13 +275,15 @@ def test_lookup_many_costs_one_rpc_and_leases_the_hits(service, monkeypatch):
         ]
         manager.on_request_finished(request)
         manager.complete_load(keys, request)
+        region.cleanup()
     finally:
         manager.shutdown()
 
 
 def test_until_miss_scan_leases_only_the_prefix_it_consumed(service):
     """A prefix scan must not pin the hits behind the miss that ends it."""
-    manager = _wide_spec(service, num_chunks=8).get_manager()
+    spec = _wide_spec(service, num_chunks=8)
+    manager = spec.get_manager()
     request = ReqContext("prefix")
     try:
         keys = [OffloadKey(index.to_bytes(4, "big")) for index in range(8)]
@@ -265,6 +291,7 @@ def test_until_miss_scan_leases_only_the_prefix_it_consumed(service):
         assert output is not None
         manager.complete_store(keys, request)
         manager.on_schedule_end(SCHEDULE_END)
+        region = _fault_in(spec)
         # Key 4 is absent and key 7 is present, so a full scan would lease it.
         scan = keys[:4] + [OffloadKey(b"absent")] + keys[5:]
 
@@ -284,6 +311,7 @@ def test_until_miss_scan_leases_only_the_prefix_it_consumed(service):
         manager.on_request_finished(request)
         manager.reset_cache()
         manager.on_reset_flushed()
+        region.cleanup()
     finally:
         manager.shutdown()
 
@@ -417,7 +445,8 @@ def test_client_connect_error_names_the_socket_path(tmp_path, monkeypatch):
 
 def test_manager_reconnects_and_adopts_the_namespace_it_opened(service):
     """A lost scheduler socket costs a reconnect, not the engine's cache."""
-    manager = _spec(service).get_manager()
+    spec = _spec(service)
+    manager = spec.get_manager()
     request = ReqContext("first")
     key = OffloadKey(b"adopted")
     probe = CacheServiceClient(service)
@@ -425,6 +454,7 @@ def test_manager_reconnects_and_adopts_the_namespace_it_opened(service):
         assert manager.prepare_store([key], request) is not None
         manager.complete_store([key], request)
         manager.on_schedule_end(SCHEDULE_END)
+        region = _fault_in(spec)
         assert manager.lookup(key, request) is LookupResult.HIT
 
         # The scheduler's connection dies; the service keeps the namespace.
@@ -439,6 +469,7 @@ def test_manager_reconnects_and_adopts_the_namespace_it_opened(service):
         assert manager.lookup(key, ReqContext("second")) is LookupResult.HIT
         assert probe.call("info")["detached"] == 0
         assert manager.client.call("stats")["stats"]["entries"] == 1
+        region.cleanup()
     finally:
         probe.close()
         manager.shutdown()
@@ -502,11 +533,15 @@ def test_deferred_commit_publishes_before_the_next_observation(service):
     Deferring the commit to `on_schedule_end` batches a step's completions into
     one round trip, but it must never change what a later call sees.
     """
-    manager = _spec(service).get_manager()
+    spec = _spec(service)
+    manager = spec.get_manager()
     request = ReqContext("first")
     try:
         key = OffloadKey(b"deferred")
         assert manager.prepare_store([key], request) is not None
+        # A worker writes the row before the commit is queued, so only a commit
+        # that has not been flushed can still make the lookup report pending.
+        region = _fault_in(spec)
         manager.complete_store([key], request)
 
         # The commit is queued, and this lookup publishes it first.
@@ -514,13 +549,15 @@ def test_deferred_commit_publishes_before_the_next_observation(service):
         manager.on_schedule_end(SCHEDULE_END)
         assert manager.lookup(key, ReqContext("third")) is LookupResult.HIT
         assert manager.client.call("stats")["stats"]["commits"] == 1
+        region.cleanup()
     finally:
         manager.shutdown()
 
 
 def test_a_step_of_completions_costs_one_burst(service, monkeypatch):
     """A step's deferrable calls are one round trip, and its lease is released."""
-    manager = _wide_spec(service, num_chunks=8).get_manager()
+    spec = _wide_spec(service, num_chunks=8)
+    manager = spec.get_manager()
     earlier = ReqContext("earlier")
     stored = OffloadKey(b"published")
     bursts: list[list[str]] = []
@@ -539,6 +576,7 @@ def test_a_step_of_completions_costs_one_burst(service, monkeypatch):
         assert manager.prepare_store([stored], earlier) is not None
         manager.complete_store([stored], earlier)
         manager.on_schedule_end(SCHEDULE_END)
+        region = _fault_in(spec)
 
         monkeypatch.setattr(manager.client, "call", counting_call)
         monkeypatch.setattr(manager.client, "pipeline", counting_pipeline)
@@ -560,5 +598,6 @@ def test_a_step_of_completions_costs_one_burst(service, monkeypatch):
         assert bursts == [["commit", "release_request"]]
         assert singles == ["lookup", "store"]
         assert manager.client.call("stats")["stats"]["leased"] == 0
+        region.cleanup()
     finally:
         manager.shutdown()

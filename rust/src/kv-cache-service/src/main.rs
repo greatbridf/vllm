@@ -366,22 +366,21 @@ fn handle(
                     check_keys(&keys).map_err(reject)?;
                     check_request(&request).map_err(reject)?;
                     let slots = cache.load(&keys, &request).map_err(reject)?;
-                    // Prefetching must not delay this reply: at a memory limit
-                    // the readahead itself reclaims, which takes longer than a
-                    // client waits. The mapping is shared, so the work runs on
-                    // its own thread with the cache lock released.
+                    let pages = slots.len() * cache.row_bytes / cache.page_size;
                     let prefetched = if prefetch {
-                        let (mapping, row_bytes, page_size) = cache.prefetch_parts();
-                        let pages = slots.len() * row_bytes / page_size;
-                        let wanted = slots.clone();
-                        std::thread::spawn(move || {
-                            let _ = prefetch_rows(&mapping, row_bytes, page_size, &wanted);
-                        });
+                        prefetch_detached(&cache, slots.clone());
                         pages
                     } else {
                         0
                     };
                     json!({"ok": true, "slots": slots, "prefetched": prefetched})
+                }
+                Request::Prefetch { keys } => {
+                    check_keys(&keys).map_err(reject)?;
+                    let slots = cache.committed_slots(&keys).map_err(reject)?;
+                    let pages = slots.len() * cache.row_bytes / cache.page_size;
+                    prefetch_detached(&cache, slots);
+                    json!({"ok": true, "pages": pages})
                 }
                 Request::Release { keys, request } => {
                     check_keys(&keys).map_err(reject)?;
@@ -457,6 +456,18 @@ fn handle(
 
 fn released_reply(released: Released) -> Value {
     json!({"ok": true, "released": released.leases, "unknown": released.unknown})
+}
+
+/// Asks the kernel to read `slots` back in, on a thread of its own.
+///
+/// The readahead must not delay a reply: at a memory limit the readahead itself
+/// reclaims, which takes longer than a client waits. The mapping is shared, so
+/// the work runs with the cache lock released.
+fn prefetch_detached(cache: &Cache, slots: Vec<usize>) {
+    let (mapping, row_bytes, page_size) = cache.prefetch_parts();
+    std::thread::spawn(move || {
+        let _ = prefetch_rows(&mapping, row_bytes, page_size, &slots);
+    });
 }
 
 /// Frees pending reservations that outlived `--pending-timeout-secs` before a

@@ -78,8 +78,12 @@ that pins it:
   (`failed_publish_keeps_entry_pending_and_returns_error`).
 - **Lease before hit.** `lookup` and `lookup_many` take the lease before
   reporting a hit, and `load` refuses a key this request does not lease
-  (`lookup_lease_prevents_eviction_before_load`). A lease is released only when
-  the request finished and every job it issued completed
+  (`lookup_lease_prevents_eviction_before_load`). A hit also means readable now:
+  a committed chunk whose row is not entirely in DRAM answers `pending` and
+  takes no lease, which is what the connector defers on
+  (`a_committed_chunk_is_pending_until_its_pages_are_in_dram`,
+  `prefetch_asks_for_a_whole_row_before_the_load_that_reads_it`). A lease is
+  released only when the request finished and every job it issued completed
   (`test_lookup_lease_released_only_after_finish_and_all_jobs`). A prefix scan
   sets `until_miss`, so `lookup_many` leases exactly the hits it consumed: its
   reply ends at the first `miss`, and a chunk behind that gap is never leased

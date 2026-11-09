@@ -64,6 +64,11 @@ pub enum Request {
         #[serde(default = "enabled")]
         prefetch: bool,
     },
+    /// Ask the kernel to read committed chunks back in before a `load` needs
+    /// them, which is how the readahead overlaps scheduling instead of a fault.
+    Prefetch {
+        keys: Vec<String>,
+    },
     Release {
         keys: Vec<String>,
         request: String,
@@ -109,6 +114,7 @@ impl Request {
             Request::Lookup { .. } => "lookup",
             Request::LookupMany { .. } => "lookup_many",
             Request::Load { .. } => "load",
+            Request::Prefetch { .. } => "prefetch",
             Request::Release { .. } => "release",
             Request::ReleaseAll { .. } => "release_request",
             Request::Store { .. } => "store",
