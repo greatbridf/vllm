@@ -4,6 +4,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -18,7 +19,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 use vllm_kv_cache_service::cache::{
     Cache, PREFETCH_STREAMS, PrefetchLimits, Released, Status, StoreRejection, check_keys,
-    check_request, namespace_bytes, prefetch_rows, prefetch_rows_parallel,
+    check_request, namespace_bytes, page_out_rows, prefetch_rows, prefetch_rows_parallel,
 };
 use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
 use vllm_kv_cache_service::protocol::{self, Request};
@@ -79,6 +80,12 @@ struct Args {
     /// for a later lookup.
     #[arg(long, default_value_t = 32)]
     prefetch_max_chunks: usize,
+    /// After a commit, keep this service's cgroup at or below this percentage of
+    /// its `memory.max` by asking the kernel to reclaim through
+    /// `memory.reclaim`; 0 disables it. `madvise(MADV_PAGEOUT)` does not collect
+    /// this mapping's pages, so cgroup reclaim is the only trigger that works.
+    #[arg(long, default_value_t = 0)]
+    spill_watermark_percent: u64,
     /// Attach the rswap digest BPF program through sysfs; disabled by default.
     /// Defaults to /sys/kernel/mm/xswap/rswap_attach when no path is given.
     #[arg(
@@ -143,12 +150,17 @@ struct Geometry {
 
 /// Namespaces reachable by name. Its lock is only held to clone a cache handle or
 /// to insert and remove an entry, never across socket I/O.
+/// Chunks one watermark spill pages out.
+const SPILL_CHUNKS: usize = 32;
+
 struct Registry {
     namespaces: HashMap<String, Namespace>,
     retired: Vec<Namespace>,
     budget: usize,
     rswap_attach: Option<PathBuf>,
     pin_lease_bytes: usize,
+    /// `(memory.reclaim, watermark percent)` of this service's cgroup.
+    spill: Option<(PathBuf, u64)>,
     prefetch: PrefetchLimits,
     pending_timeout: Option<Duration>,
     started: Instant,
@@ -265,7 +277,7 @@ fn info(registry: &Registry, limits: &Limits) -> Value {
 
 fn handle(
     request: Request,
-    registry: &Mutex<Registry>,
+    registry: &Arc<Mutex<Registry>>,
     limits: &Limits,
     session: u64,
     namespace: &mut Option<String>,
@@ -446,6 +458,9 @@ fn handle(
                     check_keys(&keys).map_err(reject)?;
                     check_request(&request).map_err(reject)?;
                     cache.commit(&keys, &request, success).map_err(reject)?;
+                    if success && let Some(spill) = registry_spill(registry) {
+                        spawn_watermark_spill(registry, spill, name);
+                    }
                     json!({"ok": true})
                 }
                 Request::Touch { keys } => {
@@ -555,9 +570,94 @@ fn reclaim_expired(cache: &mut Cache, namespace: &str, pending_timeout: Option<D
     }
 }
 
+/// This service's cgroup v2 `memory.reclaim`, if it has one.
+///
+/// `madvise(MADV_PAGEOUT)` does not collect the pages of this mapping (measured:
+/// it reports success and pages nothing out), while cgroup reclaim does, so the
+/// watermark spill goes through the cgroup.
+fn cgroup_reclaim_path() -> Option<PathBuf> {
+    let membership = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = membership.lines().find_map(|line| line.strip_prefix("0::"))?.trim();
+    let reclaim = PathBuf::from(format!("/sys/fs/cgroup{path}/memory.reclaim"));
+    reclaim.is_file().then_some(reclaim)
+}
+
+/// The watermark spill, if this service has one.
+fn registry_spill(registry: &Mutex<Registry>) -> Option<(PathBuf, u64)> {
+    lock_or_recover(registry, "registry").spill.clone()
+}
+
+/// Pages the coldest chunks out, or falls back to cgroup reclaim.
+///
+/// The page-out goes through `MADV_PAGEOUT` on the rows the cache would evict
+/// next; that only works for ranges that are not locked, which is why a commit
+/// drops the reservation's lock. Runs on its own thread: both triggers reclaim
+/// synchronously and must never delay a reply. If the rows are still resident
+/// afterwards (pageout collected nothing), the cgroup's `memory.reclaim` is the
+/// fallback, because it reclaims whatever the kernel finds reclaimable.
+fn spawn_watermark_spill(
+    registry: &Arc<Mutex<Registry>>,
+    (reclaim, watermark): (PathBuf, u64),
+    namespace: &str,
+) {
+    let prepared = {
+        let registry = lock_or_recover(registry, "registry");
+        registry.namespaces.get(namespace).map(|entry| {
+            let cache = Arc::clone(&entry.cache);
+            let (mapping, row_bytes, page_size) = lock_or_recover(&cache, "cache").prefetch_parts();
+            (cache, mapping, row_bytes, page_size)
+        })
+    };
+    let Some((cache, mapping, row_bytes, page_size)) = prepared else {
+        return;
+    };
+    let reclaim = reclaim.clone();
+    std::thread::spawn(move || {
+        let under_watermark = |current: Option<u64>, limit: Option<u64>| match (current, limit) {
+            (Some(current), Some(limit)) if limit > 0 => current <= limit * watermark / 100,
+            _ => true,
+        };
+        let current = read_cgroup_number(reclaim.with_file_name("memory.current"));
+        let limit = read_cgroup_number(reclaim.with_file_name("memory.max"));
+        if under_watermark(current, limit) {
+            return;
+        }
+        let candidates = lock_or_recover(&cache, "cache").spill_candidates(SPILL_CHUNKS);
+        if !candidates.is_empty() {
+            match page_out_rows(&mapping, row_bytes, page_size, &candidates) {
+                Ok(pages) => log_event!(
+                    "spill_pageout",
+                    "chunks" = candidates.len(),
+                    "pages" = pages
+                ),
+                Err(error) => log_event!("spill_pageout_failed", "error" = error),
+            }
+            lock_or_recover(&cache, "cache")
+                .add_reclaimed_bytes((candidates.len() * row_bytes) as u64);
+        }
+        let current = read_cgroup_number(reclaim.with_file_name("memory.current"));
+        if under_watermark(current, limit) {
+            return;
+        }
+        let want = current.unwrap_or(0).saturating_sub(limit.unwrap_or(0) * watermark / 100);
+        let outcome = fs::OpenOptions::new()
+            .write(true)
+            .open(&reclaim)
+            .and_then(|mut file| file.write_all(want.to_string().as_bytes()));
+        match outcome {
+            Ok(()) => log_event!("spill_reclaim", "bytes" = want),
+            Err(error) => log_event!("spill_failed", "bytes" = want, "error" = error),
+        }
+    });
+}
+
+fn read_cgroup_number(path: PathBuf) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 fn serve(
     stream: &mut UnixStream,
-    registry: &Mutex<Registry>,
+    registry: &Arc<Mutex<Registry>>,
     session: u64,
     namespace: &mut Option<String>,
     limits: &Limits,
@@ -1138,6 +1238,7 @@ fn run_service(args: Args) -> io::Result<()> {
         "pending_timeout_secs" = args.pending_timeout_secs,
         "namespace_grace_secs" = args.namespace_grace_secs,
         "pin_lease_bytes" = args.pin_lease_bytes,
+        "spill_watermark_percent" = args.spill_watermark_percent,
         "prefetch_cooldown_ms" = args.prefetch_cooldown_ms,
         "prefetch_max_chunks" = args.prefetch_max_chunks,
     );
@@ -1147,6 +1248,9 @@ fn run_service(args: Args) -> io::Result<()> {
         budget: capacity_bytes,
         rswap_attach: args.rswap_attach,
         pin_lease_bytes: args.pin_lease_bytes,
+        spill: cgroup_reclaim_path()
+            .filter(|_| args.spill_watermark_percent > 0 && args.spill_watermark_percent < 100)
+            .map(|path| (path, args.spill_watermark_percent)),
         prefetch: PrefetchLimits {
             cooldown: Duration::from_millis(args.prefetch_cooldown_ms),
             max_chunks: args.prefetch_max_chunks,

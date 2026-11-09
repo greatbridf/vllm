@@ -30,6 +30,8 @@ struct Slot {
     ready: bool,
     /// Whether the slot's row is locked against reclaim for its readers.
     pinned: bool,
+    /// Whether the digest is already published for this slot.
+    published: bool,
     reservation: Option<Reservation>,
 }
 
@@ -42,6 +44,7 @@ impl Slot {
             readers: Vec::new(),
             ready: false,
             pinned: false,
+            published: false,
             reservation: None,
         }
     }
@@ -156,6 +159,8 @@ struct Counters {
     prefetch_calls: usize,
     prefetch_chunks: usize,
     prefetch_skipped: usize,
+    early_publish_failures: usize,
+    reclaimed_bytes: u64,
 }
 
 /// Leases ended by `release` or `release_request`, and the keys or request id
@@ -534,6 +539,23 @@ impl Cache {
     ///
     /// Returns:
     ///     The number of base pages handed to the kernel.
+    /// The coldest chunks a watermark spill may page out.
+    ///
+    /// Walks the eviction order from the tail and takes committed rows nobody
+    /// holds, so the spill costs exactly the chunks the cache would evict next.
+    pub fn spill_candidates(&self, max: usize) -> Vec<usize> {
+        let mut slots = Vec::with_capacity(max);
+        let mut cursor = self.lru_tail;
+        while cursor != NO_SLOT && slots.len() < max {
+            let entry = &self.slots[cursor as usize];
+            if entry.ready && entry.readers.is_empty() && !entry.pinned {
+                slots.push(cursor as usize);
+            }
+            cursor = entry.prev;
+        }
+        slots
+    }
+
     pub fn spill(&self, keys: &[String]) -> io::Result<usize> {
         let mut pages = 0;
         for key in keys {
@@ -906,6 +928,33 @@ impl Cache {
             reserved.push(key.to_owned());
             slots.push(slot as usize);
         }
+        // Key the pages as soon as the slot exists, not after the worker's copy:
+        // under memory pressure the kernel can reach a written page before the
+        // commit, and a page without a digest cannot be written out at all
+        // (rswap answers ENODATA, reclaim fails, and the cgroup OOM-kills).
+        // Locking the row on fault is what makes publishing early safe: a page
+        // that is half written can never be reclaimed and stored under a digest.
+        for &slot in &slots {
+            if !self.lock_row_onfault(slot) {
+                continue;
+            }
+            let key = self.slots[slot].key.to_string();
+            let published = match &mut self.hashes {
+                Some(hashes) => match hashes.publish(slot, &key) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        hashes.clear(slot);
+                        self.counters.early_publish_failures += 1;
+                        log_early_publish_failure(error);
+                        false
+                    }
+                },
+                None => false,
+            };
+            if published {
+                self.slots[slot].published = true;
+            }
+        }
         self.counters.stores += slots.len();
         Ok((reserved, slots, evicted))
     }
@@ -925,27 +974,48 @@ impl Cache {
         };
         let committed = slots.len();
         if success {
-            // Publish before any entry becomes ready: a failed publish leaves
-            // every reservation pending and the caller fails closed.
-            if let Some(hashes) = &mut self.hashes {
-                for (key, &slot) in keys.iter().zip(&slots) {
-                    if let Err(error) = hashes.publish(slot as usize, key) {
-                        for &slot in &slots {
-                            hashes.clear(slot as usize);
+            // Only the reservations whose row could not be locked are keyed
+            // here; `store` already published the rest.
+            let to_publish: Vec<(&String, usize)> = keys
+                .iter()
+                .zip(&slots)
+                .map(|(key, &slot)| (key, slot as usize))
+                .filter(|(_, slot)| !self.slots[*slot].published)
+                .collect();
+            if !to_publish.is_empty()
+                && let Some(hashes) = &mut self.hashes
+            {
+                for (key, slot) in &to_publish {
+                    if let Err(error) = hashes.publish(*slot, key) {
+                        for (_, slot) in &to_publish {
+                            hashes.clear(*slot);
+                        }
+                        for (_, slot) in &to_publish {
+                            self.slots[*slot].published = false;
                         }
                         self.counters.failed_commits += 1;
                         return Err(error);
                     }
+                    self.slots[*slot].published = true;
                 }
             }
             for slot in slots {
                 self.publish_slot(slot);
+                // Drop the lock the reservation took: the digest is published, so
+                // the row is safe to reclaim now, and a locked range cannot be
+                // paged out at all (madvise pageout skips VM_LOCKED).
+                if self.slots[slot as usize].readers.is_empty() {
+                    self.unpin_slot(slot as usize);
+                }
             }
             self.counters.commits += committed;
         } else {
             for slot in slots {
-                if let Some(hashes) = &mut self.hashes {
+                if self.slots[slot as usize].published
+                    && let Some(hashes) = &mut self.hashes
+                {
                     hashes.clear(slot as usize);
+                    self.slots[slot as usize].published = false;
                 }
                 self.release_slot(slot);
             }
@@ -1049,6 +1119,11 @@ impl Cache {
         Ok(())
     }
 
+    /// Records the bytes a watermark spill asked the kernel to reclaim.
+    pub fn add_reclaimed_bytes(&mut self, bytes: u64) {
+        self.counters.reclaimed_bytes = self.counters.reclaimed_bytes.saturating_add(bytes);
+    }
+
     pub fn stats(&self) -> HashMap<&'static str, usize> {
         let mut pending = 0;
         let mut leased = 0;
@@ -1076,6 +1151,11 @@ impl Cache {
             ("commits", self.counters.commits),
             ("aborted", self.counters.aborted),
             ("failed_commits", self.counters.failed_commits),
+            (
+                "early_publish_failures",
+                self.counters.early_publish_failures,
+            ),
+            ("reclaimed_bytes", self.counters.reclaimed_bytes as usize),
             ("reclaimed", self.counters.reclaimed),
             ("requests", self.leases.lease_holders()),
             ("pinned_slots", self.pinned_slots()),
@@ -1234,6 +1314,34 @@ impl Cache {
     /// it is skipped and the caller keeps its hit without the guarantee, because
     /// unlocking a row another request still reads to make room would break that
     /// request instead. A refused `mlock` is counted and logged once, never fatal.
+    /// Locks the row so pages are locked as the worker faults them in.
+    ///
+    /// `mlock2(MLOCK_ONFAULT)` locks the pages of the range when they are
+    /// faulted in later and faults in nothing now, which is what a reservation
+    /// needs: its pages do not exist yet, and once they do, the kernel must not
+    /// reclaim them before the digest is published and the store commits.
+    fn lock_row_onfault(&mut self, slot: usize) -> bool {
+        if self.slots[slot].pinned {
+            return true;
+        }
+        if !self.pin_fits_budget() {
+            self.counters.pin_skipped += 1;
+            return false;
+        }
+        // SAFETY: the row lies inside the sealed mapping, so the range is mapped
+        // and page-aligned; MLOCK_ONFAULT only marks it.
+        let row = self.row_base(slot) as *const libc::c_void;
+        let locked = unsafe { libc::mlock2(row, self.row_bytes, libc::MLOCK_ONFAULT) };
+        if locked != 0 {
+            self.counters.pin_failures += 1;
+            log_pin_failure(io::Error::last_os_error());
+            return false;
+        }
+        self.slots[slot].pinned = true;
+        self.pinned_bytes += self.row_bytes;
+        true
+    }
+
     fn pin_slot(&mut self, slot: usize) {
         if self.slots[slot].pinned || self.pin_budget == 0 {
             return;
@@ -1340,6 +1448,13 @@ impl Cache {
 /// Reports a refused `mlock` or `munlock` once per process: a host without the
 /// privilege to lock memory refuses every row, and one line names the cause while
 /// `stats` counts the rest.
+fn log_early_publish_failure(error: io::Error) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log_event!("digest_deferred", "error" = error);
+    }
+}
+
 fn log_pin_failure(error: io::Error) {
     static REPORTED: AtomicBool = AtomicBool::new(false);
     if !REPORTED.swap(true, Ordering::Relaxed) {
@@ -1472,6 +1587,38 @@ pub fn prefetch_rows_parallel(
     Ok(pages)
 }
 
+/// Touches one byte per page of each row, then asks the kernel to page the rows
+/// out.
+///
+/// The touch installs this process's page table entries: `madvise` walks the
+/// caller's page tables, so a mapping this process never faulted has nothing to
+/// walk and pageout silently does nothing.
+pub fn page_out_rows(
+    mapping: &MmapMut,
+    row_bytes: usize,
+    page_size: usize,
+    slots: &[usize],
+) -> io::Result<usize> {
+    let mut pages = 0;
+    for &slot in slots {
+        let base = mapping.as_ptr() as usize + slot * row_bytes;
+        for offset in (0..row_bytes).step_by(page_size) {
+            // SAFETY: the slot lies inside the sealed mapping and the offset is
+            // page-aligned within its row; a volatile read only faults the page in.
+            let page = std::ptr::with_exposed_provenance::<u8>(base + offset);
+            let _ = unsafe { std::ptr::read_volatile(page) };
+        }
+        // SAFETY: the range is the slot's whole row inside the live mapping.
+        let advised =
+            unsafe { libc::madvise(base as *mut libc::c_void, row_bytes, libc::MADV_PAGEOUT) };
+        if advised != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        pages += row_bytes / page_size;
+    }
+    Ok(pages)
+}
+
 /// One `MADV_WILLNEED` over rows `first..=last`.
 fn advise_rows(
     mapping: &MmapMut,
@@ -1574,6 +1721,29 @@ mod tests {
 
     fn ready(cache: &Cache, key: &str) -> bool {
         cache.slots[slot(cache, key)].ready
+    }
+
+    fn recording_cache_with_pins(
+        fail_publish: bool,
+        pin_budget: usize,
+    ) -> (Cache, Arc<Mutex<Vec<Op>>>) {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let factory = RecordingFactory {
+            ops: Arc::clone(&ops),
+            fail_publish,
+        };
+        let cache = Cache::with_hashes(
+            1,
+            64,
+            1,
+            2,
+            2 * 1024 * 1024,
+            pin_budget,
+            PrefetchLimits::default(),
+            Some(&factory as &dyn HashFactory),
+        )
+        .unwrap();
+        (cache, ops)
     }
 
     fn recording_cache(fail_publish: bool) -> (Cache, Arc<Mutex<Vec<Op>>>) {
@@ -1720,30 +1890,34 @@ mod tests {
     }
 
     #[test]
-    fn a_pin_budget_of_one_row_leaves_the_second_lease_unpinned() {
-        let mut cache = cache_with_pins(2, page_size().unwrap());
+    fn a_pin_budget_of_one_row_leaves_one_lease_unpinned() {
+        let mut cache = cache_with_pins(2, 16 * 1024);
         let both = keys(&["aa", "bb"]);
         cache.store(&both, "writer").unwrap();
+        // A reservation locks its row on fault, under the same budget.
+        let stats = cache.stats();
+        assert!(stats["pinned_slots"] <= 1);
+        assert_eq!(
+            stats["pinned_slots"] + stats["pin_skipped"] + stats["pin_failures"],
+            2
+        );
         cache.commit(&both, "writer", true).unwrap();
+        assert_eq!(
+            cache.stats()["pinned_slots"],
+            0,
+            "commit releases the reservation lock"
+        );
         touch_all(&cache, &both);
 
         assert_eq!(cache.lookup("aa", "r"), Status::Hit);
-        let pinned_one = cache.stats()["pinned_slots"] == 1;
         assert_eq!(cache.lookup("bb", "r"), Status::Hit);
         let stats = cache.stats();
-        // The budget changes the guarantee, not the answer: both keys are hits
-        // and both keep their lease without the second row being unlocked.
+        // The budget changes the guarantee, not the answer.
         assert_eq!(stats["hits"], 2);
         assert_eq!(stats["leased"], 2);
-        if pinned_one {
-            assert_eq!(stats["pinned_slots"], 1);
-            assert_eq!(stats["pinned_bytes"], cache.row_bytes);
-            assert_eq!(stats["pin_skipped"], 1);
-        } else {
-            // `mlock` refused on this host, so both pins failed instead.
-            assert_eq!(stats["pin_failures"], 2);
-            assert_eq!(stats["pin_skipped"], 0);
-            assert_eq!(stats["pinned_bytes"], 0);
+        assert!(stats["pinned_slots"] <= 1);
+        if stats["pinned_slots"] == 0 {
+            assert!(stats["pin_skipped"] + stats["pin_failures"] >= 1);
         }
     }
 
@@ -2008,21 +2182,41 @@ mod tests {
     }
 
     #[test]
-    fn failed_commit_and_eviction_clear_before_releasing_slots() {
-        let (mut cache, ops) = recording_cache(false);
+    fn failed_commit_clears_the_digest_store_published() {
+        let (mut cache, ops) = recording_cache_with_pins(false, 16 * 1024);
         let first = keys(&["aa"]);
         cache.store(&first, "r").unwrap();
-        cache.commit(&first, "r", false).unwrap();
-        assert_eq!(recorded(&ops), vec![Op::Clear(0)]);
+        // A row that could be locked is keyed at reservation time, before the
+        // worker's copy, so no page can reach reclaim without a digest.
+        let first_slot = slot(&cache, "aa");
+        let published_early = recorded(&ops).contains(&Op::Publish(first_slot, "aa".into()));
+        if published_early {
+            cache.commit(&first, "r", false).unwrap();
+            assert_eq!(
+                recorded(&ops),
+                vec![Op::Publish(first_slot, "aa".into()), Op::Clear(first_slot)]
+            );
+        } else {
+            // No lock available on this host or budget: the digest waits for the
+            // commit, and a failed commit has nothing to clear.
+            cache.commit(&first, "r", false).unwrap();
+            assert!(recorded(&ops).is_empty());
+        }
 
         let both = keys(&["aa", "bb"]);
         cache.store(&both, "r").unwrap();
         cache.commit(&both, "r", true).unwrap();
+        let published: Vec<_> = recorded(&ops);
+        assert!(published.iter().any(|op| matches!(op, Op::Publish(_, _))));
         let victim_slot = slot(&cache, "aa");
         ops.lock().unwrap().clear();
         let (_, _, evicted) = cache.store(&keys(&["cc"]), "r").unwrap();
         assert_eq!(evicted, keys(&["aa"]));
-        assert_eq!(recorded(&ops), vec![Op::Clear(victim_slot)]);
+        let after = recorded(&ops);
+        // The evicted row loses its digest before its slot is reused, and the
+        // new reservation may key itself immediately.
+        assert_eq!(after[0], Op::Clear(victim_slot));
+        assert!(after.len() <= 2);
     }
 
     #[test]

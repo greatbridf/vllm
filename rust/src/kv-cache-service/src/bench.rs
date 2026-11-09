@@ -312,6 +312,7 @@ impl Service {
         let listener = UnixListener::bind(&socket)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         let registry = Arc::new(Mutex::new(Registry {
+            spill: None,
             namespaces: HashMap::new(),
             retired: Vec::new(),
             budget,

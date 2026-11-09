@@ -245,6 +245,26 @@ sent only once the burst is collected.
 | `close` | none | scheduler | `ok` only |
 | `info` | none | anyone, before any handshake | service state |
 
+`store` keys the pages it reserves. The cache key is known at reservation
+time, so the digest is published then, not at `commit`; the row is locked first
+with `mlock2(MLOCK_ONFAULT)`, which locks the pages as the worker faults them in
+and faults in nothing itself. That pair closes the window in which a page is
+dirty but has no digest: the kernel cannot reclaim a written page before its
+digest exists, and a half-written page can never be stored under a digest. When
+the row cannot be locked (no `CAP_IPC_LOCK`, or `--pin-lease-bytes` exhausted)
+the digest waits for the commit, as before, and `stats.early_publish_failures`
+counts it. `commit` releases the reservation's lock; a lease that follows takes
+its own.
+
+`--spill-watermark-percent` drives the offload instead of leaving it to whatever
+reclaim happens to do: after a commit, if this service's cgroup is above that
+percentage of its `memory.max`, the coldest chunks page out first — the LRU tail,
+skipping leased and locked rows — and if those rows are still resident afterwards
+the service asks the cgroup to reclaim through `memory.reclaim`. Measured on this
+kernel, `MADV_PAGEOUT` reports success for the mapping and pages nothing out,
+from the service's mapping or from the worker's, while cgroup reclaim moves
+gigabytes, so the page-out is the first attempt and the cgroup the fallback.
+
 `load` prefetches by default: after it resolves the slots it asks the kernel to
 read those chunks back in with one `MADV_WILLNEED` per contiguous row, on its own
 thread so the reply is never delayed. A swap-in is submitted per fault and the
