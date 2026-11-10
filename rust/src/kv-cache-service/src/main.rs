@@ -24,6 +24,7 @@ use vllm_kv_cache_service::cache::{
 };
 use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
 use vllm_kv_cache_service::protocol::{self, Request};
+use vllm_kv_cache_service::remote::{RedisTier, RemoteTier};
 
 #[macro_use]
 mod log;
@@ -100,6 +101,12 @@ struct Args {
         default_missing_value = "/sys/kernel/mm/xswap/rswap_attach"
     )]
     rswap_attach: Option<PathBuf>,
+    /// Read missing rows from an rswap Redis tier; never write remote objects.
+    #[arg(long, env = "VLLM_KV_REMOTE_REDIS_URL", hide_env_values = true)]
+    remote_redis_url: Option<String>,
+    /// Total remote-read budget per lookup RPC; keep below service_timeout.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
+    remote_timeout_ms: u64,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -163,6 +170,8 @@ struct Registry {
     retired: Vec<Namespace>,
     budget: usize,
     rswap_attach: Option<PathBuf>,
+    remote: Option<Arc<dyn RemoteTier>>,
+    remote_timeout: Duration,
     pin_lease_bytes: usize,
     eviction_policy: EvictionPolicy,
     /// `(memory.reclaim, watermark percent)` of this service's cgroup.
@@ -356,7 +365,7 @@ fn handle(
         }
         command => {
             let name = namespace.as_deref().ok_or_else(|| reject("handshake required"))?;
-            let (handle, pending_timeout, sessions, detached) = {
+            let (handle, pending_timeout, sessions, detached, remote, remote_timeout) = {
                 let registry = lock_or_recover(registry, "registry");
                 let entry = registry
                     .namespaces
@@ -367,6 +376,8 @@ fn handle(
                     registry.pending_timeout,
                     entry.sessions.len(),
                     entry.detached(),
+                    registry.remote.clone(),
+                    registry.remote_timeout,
                 )
             };
             let mut cache = lock_or_recover(&handle, "cache");
@@ -379,7 +390,21 @@ fn handle(
                 Request::Lookup { key, request } => {
                     check_keys(std::slice::from_ref(&key)).map_err(reject)?;
                     check_request(&request).map_err(reject)?;
-                    let status = cache.lookup(&key, &request);
+                    let mut status = cache.lookup(&key, &request);
+                    if status == Status::Miss
+                        && let Some(remote) = &remote
+                    {
+                        let geometry = (cache.row_bytes, cache.page_size);
+                        drop(cache);
+                        let row = remote.load(
+                            &key,
+                            geometry.0,
+                            geometry.1,
+                            Instant::now() + remote_timeout,
+                        );
+                        cache = remote_cache(registry, &handle, name, session)?;
+                        status = promote_remote(&mut cache, &key, &request, row);
+                    }
                     prefetch_pending(
                         &mut cache,
                         &handle,
@@ -398,7 +423,27 @@ fn handle(
                     check_request(&request).map_err(reject)?;
                     // A truncated scan reports fewer statuses than keys, which
                     // is smaller than the batch and so still fits one frame.
-                    let statuses = cache.lookup_many(&keys, &request, until_miss);
+                    let statuses = if let Some(remote) = &remote {
+                        let deadline = Instant::now() + remote_timeout;
+                        let mut statuses = Vec::with_capacity(keys.len());
+                        for key in &keys {
+                            let mut status = cache.lookup(key, &request);
+                            if status == Status::Miss && Instant::now() < deadline {
+                                let geometry = (cache.row_bytes, cache.page_size);
+                                drop(cache);
+                                let row = remote.load(key, geometry.0, geometry.1, deadline);
+                                cache = remote_cache(registry, &handle, name, session)?;
+                                status = promote_remote(&mut cache, key, &request, row);
+                            }
+                            statuses.push(status);
+                            if until_miss && status == Status::Miss {
+                                break;
+                            }
+                        }
+                        statuses
+                    } else {
+                        cache.lookup_many(&keys, &request, until_miss)
+                    };
                     prefetch_pending(&mut cache, &handle, &keys, &statuses, &request);
                     json!({"ok": true, "statuses": statuses})
                 }
@@ -503,6 +548,48 @@ fn handle(
 
 fn released_reply(released: Released) -> Value {
     json!({"ok": true, "released": released.leases, "unknown": released.unknown})
+}
+
+/// Revalidate the namespace after remote I/O, locking registry before cache so
+/// retirement cannot clear its hashes and then race a late promotion.
+fn remote_cache<'a>(
+    registry: &Arc<Mutex<Registry>>,
+    handle: &'a Arc<Mutex<Cache>>,
+    name: &str,
+    session: u64,
+) -> Result<MutexGuard<'a, Cache>, Failure> {
+    let registry = lock_or_recover(registry, "registry");
+    let entry = registry
+        .namespaces
+        .get(name)
+        .filter(|entry| Arc::ptr_eq(&entry.cache, handle))
+        .ok_or_else(|| reject("cache namespace invalidated"))?;
+    if entry.sessions.get(&session) != Some(&SessionKind::Owner) {
+        return Err(reject("namespace owner changed during remote lookup"));
+    }
+    Ok(lock_or_recover(handle, "cache"))
+}
+
+fn promote_remote(
+    cache: &mut Cache,
+    key: &str,
+    request: &str,
+    row: io::Result<Option<Vec<u8>>>,
+) -> Status {
+    match row {
+        Ok(Some(row)) => match cache.promote_remote(key, request, &row) {
+            Ok(status) => status,
+            Err(error) => {
+                log_event!("remote_promotion_failed", "error" = error);
+                Status::Miss
+            }
+        },
+        Ok(None) => Status::Miss,
+        Err(error) => {
+            log_event!("remote_lookup_failed", "error" = error);
+            Status::Miss
+        }
+    }
 }
 
 /// Asks the kernel to read `slots` back in, on a thread of its own.
@@ -1282,6 +1369,13 @@ fn run_service(args: Args) -> io::Result<()> {
         retired: Vec::new(),
         budget: capacity_bytes,
         rswap_attach: args.rswap_attach,
+        remote: args
+            .remote_redis_url
+            .as_deref()
+            .map(RedisTier::new)
+            .transpose()?
+            .map(|tier| Arc::new(tier) as Arc<dyn RemoteTier>),
+        remote_timeout: Duration::from_millis(args.remote_timeout_ms),
         pin_lease_bytes: args.pin_lease_bytes,
         eviction_policy: args.eviction_policy,
         spill: cgroup_reclaim_path()

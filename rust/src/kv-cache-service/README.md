@@ -95,6 +95,39 @@ default `0`: a row locked by a lease is not reclaimable either.
 
 ## Deployment
 
+### Read-Only Redis Tier
+
+Set `VLLM_KV_REMOTE_REDIS_URL=redis://127.0.0.1:6379/0` or pass
+`--remote-redis-url redis://127.0.0.1:6379/0` to enable remote loads after a
+local cache miss. Redis URL credentials and a database number are supported;
+prefer the environment variable for secrets. The default is disabled.
+`--remote-timeout-ms` defaults to `1000`, is positive, and budgets remote reads
+across one complete lookup RPC. Keep it below the connector's `service_timeout`.
+A busy Redis connection, missing page, wrong-sized page, or transport failure
+becomes a miss without disabling local stores.
+
+`lookup` and `lookup_many` fetch all pages of a missing row, promote it into
+the service-owned memfd, and take the normal lookup lease before reporting
+`hit`. A prefix scan stops at the first miss, including an incomplete remote
+row. Existing local hits and pending worker stores are never overwritten.
+Promotions use the local eviction policy and cannot displace leased rows;
+a full cache with no eligible victim reports a miss. Kernel-swapped local
+rows still use the existing pending/readahead path.
+
+The wire contract and worker DMA path are unchanged. The service only issues
+pipelined `GET` commands, in batches of at most 32 pages, and never stores or
+deletes remote data. Remote objects must already be populated, for example by
+the rswap kernel. Keys are the lowercase 96-character hex encoding of
+`PageHash::new(client_key, chunk_relative_page_offset)`, not the client's raw
+chunk hash. Values are raw host base-page images, including all TP rank slices
+and final row padding.
+
+Use a trusted Redis dataset dedicated to one compatible model, KV layout, TP
+geometry, hash algorithm/seed, and host page size. The rswap key format contains
+no layout fingerprint or geometry; matching keys and sizes alone cannot detect
+incompatible KV bytes. This is not canonical-layout or arbitrary cross-engine
+cache sharing. No rswap/BPF privileges are needed for this userspace loader.
+
 Run the service under a supervisor. A `systemd` unit:
 
 ```ini
@@ -767,7 +800,8 @@ when enabled, and model output is unaffected.
 - Linux, trusted same-UID local clients, single-node TP-only.
 - Complete physical packed rows, including DeepSeek MLA/indexer bytes and padding.
 - Existing model replay for non-cacheable compressor and bounded-replay state.
-- No secondary tiers, persistent cache, cross-engine cache reuse, context
+- Optional read-only rswap Redis loads; no remote stores, general secondary
+  tiers, persistent local cache, arbitrary cross-engine cache reuse, context
   parallelism, pipeline parallelism, or shared-copy TP deduplication.
 - Bounded synchronous control RPCs are a correctness-first MVP. Lookups are
   batched through `lookup_many`; the connector does not pipeline its requests,

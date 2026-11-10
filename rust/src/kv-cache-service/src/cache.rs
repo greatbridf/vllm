@@ -551,6 +551,33 @@ impl Cache {
         statuses
     }
 
+    /// Promotes a complete remote row and leases it before returning a hit.
+    /// The caller holds the cache lock, but has already finished remote I/O.
+    pub fn promote_remote(&mut self, key: &str, request: &str, row: &[u8]) -> io::Result<Status> {
+        if row.len() != self.row_bytes {
+            return Err(invalid("remote row size mismatch"));
+        }
+        // A store, reset, or another lookup may have run during the remote read.
+        // Never overwrite a worker reservation or bytes another request leases.
+        if self.index.contains_key(key) {
+            return Ok(self.lookup(key, request));
+        }
+        let keys = [key.to_owned()];
+        let Ok((_, slots, _)) = self.store(&keys, request) else {
+            return Ok(Status::Miss);
+        };
+        let slot = slots[0];
+        let result = self
+            .file
+            .write_all_at(row, (slot * self.row_bytes) as u64)
+            .and_then(|()| self.commit(&keys, request, true));
+        if let Err(error) = result {
+            self.commit(&keys, request, false)?;
+            return Err(error);
+        }
+        Ok(self.lookup(key, request))
+    }
+
     /// Writes committed chunks out through the kernel's swap path.
     ///
     /// The digest is resolved from the VMA that carries the rswap program, and

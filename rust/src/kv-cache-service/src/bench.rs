@@ -317,6 +317,8 @@ impl Service {
             retired: Vec::new(),
             budget,
             rswap_attach: None,
+            remote: None,
+            remote_timeout: Duration::from_secs(1),
             pin_lease_bytes: 0,
             eviction_policy: crate::EvictionPolicy::Lru,
             prefetch: PrefetchLimits::default(),

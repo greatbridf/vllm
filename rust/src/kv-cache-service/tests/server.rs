@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //! Process-level tests: spawn the real service and speak raw control frames.
 use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -190,6 +191,258 @@ fn open_with(client: &mut Client, namespace: &str, fingerprint: &str, num_chunks
         "world_size": 2,
         "num_chunks": num_chunks,
     }))
+}
+
+/// The only mocked boundary is Redis; parse requests with its real RESP parser.
+fn redis_peer(replies: Vec<(String, Option<Vec<u8>>)>) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("redis://{}/", listener.local_addr().unwrap());
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut parser = redis::Parser::new();
+        // redis-rs initializes connections with optional CLIENT SETINFO commands.
+        for (key, page) in replies {
+            loop {
+                let command = parser.parse_value(&mut stream).unwrap();
+                let redis::Value::Array(args) = command else {
+                    panic!("expected RESP array: {command:?}");
+                };
+                if args.first() == Some(&redis::Value::BulkString(b"CLIENT".to_vec())) {
+                    stream.write_all(b"+OK\r\n").unwrap();
+                    continue;
+                }
+                assert_eq!(
+                    args,
+                    vec![
+                        redis::Value::BulkString(b"GET".to_vec()),
+                        redis::Value::BulkString(key.into_bytes()),
+                    ],
+                    "remote tier must only read the kernel's exact page key"
+                );
+                break;
+            }
+            match page {
+                Some(page) => {
+                    write!(stream, "${}\r\n", page.len()).unwrap();
+                    stream.write_all(&page).unwrap();
+                    stream.write_all(b"\r\n").unwrap();
+                }
+                None => stream.write_all(b"$-1\r\n").unwrap(),
+            }
+        }
+    });
+    (url, peer)
+}
+
+#[test]
+fn stalled_remote_read_does_not_hold_cache_or_registry_locks() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("redis://{}/", listener.local_addr().unwrap());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut parser = redis::Parser::new();
+        loop {
+            let redis::Value::Array(args) = parser.parse_value(&mut stream).unwrap() else {
+                panic!("expected RESP command");
+            };
+            if args.first() == Some(&redis::Value::BulkString(b"CLIENT".to_vec())) {
+                stream.write_all(b"+OK\r\n").unwrap();
+            } else {
+                assert_eq!(args[0], redis::Value::BulkString(b"GET".to_vec()));
+                break;
+            }
+        }
+        started_tx.send(()).unwrap();
+        finish_rx.recv_timeout(TIMEOUT).unwrap();
+    });
+    let service = Service::start_with(&["--remote-redis-url", &url, "--remote-timeout-ms", "100"]);
+    let mut owner = service.connect();
+    assert_eq!(open(&mut owner, "stalled")["ok"], true);
+    let mut worker = service.connect();
+    assert_eq!(attach(&mut worker, "stalled", 0)["ok"], true);
+    receive_descriptor(&worker.stream).into_iter().for_each(|fd| {
+        // SAFETY: close the test-owned descriptor, keeping the worker session.
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    });
+    owner.send(&json!({"op": "lookup", "key": "aa", "request": "reader"}));
+    started_rx.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(worker.call(json!({"op": "stats"}))["ok"], true);
+    let mut other = service.connect();
+    assert_eq!(open(&mut other, "other")["ok"], true);
+    // A busy pooled connection must not wait behind the stalled namespace.
+    assert_eq!(
+        other.call(json!({
+            "op": "lookup", "key": "bb", "request": "other-reader",
+        }))["status"],
+        "miss"
+    );
+    assert_eq!(
+        other.call(json!({
+            "op": "store", "keys": ["cc"], "request": "writer",
+        }))["keys"],
+        json!(["cc"])
+    );
+    // The peer only exits after we receive the timeout: completion cannot be
+    // caused by EOF instead of the configured remote budget.
+    assert_eq!(owner.receive()["status"], "miss");
+    finish_tx.send(()).unwrap();
+    peer.join().unwrap();
+}
+
+#[test]
+fn remote_rows_are_loaded_by_client_hash_and_leased_before_gpu_load() {
+    use vllm_kv_cache_service::hash::PageHash;
+
+    let page = page_size();
+    let key = "ab".repeat(36);
+    let pages = [vec![0x37; page], vec![0xa9; page]];
+    let replies = pages
+        .iter()
+        .enumerate()
+        .map(|(offset, bytes)| {
+            (
+                hex::encode(PageHash::new(&key, offset as u64).hash()),
+                Some(bytes.clone()),
+            )
+        })
+        .collect();
+    let (url, peer) = redis_peer(replies);
+    let service = Service::start_with(&["--remote-redis-url", &url]);
+    let mut client = service.connect();
+    let geometry = client.call(json!({
+        "op": "open", "version": 1, "namespace": "remote",
+        "fingerprint": "a".repeat(64), "worker_bytes": page - 1,
+        "world_size": 2, "num_chunks": 1,
+    }));
+    assert_eq!(geometry["row_bytes"], 2 * page);
+    let mapping = WorkerMapping::attach(&service, "remote", 0);
+    assert_eq!(
+        client.call(json!({
+            "op": "lookup_many", "keys": [key], "request": "reader", "until_miss": true,
+        })),
+        json!({"ok": true, "statuses": ["hit"]})
+    );
+    let loaded = client.call(json!({
+        "op": "load", "keys": [key], "request": "reader", "prefetch": false,
+    }));
+    assert_eq!(loaded["slots"], json!([0]));
+    // SAFETY: this is the complete leased row inside the worker's mapping.
+    let bytes = unsafe { std::slice::from_raw_parts(mapping.base, 2 * page) };
+    assert_eq!(bytes, pages.concat());
+    assert_eq!(
+        client.call(json!({
+            "op": "store", "keys": ["cc"], "request": "writer",
+        })),
+        json!({"ok": true, "full": true})
+    );
+    peer.join().unwrap();
+    // The peer is gone: the locally promoted row must still be a hit.
+    assert_eq!(
+        client.call(json!({
+            "op": "lookup", "key": key, "request": "second",
+        }))["status"],
+        "hit"
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "release_request", "request": "reader",
+        }))["released"],
+        1
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "store", "keys": ["cc"], "request": "writer",
+        }))["full"],
+        true
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "release_request", "request": "second",
+        }))["released"],
+        1
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "store", "keys": ["cc"], "request": "writer",
+        }))["keys"],
+        json!(["cc"])
+    );
+}
+
+#[test]
+fn partial_or_invalid_remote_rows_never_publish_and_stop_prefix_scans() {
+    use vllm_kv_cache_service::hash::PageHash;
+
+    for last in [None, Some(vec![0x55; 1])] {
+        let page = page_size();
+        let (url, peer) = redis_peer(vec![
+            (
+                hex::encode(PageHash::new("aa", 0).hash()),
+                Some(vec![0x33; page]),
+            ),
+            (hex::encode(PageHash::new("aa", 1).hash()), last),
+        ]);
+        let service = Service::start_with(&["--remote-redis-url", &url]);
+        let mut client = service.connect();
+        assert_eq!(
+            client.call(json!({
+                "op": "open", "version": 1, "namespace": "partial",
+                "fingerprint": "a".repeat(64), "worker_bytes": page,
+                "world_size": 2, "num_chunks": 1,
+            }))["ok"],
+            true
+        );
+        assert_eq!(
+            client.call(json!({
+                "op": "lookup_many", "keys": ["aa", "bb"],
+                "request": "reader", "until_miss": true,
+            })),
+            json!({"ok": true, "statuses": ["miss"]})
+        );
+        let stats = client.call(json!({"op": "stats"}))["stats"].clone();
+        assert_eq!(stats["entries"], 0);
+        assert_eq!(stats["pending"], 0);
+        assert_eq!(
+            client.call(json!({
+                "op": "store", "keys": ["cc"], "request": "writer",
+            }))["keys"],
+            json!(["cc"])
+        );
+        peer.join().unwrap();
+    }
+}
+
+#[test]
+fn remote_transport_failure_is_a_miss_and_keeps_the_service_usable() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("redis://{}/", listener.local_addr().unwrap());
+    drop(listener);
+    let service = Service::start_with(&["--remote-redis-url", &url]);
+    let mut client = service.connect();
+    assert_eq!(open(&mut client, "offline")["ok"], true);
+    assert_eq!(
+        client.call(json!({
+            "op": "lookup", "key": "aa", "request": "reader",
+        }))["status"],
+        "miss"
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "store", "keys": ["aa"], "request": "writer",
+        }))["keys"],
+        json!(["aa"])
+    );
+    assert_eq!(
+        client.call(json!({
+            "op": "lookup", "key": "aa", "request": "reader",
+        }))["status"],
+        "pending",
+        "remote misses must never replace a pending worker store"
+    );
 }
 
 #[test]

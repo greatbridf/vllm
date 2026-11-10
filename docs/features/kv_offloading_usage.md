@@ -129,10 +129,23 @@ Choose this backend when one DRAM cache on the node should outlive a worker
 restart within one engine lifetime, with eviction and lease bookkeeping outside
 the engine process. It replaces the in-process CPU tier of `OffloadingConnector`
 (`offload_region: "shared"`, `"mmap"`, or `"hmm"`), not LMCache: it has no
-multi-node or disaggregated role, serves no remote peer, keeps no secondary tier,
+multi-node or disaggregated role, serves no remote peer, keeps no general secondary tier,
 does not persist across engine sessions, and is single-node tensor-parallel only,
 so it is not a drop-in for `LMCacheConnectorV1`/`LMCacheMPConnector` in a
 disaggregated prefill/decode or multi-tier deployment.
+
+The service can optionally load local misses from an existing rswap Redis
+dataset. Set `VLLM_KV_REMOTE_REDIS_URL=redis://127.0.0.1:6379/0` on the service
+or pass `--remote-redis-url`; this is not a `kv_connector_extra_config` key.
+`--remote-timeout-ms` defaults to `1000` per lookup RPC and must be positive;
+keep it below `service_timeout`. Complete remote rows are staged in the local
+memfd and leased before lookup reports a hit, using the existing worker DMA.
+Redis failures, incomplete rows, and unavailable local capacity are misses.
+There are no remote stores or deletes. Use a trusted dataset with the same
+model, KV layout, TP geometry, hash seed/algorithm, and host page size: the rswap
+page keys do not encode a layout fingerprint. See
+[Read-Only Redis Tier](../../rust/src/kv-cache-service/README.md#read-only-redis-tier)
+for the key format and deployment constraints.
 
 See the [Rust cache service guide](../../rust/src/kv-cache-service/README.md)
 for startup commands, DeepSeek-V4.1-Flash configuration, supported scope,
