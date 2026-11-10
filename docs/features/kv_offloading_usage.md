@@ -117,6 +117,14 @@ service's `--pin-lease-bytes` at `0` to keep cache pages reclaimable. This is a
 service CLI option, not `kv_connector_extra_config`: the connector's
 `eviction_policy` must still be `lru`.
 
+When prefetch detects a failed shared-memory swapin, the service invalidates the
+whole KV row and subsequent lookups report a miss rather than leaving it pending.
+The `lost_chunks` counter records these rows; `discard_failures` records failed
+row cleanup. Lost rows are not reused until existing leases end and hole punching
+has cleared their backing pages and swap entries. This does not protect a
+pageable worker copy from reclaim after a lookup hit; lease pinning is still
+needed for that guarantee.
+
 Choose this backend when one DRAM cache on the node should outlive a worker
 restart within one engine lifetime, with eviction and lease bookkeeping outside
 the engine process. It replaces the in-process CPU tier of `OffloadingConnector`

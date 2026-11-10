@@ -19,7 +19,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 use vllm_kv_cache_service::cache::{
     Cache, EvictionPolicy, PREFETCH_STREAMS, PrefetchLimits, Released, Status, StoreRejection,
-    check_keys, check_request, namespace_bytes, page_out_rows, prefetch_rows,
+    check_keys, check_prefetched_row, check_request, namespace_bytes, page_out_rows, prefetch_rows,
     prefetch_rows_parallel,
 };
 use vllm_kv_cache_service::hash::{HashFactory, RswapConfig};
@@ -412,7 +412,7 @@ fn handle(
                     let slots = cache.load(&keys, &request).map_err(reject)?;
                     let pages = slots.len() * cache.row_bytes / cache.page_size;
                     let prefetched = if prefetch {
-                        prefetch_detached(&cache, slots.clone());
+                        prefetch_detached(&mut cache, &handle, slots.clone());
                         pages
                     } else {
                         0
@@ -423,7 +423,7 @@ fn handle(
                     check_keys(&keys).map_err(reject)?;
                     let slots = cache.committed_slots(&keys).map_err(reject)?;
                     let pages = slots.len() * cache.row_bytes / cache.page_size;
-                    prefetch_detached(&cache, slots);
+                    prefetch_detached(&mut cache, &handle, slots);
                     json!({"ok": true, "pages": pages})
                 }
                 Request::Release { keys, request } => {
@@ -476,7 +476,7 @@ fn handle(
                 }
                 Request::Spill { keys } => {
                     check_keys(&keys).map_err(reject)?;
-                    json!({"ok": true, "pages": cache.spill(&keys)?})
+                    json!({"ok": true, "pages": cache.spill(&keys).map_err(reject)?})
                 }
                 Request::Reset { force } => {
                     reclaim_expired(&mut cache, name, pending_timeout);
@@ -510,10 +510,28 @@ fn released_reply(released: Released) -> Value {
 /// The readahead must not delay a reply: at a memory limit the readahead itself
 /// reclaims, which takes longer than a client waits. The mapping is shared, so
 /// the work runs with the cache lock released.
-fn prefetch_detached(cache: &Cache, slots: Vec<usize>) {
+fn prefetch_detached(cache: &mut Cache, handle: &Arc<Mutex<Cache>>, slots: Vec<usize>) {
+    let slots: Vec<usize> = slots.into_iter().filter(|&slot| !cache.is_resident(slot)).collect();
+    if slots.is_empty() {
+        return;
+    }
     let (mapping, row_bytes, page_size) = cache.prefetch_parts();
+    let Ok((file, checks)) = cache.prefetch_checks(&slots) else {
+        return;
+    };
+    let handle = Arc::clone(handle);
     std::thread::spawn(move || {
         let _ = prefetch_rows(&mapping, row_bytes, page_size, &slots);
+        for (slot, generation) in checks {
+            let result = check_prefetched_row(&file, row_bytes, page_size, slot);
+            let mut cache = lock_or_recover(&handle, "cache");
+            if let Err(error) = result
+                && error.raw_os_error() == Some(libc::EIO)
+            {
+                cache.lose_chunk(slot, generation);
+            }
+            cache.finish_check(slot, generation);
+        }
     });
 }
 
@@ -545,14 +563,23 @@ fn prefetch_pending(
     if accepted.is_empty() {
         return;
     }
+    let Ok((file, checks)) = cache.prefetch_checks(&accepted) else {
+        return;
+    };
     let handle = Arc::clone(handle);
     let request = request.to_owned();
     thread::spawn(move || {
         let (mapping, row_bytes, page_size) = lock_or_recover(&handle, "cache").prefetch_parts();
         let _ = prefetch_rows_parallel(&mapping, row_bytes, page_size, &accepted, PREFETCH_STREAMS);
-        let mut cache = lock_or_recover(&handle, "cache");
-        for slot in accepted {
-            cache.finish_prefetch(slot, &request);
+        for (slot, generation) in checks {
+            let checked = check_prefetched_row(&file, row_bytes, page_size, slot);
+            let mut cache = lock_or_recover(&handle, "cache");
+            if checked.as_ref().is_err_and(|error| error.raw_os_error() == Some(libc::EIO)) {
+                cache.lose_chunk(slot, generation);
+            } else if checked.is_ok() {
+                cache.finish_checked_prefetch(slot, generation, &request);
+            }
+            cache.finish_check(slot, generation);
         }
     });
 }

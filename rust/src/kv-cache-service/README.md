@@ -18,6 +18,16 @@ configuration and leave `--pin-lease-bytes` at `0`. The service-side eviction
 option does not override these pinning settings or the connector's
 `eviction_policy` setting, which must remain `lru`.
 
+Lookup-triggered prefetch checks each page through the memfd after submitting
+read-ahead. A failed shmem swapin returns `EIO` through that syscall instead of
+delivering `SIGBUS` to the service. The affected KV row becomes a miss; its
+digest is cleared, and once existing leases end the service punches out the
+whole row, releasing swap entries and poison markers before reusing the slot.
+This applies with either eviction policy. `stats` reports `lost_chunks` and
+`discard_failures`. Advice alone is not a completion check. With lease pinning
+disabled, pages can still be reclaimed between a hit and a worker copy; this
+recovery path does not catch signals in GPU workers or protect that race.
+
 ## Start
 
 ```bash

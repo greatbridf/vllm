@@ -5,7 +5,9 @@ use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +38,9 @@ struct Slot {
     next: u32,
     readers: Vec<u32>,
     ready: bool,
+    lost: bool,
+    generation: u64,
+    checks: usize,
     /// Whether the slot's row is locked against reclaim for its readers.
     pinned: bool,
     /// Whether the digest is already published for this slot.
@@ -51,6 +56,9 @@ impl Slot {
             next: NO_SLOT,
             readers: Vec::new(),
             ready: false,
+            lost: false,
+            generation: 0,
+            checks: 0,
             pinned: false,
             published: false,
             reservation: None,
@@ -138,6 +146,7 @@ pub struct Cache {
     /// Slots a readahead locked for the request that asked for them.
     prefetch_pins: HashMap<Box<str>, Vec<u32>>,
     hashes: Option<Box<dyn PageHashes>>,
+    next_generation: u64,
 }
 
 /// A readahead a lookup started for one slot: when it started, which the cooldown
@@ -170,6 +179,8 @@ struct Counters {
     prefetch_skipped: usize,
     early_publish_failures: usize,
     reclaimed_bytes: u64,
+    lost_chunks: usize,
+    discard_failures: usize,
 }
 
 /// Leases ended by `release` or `release_request`, and the keys or request id
@@ -478,6 +489,7 @@ impl Cache {
             readaheads: HashMap::new(),
             prefetch_pins: HashMap::new(),
             hashes,
+            next_generation: 0,
         })
     }
 
@@ -499,6 +511,10 @@ impl Cache {
             self.counters.misses += 1;
             return Status::Miss;
         };
+        if self.slots[slot as usize].lost {
+            self.counters.misses += 1;
+            return Status::Miss;
+        }
         if !self.slots[slot as usize].ready || !self.is_resident(slot as usize) {
             self.counters.pending_hits += 1;
             return Status::Pending;
@@ -571,24 +587,23 @@ impl Cache {
         slots
     }
 
-    pub fn spill(&self, keys: &[String]) -> io::Result<usize> {
+    pub fn spill(&mut self, keys: &[String]) -> io::Result<usize> {
         let mut pages = 0;
         for key in keys {
             let slot = *self
                 .index
                 .get(key.as_str())
                 .ok_or_else(|| invalid("spill requires a stored chunk"))?;
-            if !self.slots[slot as usize].ready {
+            if !self.slots[slot as usize].ready || self.slots[slot as usize].lost {
                 return Err(invalid("spill requires a committed chunk"));
             }
             let base = self.mapping.as_ptr() as usize + slot as usize * self.row_bytes;
             for offset in (0..self.row_bytes).step_by(self.page_size) {
-                // SAFETY: the slot lies inside the sealed mapping and the offset
-                // is page-aligned within its row; a volatile read installs a
-                // page table entry and changes no data.
-                unsafe {
-                    let page = std::ptr::with_exposed_provenance::<u8>(base + offset);
-                    let _ = std::ptr::read_volatile(page);
+                if let Err(error) = touch_mapped_page(base + offset) {
+                    if error.raw_os_error() == Some(libc::EFAULT) {
+                        self.lose_chunk(slot as usize, self.slots[slot as usize].generation);
+                    }
+                    return Err(error);
                 }
             }
             // SAFETY: the range is the slot's whole row inside the live mapping.
@@ -635,6 +650,77 @@ impl Cache {
         (Arc::clone(&self.mapping), self.row_bytes, self.page_size)
     }
 
+    /// A file read reports a failed shmem swapin as EIO rather than SIGBUS.
+    /// Keep the generation so an old completion cannot invalidate slot reuse.
+    pub fn prefetch_checks(&mut self, slots: &[usize]) -> io::Result<(File, Vec<(usize, u64)>)> {
+        let file = self.file.try_clone()?;
+        for &slot in slots {
+            self.slots[slot].checks += 1;
+        }
+        Ok((
+            file,
+            slots.iter().map(|&slot| (slot, self.slots[slot].generation)).collect(),
+        ))
+    }
+
+    pub fn finish_check(&mut self, slot: usize, generation: u64) {
+        if self.slots[slot].generation == generation {
+            self.slots[slot].checks -= 1;
+            self.discard_lost(slot);
+        }
+    }
+
+    pub fn lose_chunk(&mut self, slot: usize, generation: u64) {
+        if self.slots[slot].generation != generation
+            || !self.slots[slot].ready
+            || self.slots[slot].lost
+        {
+            return;
+        }
+        self.slots[slot].lost = true;
+        self.counters.lost_chunks += 1;
+        self.forget_prefetch(slot as u32);
+        if let Some(hashes) = &mut self.hashes {
+            hashes.clear(slot);
+        }
+        self.slots[slot].published = false;
+        self.discard_lost(slot);
+    }
+
+    pub fn finish_checked_prefetch(&mut self, slot: usize, generation: u64, request: &str) {
+        if self.slots[slot].generation == generation && !self.slots[slot].lost {
+            self.finish_prefetch(slot, request);
+        }
+    }
+
+    fn discard_lost(&mut self, slot: usize) {
+        if !self.slots[slot].lost
+            || !self.slots[slot].readers.is_empty()
+            || self.slots[slot].checks != 0
+        {
+            return;
+        }
+        self.unpin_slot(slot);
+        if self.slots[slot].pinned {
+            return;
+        }
+        // SAFETY: this is one complete unleased row in the owned memfd. Hole
+        // punching zaps all shared mappings and frees swap/poisoned entries.
+        let result = unsafe {
+            libc::fallocate(
+                self.file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                (slot * self.row_bytes) as libc::off_t,
+                self.row_bytes as libc::off_t,
+            )
+        };
+        if result != 0 {
+            self.counters.discard_failures += 1;
+            return;
+        }
+        self.release_slot(slot as u32);
+    }
+
     /// Number of the slot's row pages the kernel holds in DRAM, as `mincore(2)`
     /// reports them. Asking touches no page, so it cannot change the answer.
     pub fn resident_pages(&self, slot: usize) -> io::Result<usize> {
@@ -670,7 +756,8 @@ impl Cache {
         keys.iter()
             .filter_map(|key| {
                 let slot = *self.index.get(*key)?;
-                self.slots[slot as usize].ready.then_some(slot as usize)
+                (self.slots[slot as usize].ready && !self.slots[slot as usize].lost)
+                    .then_some(slot as usize)
             })
             .collect()
     }
@@ -809,7 +896,7 @@ impl Cache {
                 .ok_or_else(|| invalid("load requires a ready leased entry"))?;
             let entry = &self.slots[slot as usize];
             let leased = request.is_some_and(|request| entry.readers.contains(&request));
-            if !entry.ready || !leased {
+            if !entry.ready || entry.lost || !leased {
                 return Err(invalid("load requires a ready leased entry"));
             }
             slots.push(slot as usize);
@@ -841,6 +928,7 @@ impl Cache {
                     self.leases.unlease(request, slot);
                     if unleased {
                         self.unpin_slot(slot as usize);
+                        self.discard_lost(slot as usize);
                     }
                     released.leases += 1;
                 }
@@ -864,6 +952,7 @@ impl Cache {
                 entry.readers.retain(|reader| *reader != id);
                 if entry.readers.is_empty() {
                     self.unpin_slot(*slot as usize);
+                    self.discard_lost(*slot as usize);
                 }
             }
             released.leases = slots.len();
@@ -904,6 +993,25 @@ impl Cache {
     /// leave every slot, key, and counter as they were, so a caller that cannot be
     /// answered keeps the cache it had.
     pub fn store(&mut self, keys: &[String], request: &str) -> Result<StorePlan, StoreRejection> {
+        if self.counters.lost_chunks != 0 {
+            let lost: Vec<usize> = keys
+                .iter()
+                .filter_map(|key| self.index.get(key.as_str()))
+                .copied()
+                .filter(|slot| self.slots[*slot as usize].lost)
+                .map(|slot| slot as usize)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            for slot in lost {
+                self.discard_lost(slot);
+            }
+            if keys.iter().any(|key| {
+                self.index.get(key.as_str()).is_some_and(|slot| self.slots[*slot as usize].lost)
+            }) {
+                return Err(StoreRejection::Full);
+            }
+        }
         let incoming: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let missing: Vec<&str> = keys
             .iter()
@@ -934,6 +1042,9 @@ impl Cache {
         let since = Instant::now();
         for key in missing {
             let slot = self.free.pop().expect("capacity checked");
+            self.next_generation =
+                self.next_generation.checked_add(1).expect("slot generation exhausted");
+            self.slots[slot as usize].generation = self.next_generation;
             let owner = self.owners.acquire(request);
             self.slots[slot as usize].key = Box::from(key);
             self.slots[slot as usize].ready = false;
@@ -1102,6 +1213,9 @@ impl Cache {
     /// it until that transfer ends; with `force` every lease and reservation is
     /// dropped, which a client may only do after its own transfers are flushed.
     pub fn reset(&mut self, force: bool) -> io::Result<()> {
+        if self.slots.iter().any(|slot| slot.checks != 0) {
+            return Err(invalid("cannot reset a cache with active prefetch checks"));
+        }
         if !force
             && self.index.values().any(|slot| {
                 let entry = &self.slots[*slot as usize];
@@ -1111,6 +1225,26 @@ impl Cache {
             return Err(invalid(
                 "cannot reset a cache with active transfers or leases",
             ));
+        }
+        let lost: Vec<usize> = self
+            .index
+            .values()
+            .copied()
+            .filter(|slot| self.slots[*slot as usize].lost)
+            .map(|slot| slot as usize)
+            .collect();
+        for slot in lost {
+            // A forced reset is called only after the worker transfer fence.
+            if force {
+                let readers = std::mem::take(&mut self.slots[slot].readers);
+                for reader in readers {
+                    self.leases.unlease(reader, slot as u32);
+                }
+            }
+            self.discard_lost(slot);
+            if self.slots[slot].lost {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
         }
         if let Some(hashes) = &mut self.hashes {
             hashes.reset();
@@ -1162,6 +1296,8 @@ impl Cache {
             ("misses", self.counters.misses),
             ("pending_hits", self.counters.pending_hits),
             ("evictions", self.counters.evictions),
+            ("lost_chunks", self.counters.lost_chunks),
+            ("discard_failures", self.counters.discard_failures),
             ("stores", self.counters.stores),
             ("commits", self.counters.commits),
             ("aborted", self.counters.aborted),
@@ -1244,6 +1380,7 @@ impl Cache {
         self.unlink(slot);
         let key = std::mem::take(&mut self.slots[slot as usize].key);
         self.slots[slot as usize].ready = false;
+        self.slots[slot as usize].lost = false;
         if let Some(reservation) = self.slots[slot as usize].reservation.take() {
             self.owners.release(reservation.owner);
         }
@@ -1418,7 +1555,12 @@ impl Cache {
         let mut slot = self.lru_tail;
         while victims.len() < needed && slot != NO_SLOT {
             let entry = &self.slots[slot as usize];
-            if entry.ready && entry.readers.is_empty() && !incoming.contains(&*entry.key) {
+            if entry.ready
+                && !entry.lost
+                && entry.checks == 0
+                && entry.readers.is_empty()
+                && !incoming.contains(&*entry.key)
+            {
                 victims.push(slot);
             }
             slot = entry.prev;
@@ -1511,6 +1653,28 @@ fn cgroup_memory() -> Option<(u64, u64)> {
             .ok()
     };
     Some((read("memory.current")?, read("memory.max")?))
+}
+
+/// Check every page after asynchronous advice, without touching mapped bytes.
+/// A one-byte pread waits for that page's I/O and preserves kernel error handling.
+pub fn check_prefetched_row(
+    file: &File,
+    row_bytes: usize,
+    page_size: usize,
+    slot: usize,
+) -> io::Result<()> {
+    let mut byte = [0u8; 1];
+    for offset in (slot * row_bytes..(slot + 1) * row_bytes).step_by(page_size) {
+        loop {
+            match file.read_at(&mut byte, offset as u64) {
+                Ok(1) => break,
+                Ok(_) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Asks the kernel to read whole rows back in with one `MADV_WILLNEED` each.
@@ -1634,10 +1798,7 @@ pub fn page_out_rows(
     for &slot in slots {
         let base = mapping.as_ptr() as usize + slot * row_bytes;
         for offset in (0..row_bytes).step_by(page_size) {
-            // SAFETY: the slot lies inside the sealed mapping and the offset is
-            // page-aligned within its row; a volatile read only faults the page in.
-            let page = std::ptr::with_exposed_provenance::<u8>(base + offset);
-            let _ = unsafe { std::ptr::read_volatile(page) };
+            touch_mapped_page(base + offset)?;
         }
         // SAFETY: the range is the slot's whole row inside the live mapping.
         let advised =
@@ -1648,6 +1809,28 @@ pub fn page_out_rows(
         pages += row_bytes / page_size;
     }
     Ok(pages)
+}
+
+/// GUP faults in this process's mapping but returns EFAULT on poisoned shmem,
+/// instead of raising SIGBUS as a direct CPU load would.
+fn touch_mapped_page(address: usize) -> io::Result<()> {
+    let mut byte = 0u8;
+    let local = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    let remote = libc::iovec {
+        iov_base: address as *mut libc::c_void,
+        iov_len: 1,
+    };
+    // SAFETY: local points to a writable byte. The kernel validates the remote
+    // address inside this process; an inaccessible source is a syscall error.
+    let read = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    if read == 1 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// One `MADV_WILLNEED` over rows `first..=last`.
@@ -1727,6 +1910,69 @@ mod tests {
 
     fn cache() -> Cache {
         cache_with(2)
+    }
+
+    #[test]
+    fn lost_row_is_a_miss_and_its_hole_can_be_stored_again() {
+        let mut cache = cache();
+        let wanted = keys(&["aa"]);
+        let (_, slots, _) = cache.store(&wanted, "writer").unwrap();
+        cache.file.write_all_at(&[0x5a], 0).unwrap();
+        cache.commit(&wanted, "writer", true).unwrap();
+        let generation = cache.slots[slots[0]].generation;
+        cache.lose_chunk(slots[0], generation);
+        assert_eq!(cache.lookup("aa", "reader"), Status::Miss);
+        assert_eq!(cache.stats()["lost_chunks"], 1);
+        assert_eq!(cache.stats()["entries"], 0);
+        let mut byte = [1];
+        cache.file.read_exact_at(&mut byte, 0).unwrap();
+        assert_eq!(byte, [0]);
+        cache.store(&wanted, "new-writer").unwrap();
+        cache.commit(&wanted, "new-writer", true).unwrap();
+        cache.lose_chunk(slots[0], generation);
+        assert_eq!(cache.stats()["lost_chunks"], 1);
+        cache.assert_slot_accounting();
+    }
+
+    #[test]
+    fn lost_leased_row_is_not_recycled_until_all_readers_finish() {
+        let mut cache = cache();
+        let wanted = keys(&["aa"]);
+        let (_, slots, _) = cache.store(&wanted, "writer").unwrap();
+        cache.commit(&wanted, "writer", true).unwrap();
+        cache.file.write_all_at(&[0x5a], 0).unwrap();
+        assert_eq!(cache.lookup("aa", "a"), Status::Hit);
+        assert_eq!(cache.lookup("aa", "b"), Status::Hit);
+        cache.lose_chunk(slots[0], cache.slots[slots[0]].generation);
+        assert_eq!(cache.lookup("aa", "c"), Status::Miss);
+        assert!(cache.load(&wanted, "a").is_err());
+        cache.release_request("a");
+        assert_eq!(cache.stats()["entries"], 1);
+        cache.release(&wanted, "b");
+        assert_eq!(cache.stats()["entries"], 0);
+        cache.assert_slot_accounting();
+    }
+
+    #[test]
+    fn lost_row_waits_for_every_prefetch_check_before_reuse() {
+        let mut cache = cache();
+        let wanted = keys(&["aa"]);
+        let (_, slots, _) = cache.store(&wanted, "writer").unwrap();
+        cache.commit(&wanted, "writer", true).unwrap();
+        let (_, a) = cache.prefetch_checks(&slots).unwrap();
+        let (_, b) = cache.prefetch_checks(&slots).unwrap();
+        cache.lose_chunk(a[0].0, a[0].1);
+        assert_eq!(cache.lookup("aa", "reader"), Status::Miss);
+        assert!(cache.reset(true).is_err());
+        assert!(matches!(
+            cache.store(&wanted, "replacement"),
+            Err(StoreRejection::Full)
+        ));
+        cache.finish_check(a[0].0, a[0].1);
+        assert_eq!(cache.stats()["entries"], 1);
+        cache.finish_check(b[0].0, b[0].1);
+        assert_eq!(cache.stats()["entries"], 0);
+        cache.assert_slot_accounting();
     }
 
     fn cache_with(num_chunks: usize) -> Cache {

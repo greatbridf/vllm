@@ -217,6 +217,7 @@ class Engine:
         worker_bytes: int,
         name: str,
         world_size: int = 1,
+        extra_config: dict | None = None,
     ):
         self.spec = RustServiceOffloadingSpec(
             replace(
@@ -228,6 +229,7 @@ class Engine:
                     extra_config={
                         "service_socket": socket_path,
                         "pin_host_memory": not RS_WORKLOAD.rswap,
+                        **(extra_config or {}),
                     },
                 ),
                 engine_id=name,

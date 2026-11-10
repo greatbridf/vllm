@@ -25,10 +25,14 @@ rswap device and leaves any other swap device alone.
 
 import ctypes
 import errno
+import faulthandler
 import mmap
 import os
+import resource
+import signal
 import subprocess
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
@@ -36,6 +40,7 @@ import numpy as np
 import pytest
 
 from tests.v1.kv_offload.conftest import make_offloading_config
+from tests.v1.kv_offload.test_service_rswap import _page_digest, _redis_del, _redis_get
 from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import pin_mmap_region
@@ -102,7 +107,7 @@ def device():
 
 
 @pytest.fixture
-def service(tmp_path):
+def service(tmp_path, request):
     if not BINARY.is_file():
         pytest.skip("build vllm-kv-cache-service or set VLLM_KV_CACHE_SERVICE_BINARY")
     tmp_path.chmod(0o700)
@@ -115,6 +120,8 @@ def service(tmp_path):
             "--capacity-bytes",
             str(CACHE_BYTES),
             "--rswap-attach",
+            "--eviction-policy",
+            getattr(request, "param", "lru"),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -272,6 +279,140 @@ def test_mock_engine_store_load_round_trip(device, service):
             np.testing.assert_array_equal(engine.load(key, request), payload)
     finally:
         engine.cleanup()
+
+
+@pytest.mark.parametrize("mapped_fault", [False, True])
+@pytest.mark.parametrize("service", ["lru", "none"], indirect=True)
+def test_missing_remote_page_becomes_a_miss_and_slot_is_reusable(
+    device, service, mapped_fault
+):
+    """Lost remote bytes invalidate a row through the real prefetch/lookup path."""
+    original = Path("/proc/self/cgroup").read_text().split("0::", 1)[1].strip()
+    cgroup = Path("/sys/fs/cgroup") / f"kv-lost-{os.getpid()}"
+    cgroup.mkdir()
+    (cgroup / "memory.max").write_text(str(512 * 2**20))
+    (cgroup / "memory.swap.max").write_text(str(512 * 2**20))
+    (cgroup / "cgroup.procs").write_text(str(os.getpid()))
+    engine = None
+    token = uuid.uuid4().bytes
+    keys = [OffloadKey(token + index.to_bytes(4, "big")) for index in range(CHUNKS)]
+    backend_keys = [
+        _page_digest(key, page) for key in keys for page in range(PAGES_PER_CHUNK)
+    ]
+    try:
+        assert _redis_del(backend_keys), "Redis must permit deletion of test-owned keys"
+        engine = MockEngine(_spec(service, pin_host_memory=False))
+        request = ReqContext("missing-fill")
+        for index, key in enumerate(keys):
+            engine.store(key, request, _payload(index))
+        engine.manager.on_schedule_end(None)
+        engine.manager.on_request_finished(request)
+        engine.manager.on_schedule_end(None)
+        engine.manager.client.call("spill", keys=[key.hex() for key in keys])
+        before = read_stats(device)
+        try:
+            (cgroup / "memory.reclaim").write_text(str(64 * 2**20))
+        except OSError as error:
+            if error.errno != errno.EAGAIN:
+                raise
+        assert _reclaimed(device, before) > 0, "no cache pages reached remote swap"
+        vec = (ctypes.c_ubyte * (CACHE_BYTES // PAGE))()
+        assert (
+            LIBC.mincore(
+                ctypes.c_void_p(engine.region.base_tensor.data_ptr()),
+                ctypes.c_size_t(CACHE_BYTES),
+                vec,
+            )
+            == 0
+        )
+        candidates = [
+            index
+            for index in range(CHUNKS)
+            if any(
+                not (vec[index * PAGES_PER_CHUNK + page] & 1)
+                for page in range(PAGES_PER_CHUNK)
+            )
+        ]
+        assert candidates, "reclaim must make at least one row nonresident"
+        index = candidates[0]
+        key = keys[index]
+        row_keys = [_page_digest(key, page) for page in range(PAGES_PER_CHUNK)]
+        objects = _redis_get(row_keys)
+        assert objects is not None and any(
+            value is not None for value in objects.values()
+        )
+        assert _redis_del(row_keys)
+        assert all(value is None for value in _redis_get(row_keys).values())
+        # Isolate the deliberately fatal mapped read from pytest and the service.
+        if mapped_fault:
+            pid = os.fork()
+            if pid == 0:
+                faulthandler.disable()
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+                for page in range(PAGES_PER_CHUNK):
+                    _ = ctypes.c_ubyte.from_address(
+                        engine.region.base_tensor.data_ptr()
+                        + index * PAGES_PER_CHUNK * PAGE
+                        + page * PAGE
+                    ).value
+                os._exit(1)
+            _, status = os.waitpid(pid, 0)
+            assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGBUS
+            ctypes.set_errno(0)
+            advised = LIBC.madvise(
+                ctypes.c_void_p(
+                    engine.region.base_tensor.data_ptr()
+                    + index * PAGES_PER_CHUNK * PAGE
+                ),
+                ctypes.c_size_t(PAGES_PER_CHUNK * PAGE),
+                ctypes.c_int(mmap.MADV_WILLNEED),
+            )
+            assert advised == -1 and ctypes.get_errno() == errno.EIO
+        reader = ReqContext("missing-read")
+        deadline = time.monotonic() + 30
+        while True:
+            status = engine.manager.lookup(key, reader)
+            engine.manager.on_schedule_end(None)
+            if status is LookupResult.MISS:
+                break
+            assert status is LookupResult.HIT_PENDING
+            assert time.monotonic() < deadline, "lost row remained pending"
+            time.sleep(0.01)
+        stats = engine.manager.client.call("stats")["stats"]
+        assert stats["lost_chunks"] >= 1
+        assert stats["discard_failures"] == 0
+        deadline = time.monotonic() + 30
+        while engine.manager.client.call("stats")["stats"]["entries"] >= CHUNKS:
+            assert time.monotonic() < deadline, "lost row was not released"
+            time.sleep(0.01)
+        engine.manager.on_request_finished(reader)
+        engine.manager.on_schedule_end(None)
+        writer = ReqContext("missing-replace")
+        slot = engine.store(key, writer, _payload(index))
+        assert slot == index, "replacement must reuse the discarded row"
+        engine.manager.on_schedule_end(None)
+        assert engine.manager.lookup(key, writer) is LookupResult.HIT
+        np.testing.assert_array_equal(engine.load(key, writer), _payload(index))
+        assert (
+            LIBC.madvise(
+                ctypes.c_void_p(
+                    engine.region.base_tensor.data_ptr() + slot * PAGES_PER_CHUNK * PAGE
+                ),
+                ctypes.c_size_t(PAGES_PER_CHUNK * PAGE),
+                ctypes.c_int(mmap.MADV_WILLNEED),
+            )
+            == 0
+        ), os.strerror(ctypes.get_errno())
+        engine.manager.on_request_finished(writer)
+        engine.manager.on_schedule_end(None)
+    finally:
+        if engine:
+            engine.cleanup()
+        _redis_del(backend_keys)
+        (Path("/sys/fs/cgroup") / original.lstrip("/") / "cgroup.procs").write_text(
+            str(os.getpid())
+        )
+        cgroup.rmdir()
 
 
 def test_locked_region_is_not_reclaimable(device, service):
