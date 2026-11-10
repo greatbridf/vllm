@@ -30,6 +30,39 @@ recovery path does not catch signals in GPU workers or protect that race.
 
 ## Start
 
+From a checkout with `.venv/bin/python`, `tools/rkvctl` builds and manages the
+service. Redis and kernel swap must already be configured; it never changes
+swap devices, grants capabilities, or installs system packages.
+
+```bash
+tools/rkvctl setup
+VLLM_KV_REMOTE_REDIS_URL=redis://127.0.0.1:6379/0 \
+  tools/rkvctl start --capacity-gib 64
+tools/rkvctl status
+tools/rkvctl logs
+tools/rkvctl config --capacity-gib 64
+tools/rkvctl stop
+```
+
+`start` runs in the background and checks the `info` reply before reporting
+readiness. `run` keeps the service in the foreground for a supervisor.
+Both enable rswap hash attachment by default and require a writable
+`/sys/kernel/mm/xswap/rswap_attach` plus BPF privileges. Pass `--no-rswap`
+for userspace Redis loading without kernel hash reporting. Redis defaults to
+`redis://127.0.0.1:6379/0`; the URL must match the kernel's Redis database.
+Prefer `VLLM_KV_REMOTE_REDIS_URL` over `--redis-url` for credentials.
+Attachment privileges are checked when a namespace opens, not by `info`, so
+startup readiness alone does not prove BPF attachment works.
+
+The default private runtime directory is `/tmp/rkv-<uid>`; override it with
+`--runtime-dir` or `RKV_RUNTIME_DIR`. `--binary`/`RKV_BINARY` selects an existing
+binary. `--capacity-gib`, `--remote-timeout-ms`, and `--eviction-policy` configure
+startup. `config` prints matching `--kv-transfer-config` JSON with pageable host
+memory; pass the same capacity, timeout, and runtime directory options you used
+for `start`. Run vLLM under the service UID. `stop` sends SIGTERM only to the
+process it started; stopping drops local namespaces and requires restarting
+their vLLM engines. Use `tools/rkvctl --help` for all options.
+
 ```bash
 cargo build --manifest-path rust/Cargo.toml -p vllm-kv-cache-service
 install -d -m 700 /tmp/vllm-kv-service

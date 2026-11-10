@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ ! -x "$repo/.venv/bin/python" ]]; then
+    printf '%s\n' 'rkvctl: create the repository .venv first (uv venv --python 3.12)' >&2
+    exit 1
+fi
+exec "$repo/.venv/bin/python" - "$repo" "$@" <<'PY'
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+
+def info(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(1)
+        peer.connect(str(path))
+        body = b'{"op":"info"}'
+        peer.sendall(struct.pack("!I", len(body)) + body)
+
+        def receive(size):
+            data = bytearray()
+            while len(data) < size:
+                part = peer.recv(size - len(data))
+                if not part:
+                    raise RuntimeError("service closed the connection")
+                data.extend(part)
+            return data
+
+        size = struct.unpack("!I", receive(4))[0]
+        if not 0 < size <= 1024 * 1024:
+            raise RuntimeError("invalid service response length")
+        reply = json.loads(receive(size))
+        if reply.get("ok") is not True:
+            raise RuntimeError("service rejected info")
+        return reply
+
+
+def identity(pid):
+    try:
+        # comm can contain spaces and parentheses; fields after its final ')'
+        # begin with process state, and starttime is field 22.
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        if fields[0] == "Z":
+            return None
+        return fields[19]
+    except FileNotFoundError:
+        return None
+
+
+def main():
+    repo = Path(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        prog="rkvctl",
+        description="Manage the Rust KV cache service; does not configure Redis or swap.",
+    )
+    parser.add_argument(
+        "command", choices=("setup", "start", "run", "status", "stop", "logs", "config")
+    )
+    parser.add_argument(
+        "--runtime-dir", type=Path,
+        default=Path(os.environ.get("RKV_RUNTIME_DIR", f"/tmp/rkv-{os.getuid()}")),
+    )
+    parser.add_argument("--capacity-gib", type=int, default=64)
+    parser.add_argument("--redis-url", default=None, help="Prefer VLLM_KV_REMOTE_REDIS_URL for secrets.")
+    parser.add_argument("--remote-timeout-ms", type=int, default=1000)
+    parser.add_argument("--eviction-policy", choices=("lru", "none"), default="lru")
+    parser.add_argument("--no-rswap", action="store_true", help="Disable BPF hash attachment.")
+    parser.add_argument("--rswap-attach", type=Path, default=Path("/sys/kernel/mm/xswap/rswap_attach"))
+    parser.add_argument(
+        "--binary", type=Path,
+        default=Path(os.environ.get("RKV_BINARY", repo / "rust/target/release/vllm-kv-cache-service")),
+    )
+    args = parser.parse_args(sys.argv[2:])
+    if args.capacity_gib <= 0 or args.remote_timeout_ms <= 0:
+        parser.error("capacity and remote timeout must be positive")
+    runtime = args.runtime_dir.absolute()
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = runtime.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        parser.error("runtime directory must be owned by this UID and have mode 0700")
+    path = runtime / "cache.sock"
+    pidfile = runtime / "service.json"
+    logfile = runtime / "service.log"
+    capacity = args.capacity_gib * 1024**3
+    config = {
+        "kv_connector": "OffloadingConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+            "spec_name": "RustServiceOffloadingSpec",
+            "service_socket": str(path),
+            "service_timeout": max(5.0, args.remote_timeout_ms / 1000 + 2),
+            "cpu_bytes_to_use": capacity,
+            "blocks_per_chunk": 1,
+            "pin_host_memory": False,
+            "prefetch_on_lookup": True,
+            "prefetch_on_load": True,
+        },
+    }
+    if args.command == "config":
+        print(json.dumps(config, indent=2))
+        return
+    if args.command == "logs":
+        os.execvp("tail", ["tail", "-n", "100", "-f", str(logfile)])
+    if args.command == "status":
+        print(json.dumps(info(path), indent=2))
+        return
+    # Serialize lifecycle commands; the child must not inherit the lock.
+    with (runtime / "control.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = json.loads(pidfile.read_text()) if pidfile.exists() else None
+        live = record and record["starttime"] is not None and identity(record["pid"]) == record["starttime"]
+        if args.command == "stop":
+            if not live:
+                pidfile.unlink(missing_ok=True)
+                print("No managed service is running.")
+                return
+            # pidfd binds the signal to this process, even if its PID is reused.
+            fd = os.pidfd_open(record["pid"])
+            try:
+                if identity(record["pid"]) != record["starttime"]:
+                    raise RuntimeError("managed process changed; refusing to signal")
+                import signal
+                signal.pidfd_send_signal(fd, signal.SIGTERM)
+                deadline = time.monotonic() + 10
+                while identity(record["pid"]) == record["starttime"]:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("service did not stop; no SIGKILL was sent")
+                    time.sleep(0.05)
+            finally:
+                os.close(fd)
+            pidfile.unlink(missing_ok=True)
+            print("Cache service stopped. Existing vLLM engines must be restarted.")
+            return
+        if live:
+            raise RuntimeError("managed service is already running; use status or stop")
+        try:
+            info(path)
+        except (OSError, RuntimeError, ValueError):
+            pass
+        else:
+            raise RuntimeError("a service already owns this socket; refusing to replace it")
+        if args.command == "setup" or not args.binary.exists():
+            subprocess.run(
+                ["cargo", "build", "--release", "--manifest-path", str(repo / "rust/Cargo.toml"),
+                 "-p", "vllm-kv-cache-service"], cwd=repo, check=True,
+            )
+        if args.command == "setup":
+            print(f"Built cache service. Runtime directory: {runtime}")
+            print("rswap needs BPF privileges; run vLLM under the same UID as the service.")
+            return
+        if not args.no_rswap and not os.access(args.rswap_attach, os.W_OK):
+            raise RuntimeError(
+                f"rswap attachment is not writable: {args.rswap_attach}; "
+                "configure kernel support and privileges, or use --no-rswap"
+            )
+        env = os.environ.copy()
+        env["VLLM_KV_REMOTE_REDIS_URL"] = (
+            args.redis_url if args.redis_url is not None
+            else env.get("VLLM_KV_REMOTE_REDIS_URL", "redis://127.0.0.1:6379/0")
+        )
+        command = [
+            str(args.binary.absolute()), "--socket", str(path),
+            "--capacity-bytes", str(capacity), "--eviction-policy", args.eviction_policy,
+            "--pin-lease-bytes", "0", "--remote-timeout-ms", str(args.remote_timeout_ms),
+        ]
+        if not args.no_rswap:
+            command += ["--rswap-attach", str(args.rswap_attach)]
+        if args.command == "run":
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.execve(command[0], command, env)
+        with logfile.open("ab", buffering=0) as output:
+            child = subprocess.Popen(
+                command, env=env, stdin=subprocess.DEVNULL,
+                stdout=output, stderr=output, start_new_session=True,
+            )
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                if child.poll() is not None:
+                    raise RuntimeError(f"service exited; inspect {logfile}")
+                try:
+                    reply = info(path)
+                    if reply["pid"] != child.pid:
+                        raise RuntimeError("another service won the socket startup race")
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"service startup timed out; inspect {logfile}")
+                    time.sleep(0.05)
+            starttime = identity(child.pid)
+            if starttime is None:
+                raise RuntimeError(f"service exited during startup; inspect {logfile}")
+            pidfile.write_text(json.dumps({"pid": child.pid, "starttime": starttime}))
+        except BaseException:
+            child.terminate()
+            child.wait(timeout=10)
+            raise
+        print(f"Cache service started: PID {child.pid}, socket {path}")
+        print(f"Log: {logfile}")
+        print("vLLM connector configuration:")
+        print(json.dumps(config))
+
+
+try:
+    os.umask(0o077)
+    main()
+except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+    print(f"rkvctl: {error}", file=sys.stderr)
+    sys.exit(1)
+PY

@@ -99,6 +99,15 @@ Secondary tiers are not supported yet on engines whose workers span several node
 
 ## Rust Cache Service
 
+The checkout helper `tools/rkvctl setup` builds the service, and
+`VLLM_KV_REMOTE_REDIS_URL=redis://127.0.0.1:6379/0 tools/rkvctl start --capacity-gib 64`
+starts it with rswap hash reporting enabled. Use `--no-rswap` when kernel hash
+reporting is not needed. Redis and swap setup are external prerequisites.
+`tools/rkvctl config --capacity-gib 64` prints the vLLM connector configuration;
+`status`, `logs`, and `stop` manage the process. See the
+[service startup guide](../../rust/src/kv-cache-service/README.md#start)
+for runtime paths, privileges, and lifecycle details.
+
 To place cache ownership in a separate process, use
 `spec_name: "RustServiceOffloadingSpec"` with `OffloadingConnector`.
 The Rust service owns DRAM mappings, reservations, lookup leases, and eviction;
